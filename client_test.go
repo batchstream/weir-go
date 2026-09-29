@@ -2,6 +2,7 @@ package weir
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -161,6 +162,37 @@ func TestLocalValidationAndDeadline(t *testing.T) {
 	client.timeout = 20 * time.Millisecond
 	if _, err := client.Read(context.Background(), readRequest()); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("default budget lost: %v", err)
+	}
+}
+
+func TestNewOptionsAreExplicitAndBounded(t *testing.T) {
+	unchecked := &tls.Config{InsecureSkipVerify: true}
+	tlsConfig := &tls.Config{}
+	invalid := []Options{{Timeout: -time.Second}, {Plaintext: true, TLSConfig: tlsConfig}, {TLSConfig: unchecked}}
+	for _, options := range invalid {
+		if client, err := New("127.0.0.1:7447", options); err == nil {
+			client.Close()
+			t.Fatal("accepted invalid transport or timeout options")
+		}
+	}
+	options := Options{}
+	if _, err := New("", options); err == nil {
+		t.Fatal("accepted empty target")
+	}
+	for _, options := range []Options{{}, {Plaintext: true}, {TLSConfig: tlsConfig}} {
+		client, err := New("127.0.0.1:7447", options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.timeout != 30*time.Second {
+			t.Fatal("missing default timeout")
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tlsConfig.MinVersion != 0 {
+		t.Fatal("mutated caller TLS configuration")
 	}
 }
 
