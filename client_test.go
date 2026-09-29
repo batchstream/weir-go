@@ -365,3 +365,36 @@ func TestBulkResultMemoryBound(t *testing.T) {
 		t.Fatalf("retained %d oversized results", retained)
 	}
 }
+
+func TestTypedNilMutationOneofsAreRejectedBeforeDispatch(t *testing.T) {
+	var put *pb.MutateRequest_Put
+	var create *pb.MutateRequest_Create
+	var replace *pb.MutateRequest_Replace
+	var deletion *pb.MutateRequest_Delete
+	var transform *pb.MutateRequest_AtomicTransform
+	var expression *pb.Transform_BackendExpression
+	invalidTransform := &pb.Transform{Form: expression}
+	transformAction := &pb.MutateRequest_AtomicTransform{AtomicTransform: invalidTransform}
+	requests := []*pb.MutateRequest{
+		{Resource: readRequest().Resource, Action: put},
+		{Resource: readRequest().Resource, Action: create},
+		{Resource: readRequest().Resource, Action: replace},
+		{Resource: readRequest().Resource, Action: deletion},
+		{Resource: readRequest().Resource, Action: transform},
+		{Resource: readRequest().Resource, Action: transformAction},
+	}
+	client, fixture := newFixture(t, "ok")
+	for _, request := range requests {
+		result, err := client.Mutate(context.Background(), request)
+		if err == nil || result.Outcome != pb.MutationOutcome_NOT_STARTED {
+			t.Fatalf("invalid oneof reached RPC: %v %v", result, err)
+		}
+		operations := []Operation{{Mutate: mutationRequest()}, {Mutate: request}}
+		if _, err := client.Bulk(context.Background(), "weir://mongo", operations); err == nil {
+			t.Fatal("invalid later oneof accepted")
+		}
+	}
+	if fixture.calls.Load() != 0 {
+		t.Fatal("invalid mutation batch dispatched")
+	}
+}

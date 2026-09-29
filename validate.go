@@ -110,17 +110,30 @@ func validateMutation(req *pb.MutateRequest) error {
 	}
 	switch action := req.Action.(type) {
 	case *pb.MutateRequest_Put:
-		return validateDocument(action.Put)
+		if action != nil {
+			return validateDocument(action.Put)
+		}
 	case *pb.MutateRequest_Create:
-		return validateDocument(action.Create)
+		if action != nil {
+			return validateDocument(action.Create)
+		}
 	case *pb.MutateRequest_Replace:
-		return validateDocument(action.Replace)
+		if action != nil {
+			return validateDocument(action.Replace)
+		}
 	case *pb.MutateRequest_Delete:
-		if action.Delete != nil {
+		if action != nil && action.Delete != nil {
 			return nil
 		}
 	case *pb.MutateRequest_AtomicTransform:
-		expression := action.AtomicTransform.GetBackendExpression()
+		if action == nil {
+			break
+		}
+		form, ok := action.AtomicTransform.GetForm().(*pb.Transform_BackendExpression)
+		if !ok || form == nil {
+			return fmt.Errorf("weir: only bounded backend-expression transforms are supported")
+		}
+		expression := form.BackendExpression
 		if expression == nil || len(expression.Data) == 0 || len(expression.Data) > 16<<10 {
 			return fmt.Errorf("weir: only bounded backend-expression transforms are supported")
 		}
