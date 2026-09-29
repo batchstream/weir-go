@@ -5,6 +5,10 @@ It is never invoked by default `go test ./...`. It uses plaintext only; producti
 qualification requires verified network isolation. It does not install infrastructure or retry
 writes. Use only disposable, pre-created collections/indexes owned by this run.
 
+The published command can be installed outside this checkout with
+`go install github.com/batchstream/weir-go/examples/soak@v0.1.0`. Go resolves the
+command's BSON dependency even when a consumer only imported the SDK root package.
+
 Build once from the exact reviewed SDK revision for the worker architecture:
 
 ```sh

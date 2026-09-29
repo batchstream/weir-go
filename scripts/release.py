@@ -47,7 +47,7 @@ def main():
     # checkout can mask a release-resolution problem. Retry read-only propagation.
     with tempfile.TemporaryDirectory(prefix='weir-sdk-consumer-') as directory:
         root = Path(directory)
-        env = dict(os.environ, GOWORK='off', GOPROXY='https://proxy.golang.org,direct', GOMODCACHE=str(root / 'cache'))
+        env = dict(os.environ, GOWORK='off', GOPROXY='https://proxy.golang.org,direct', GOMODCACHE=str(root / 'cache'), GOBIN=str(root / 'bin'))
         run(['go', 'mod', 'init', 'example.com/weir-release-check'], cwd=root, env=env)
         source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go")\nfunc main() { value, err := weir.Resource("mongo", "db", "records", "s:check"); if err != nil { panic(err) }; fmt.Println(value) }\n'
         (root / 'main.go').write_text(source)
@@ -63,7 +63,9 @@ def main():
         resolved = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir-go'], cwd=root, env=env))
         if resolved['Version'] != version or resolved.get('Replace'):
             raise ValueError('external consumer did not use the published module')
-        print('Verified external module installation:', version, sha)
+        for example in ('read', 'soak'):
+            run(['go', 'install', f'github.com/batchstream/weir-go/examples/{example}@{version}'], cwd=root, env=env)
+        print('Verified external module and example installation:', version, sha)
 
 
 if __name__ == '__main__':
