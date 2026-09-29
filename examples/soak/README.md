@@ -6,7 +6,7 @@ qualification requires verified network isolation. It does not install infrastru
 writes. Use only disposable, pre-created collections/indexes owned by this run.
 
 The published command can be installed outside this checkout with
-`go install github.com/batchstream/weir-go/examples/soak@v0.1.0`. Go resolves the
+`go install github.com/batchstream/weir-go/examples/soak@v0.1.1`. Go resolves the
 command's BSON dependency even when a consumer only imported the SDK root package.
 
 Build once from the exact reviewed SDK revision for the worker architecture:
@@ -15,12 +15,24 @@ Build once from the exact reviewed SDK revision for the worker architecture:
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o soak ./examples/soak
 ```
 
-Run inside the acceptance namespace, through the Service and the real client
-NetworkPolicy path. A short calibration uses the same arguments with `-duration 3m`
+Run inside the acceptance namespace and the real client NetworkPolicy path.
+Use `-address SERVICE:PORT` for Service behavior or `-targets IP:PORT,IP:PORT,IP:PORT`
+for fixed three-Pod coverage. These flags are mutually exclusive. Fixed targets
+must be distinct literal Pod IPs with valid ports, never DNS names that can resolve
+to changing Pods. A worker always uses `targets[worker_index % target_count]`;
+there is no failover or replay. The target count must be odd and workers must be a
+multiple of twice that count, so every target gets equal MongoDB and Search load.
+For three targets and six workers, each Pod receives one worker per backend.
+The start record and worker events preserve the exact target assignments. Freeze
+the corresponding Pod UIDs and image identities in the observer baseline.
+
+Service invocation and rolling-update checks passed separately during deployment
+qualification. The 24-hour fixed-target run proves per-Pod steady coverage; it
+does not establish Service load balancing behavior. A short calibration uses the same arguments with `-duration 3m`
 and a fresh `-run-id`. Freeze all values and artifact identities before the 24-hour run:
 
 ```sh
-./soak -address weir-weir.weir-acceptance-20260929.svc:7447 \
+./soak -targets POD_1_IP:7447,POD_2_IP:7447,POD_3_IP:7447 \
   -mongo-resource weir://mongo/weir_acceptance/records \
   -search-resource weir://search/records \
   -run-id weir-soak-UNIQUE-LOWERCASE-ID \

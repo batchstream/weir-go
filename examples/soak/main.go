@@ -24,7 +24,7 @@ import (
 )
 
 type options struct {
-	Address, Mongo, Search, RunID                          string
+	Address, Targets, Mongo, Search, RunID                 string
 	ServerRevision, ImageDigest, ChartVersion, SDKRevision string
 	ObserverStatus, ObserverHeartbeat                      string
 	Duration, MaxP99                                       time.Duration
@@ -34,6 +34,7 @@ type options struct {
 type event struct {
 	Kind       string `json:"kind"`
 	Worker     int    `json:"worker"`
+	Target     string `json:"target"`
 	Backend    string `json:"backend"`
 	Resource   string `json:"resource"`
 	Sequence   int64  `json:"sequence"`
@@ -64,6 +65,7 @@ type workerRun struct {
 	ctx    context.Context
 	cfg    options
 	number int
+	target string
 	start  time.Time
 	events chan<- event
 }
@@ -104,6 +106,7 @@ func (h histogram) p99() time.Duration {
 func main() {
 	cfg := options{}
 	flag.StringVar(&cfg.Address, "address", "", "application Service host:port; explicit isolated plaintext")
+	flag.StringVar(&cfg.Targets, "targets", "", "comma-separated fixed Pod IP:port targets; mutually exclusive with address")
 	flag.StringVar(&cfg.Mongo, "mongo-resource", "", "owned Mongo collection URI")
 	flag.StringVar(&cfg.Search, "search-resource", "", "owned Search index URI")
 	flag.StringVar(&cfg.RunID, "run-id", "", "unique weir-soak-* ownership prefix; never reuse")
@@ -130,11 +133,14 @@ func main() {
 	}
 }
 func validate(cfg options) error {
+	if _, err := targetAddresses(cfg); err != nil {
+		return err
+	}
 	if (cfg.ObserverStatus == "") != (cfg.ObserverHeartbeat == "") || (cfg.ObserverStatus != "" && cfg.ObserverStatus == cfg.ObserverHeartbeat) {
 		return errors.New("observer-status and observer-heartbeat must be distinct paths supplied together")
 	}
-	if cfg.Address == "" || !strings.HasPrefix(cfg.Mongo, "weir://") || len(strings.Split(cfg.Mongo, "/")) != 5 || !strings.HasPrefix(cfg.Search, "weir://") || len(strings.Split(cfg.Search, "/")) != 4 || strings.HasSuffix(cfg.Mongo, "/") || strings.HasSuffix(cfg.Search, "/") {
-		return errors.New("explicit address and owned Mongo/Search collection URIs are required")
+	if !strings.HasPrefix(cfg.Mongo, "weir://") || len(strings.Split(cfg.Mongo, "/")) != 5 || !strings.HasPrefix(cfg.Search, "weir://") || len(strings.Split(cfg.Search, "/")) != 4 || strings.HasSuffix(cfg.Mongo, "/") || strings.HasSuffix(cfg.Search, "/") {
+		return errors.New("owned Mongo/Search collection URIs are required")
 	}
 	if !regexp.MustCompile(`^weir-soak-[a-z0-9-]{1,64}$`).MatchString(cfg.RunID) {
 		return errors.New("run-id must be a unique weir-soak-* prefix")
@@ -163,8 +169,21 @@ func run(parent context.Context, cfg options, out io.Writer) error {
 			return err
 		}
 	}
+	targets, err := targetAddresses(cfg)
+	if err != nil {
+		return err
+	}
+	assignments := make([]map[string]any, cfg.Workers)
+	for i := range assignments {
+		backend := "mongo"
+		if i%2 == 1 {
+			backend = "search"
+		}
+		assignments[i] = map[string]any{"worker": i, "backend": backend, "target": targets[i%len(targets)]}
+	}
 	start := time.Now()
 	identity := map[string]any{"kind": "start", "started_utc": start.UTC().Format(time.RFC3339Nano), "duration_ns": int64(cfg.Duration), "run_id": cfg.RunID, "workers": cfg.Workers, "cycles_per_second": cfg.Rate, "max_p99_ns": int64(cfg.MaxP99), "server_revision": cfg.ServerRevision, "image_digest": cfg.ImageDigest, "chart_version": cfg.ChartVersion, "sdk_revision": cfg.SDKRevision, "address": cfg.Address, "mongo_resource": cfg.Mongo, "search_resource": cfg.Search}
+	identity["targets"], identity["worker_targets"] = targets, assignments
 	if observer != nil {
 		identity["observer_status"] = cfg.ObserverStatus
 		identity["observer_heartbeat"] = cfg.ObserverHeartbeat
@@ -176,7 +195,7 @@ func run(parent context.Context, cfg options, out io.Writer) error {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
-		args := workerRun{ctx: ctx, cfg: cfg, number: i, start: start, events: events}
+		args := workerRun{ctx: ctx, cfg: cfg, number: i, target: targets[i%len(targets)], start: start, events: events}
 		go func() { defer wg.Done(); execute(args) }()
 	}
 	go func() { wg.Wait(); close(events) }()
@@ -280,7 +299,7 @@ func execute(args workerRun) {
 	id := fmt.Sprintf("%s-%02d", cfg.RunID, number)
 	w := worker{backend: backend, collection: collection, resource: collection + "/s:" + id, id: id, store: "weir://" + strings.Split(strings.TrimPrefix(collection, "weir://"), "/")[0], number: number, opts: cfg}
 	report := func(kind string, sequence int64, d time.Duration, err error) {
-		e := event{Kind: kind, Worker: number, Backend: backend, Resource: w.resource, Sequence: sequence, DurationNS: int64(d)}
+		e := event{Kind: kind, Worker: number, Target: args.target, Backend: backend, Resource: w.resource, Sequence: sequence, DurationNS: int64(d)}
 		if err != nil {
 			e.Error = err.Error()
 			e.Unknown = unknownWrite(err)
@@ -289,7 +308,7 @@ func execute(args workerRun) {
 	}
 	clientOpts := weir.Options{Plaintext: true, Timeout: 2 * time.Second}
 	var err error
-	w.client, err = weir.New(cfg.Address, clientOpts)
+	w.client, err = weir.New(args.target, clientOpts)
 	if err != nil {
 		report("failure", 0, 0, err)
 		return

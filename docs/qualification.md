@@ -76,6 +76,26 @@ real loopback gRPC test blocks an in-flight write, publishes observer failure,
 and verifies cancellation, UNKNOWN accounting, no replay, and no cleanup of
 uncertain records. The runner checks observation again before final success.
 
+## Fixed-Pod qualification coverage
+
+A three-minute Service-based paired run on the final releases completed 5,394
+cycles in 180.0568 seconds with a 50 ms p99 upper bound, zero errors, and zero
+UNKNOWN outcomes. Both the persisted runner exit status and observer reported
+success, with continuous Pod identity and CPU/memory samples. Independent review
+found that the six persistent gRPC connections reached only two of three Weir
+Pods. This run validates the paired reporting workflow but does not pass the
+three-Pod load coverage gate.
+
+SDK v0.1.1 adds fixed targets only to the explicit soak command. Worker assignment
+is stable and recorded, with six workers across three Pod IPs giving each Pod one
+MongoDB and one Search worker at the same total rate. The public client API and
+retry behavior are unchanged. A three-server loopback regression verifies actual
+connections and the recorded worker-target mapping; malformed, duplicate and
+uneven coverage configurations are rejected before dispatch. The final short
+paired rerun and 24-hour run must independently show positive business RPC
+counter deltas for every frozen Pod. Service and rolling behavior remain covered
+by the separate deployment checks; fixed-Pod coverage does not replace them.
+
 ## Network isolation gate
 
 The current EKS environment does not enforce the chart's NetworkPolicy. The

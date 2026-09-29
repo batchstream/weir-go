@@ -5,10 +5,10 @@ Requires Go 1.27.1. The SDK supports all five RPCs: `Read`, `Mutate`, mixed `Bul
 server-streaming `Scan`, and duplex `Native`.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.1.0
+go get github.com/batchstream/weir-go@v0.1.1
 ```
 
-SDK v0.1.0 uses the stable Weir v0.1.0 protocol; see `go.mod` for the exact
+SDK v0.1.x uses the stable Weir v0.1.0 protocol; see `go.mod` for the exact
 server dependency. The module imports the server's generated public
 `api/weir/v1` and `api/weir/search/v1` packages; it does not duplicate descriptors,
 generate a second protocol, or depend on server internals. Patch updates preserve
