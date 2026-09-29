@@ -8,7 +8,8 @@ production qualification. Passing one does not establish the others.
 The initial implementation was reviewed through
 [PR #1](https://github.com/batchstream/weir-go/pull/1). Both Linux amd64 and arm64
 CI run the complete default race suite and vet with module networking disabled
-after dependency preparation. Tests use in-memory gRPC.
+after dependency preparation. Protocol tests use in-memory gRPC; the workload's
+failure-path regression uses a loopback gRPC server.
 
 The suite rejects missing/duplicate Ends, data after End, non-OK status after End,
 incorrect Bulk/Scan counts, duplicate/out-of-range Bulk indexes, wrong result
@@ -46,3 +47,12 @@ release digest and the stable SDK protocol dependency still require a paired
 rerun. Multi-replica rolling updates, backend fault injection, resource plateaus,
 and the 24-hour run belong to the deployment qualification record and are not
 implied by these short tests.
+
+## Network isolation gate
+
+The current EKS environment does not enforce the chart's NetworkPolicy. The
+operator explicitly deferred changes to the shared CNI. Functional tests and a
+successful stability run on that cluster therefore do not qualify production
+network isolation. Weir's plaintext, unauthenticated listeners still require an
+enforced isolation boundary before production use. This gate stays open independently
+of SDK correctness, release availability, and workload results.

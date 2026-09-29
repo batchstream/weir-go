@@ -44,5 +44,5 @@ jobs:
           go vet ./...
           go vet -tags integration ./...
           python3 -m unittest discover -s scripts -p '*_test.py' -v
-          test -z "$(gofmt -l *.go examples/read/*.go)"
+          test -z "$(gofmt -l .)"
           git diff --exit-code

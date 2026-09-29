@@ -83,7 +83,7 @@ is lazy; `New` does not prove a server is reachable.
 
 - A mutation transport error or malformed response returns `UNKNOWN` plus an error.
   Reconcile through application knowledge; never automatically replay it. Local
-  validation returns `NOT_STARTED`. A server-provided outcome is never downgraded.
+  validation returns `NOT_STARTED`. A valid server result keeps its outcome.
 - `Bulk(ctx, "weir://STORE", operations)` validates all input envelopes before any
   RPC. It assigns consecutive indexes and returns a slice in input order. Each
   operation has exactly one `Read` or `Mutate`. Backend semantics are validated
@@ -135,8 +135,9 @@ GOPROXY=off GOSUMDB=off go test -race -count=1 ./...
 GOPROXY=off GOSUMDB=off go vet ./...
 ```
 
-Default tests use in-memory gRPC and never start databases or contact external
-servers. Tests cover malformed/truncated/duplicate/out-of-order results, final
+Default tests use local gRPC fixtures (in-memory protocol tests and a loopback
+workload failure test) and never start databases or contact external servers.
+Tests cover malformed/truncated/duplicate/out-of-order results, final
 non-OK status after End, partial batch evidence, cancellation, blocked Native
 upload cleanup, prevalidation and no replay.
 
@@ -154,6 +155,12 @@ enabled backend runs Create, duplicate-precondition, Replace, Put, AtomicTransfo
 Read, ordered mixed Bulk, Scan, Native and Delete through the SDK. Omit either
 resource variable to skip that backend. Only target a dedicated test dataset.
 These tests are compatible with an installed Helm release through port-forward.
+
+The [explicit stability workload](examples/soak/README.md) schedules bounded
+record cycles, audits acknowledged values and mutation uncertainty, and emits
+machine-readable progress/final evidence for a separately provisioned acceptance
+Job. It never starts as part of default tests. Infrastructure observation and
+persistent evidence storage remain part of the deployment qualification.
 
 This repository follows the upstream project's current licensing status; no new
 license grant is introduced here.
