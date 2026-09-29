@@ -26,6 +26,7 @@ import (
 type options struct {
 	Address, Mongo, Search, RunID                          string
 	ServerRevision, ImageDigest, ChartVersion, SDKRevision string
+	ObserverStatus, ObserverHeartbeat                      string
 	Duration, MaxP99                                       time.Duration
 	Workers, Rate                                          int
 }
@@ -110,6 +111,8 @@ func main() {
 	flag.StringVar(&cfg.ImageDigest, "image-digest", "", "exact server OCI digest")
 	flag.StringVar(&cfg.ChartVersion, "chart-version", "", "chart version or commit")
 	flag.StringVar(&cfg.SDKRevision, "sdk-revision", "", "SDK version or commit")
+	flag.StringVar(&cfg.ObserverStatus, "observer-status", "", "optional observer terminal JSON path; requires observer-heartbeat")
+	flag.StringVar(&cfg.ObserverHeartbeat, "observer-heartbeat", "", "optional observer heartbeat path; requires observer-status")
 	flag.DurationVar(&cfg.Duration, "duration", 0, "required observation duration, e.g. 24h")
 	flag.DurationVar(&cfg.MaxP99, "max-p99", 500*time.Millisecond, "maximum cycle p99 bucket upper bound")
 	flag.IntVar(&cfg.Workers, "workers", 6, "even worker count; half per backend")
@@ -127,6 +130,9 @@ func main() {
 	}
 }
 func validate(cfg options) error {
+	if (cfg.ObserverStatus == "") != (cfg.ObserverHeartbeat == "") || (cfg.ObserverStatus != "" && cfg.ObserverStatus == cfg.ObserverHeartbeat) {
+		return errors.New("observer-status and observer-heartbeat must be distinct paths supplied together")
+	}
 	if cfg.Address == "" || !strings.HasPrefix(cfg.Mongo, "weir://") || len(strings.Split(cfg.Mongo, "/")) != 5 || !strings.HasPrefix(cfg.Search, "weir://") || len(strings.Split(cfg.Search, "/")) != 4 || strings.HasSuffix(cfg.Mongo, "/") || strings.HasSuffix(cfg.Search, "/") {
 		return errors.New("explicit address and owned Mongo/Search collection URIs are required")
 	}
@@ -144,9 +150,25 @@ func validate(cfg options) error {
 func run(parent context.Context, cfg options, out io.Writer) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	start := time.Now()
 	encoder := json.NewEncoder(out)
+	var observer *observerGuard
+	if cfg.ObserverStatus != "" {
+		var err error
+		observer, err = awaitObserver(ctx, cfg)
+		if err != nil {
+			report := map[string]any{"kind": "failed", "run_id": cfg.RunID, "elapsed_ns": 0, "cycles": 0, "failures": 1, "unknown": 0, "error": err.Error()}
+			if writeErr := encoder.Encode(report); writeErr != nil {
+				return errors.Join(err, writeErr)
+			}
+			return err
+		}
+	}
+	start := time.Now()
 	identity := map[string]any{"kind": "start", "started_utc": start.UTC().Format(time.RFC3339Nano), "duration_ns": int64(cfg.Duration), "run_id": cfg.RunID, "workers": cfg.Workers, "cycles_per_second": cfg.Rate, "max_p99_ns": int64(cfg.MaxP99), "server_revision": cfg.ServerRevision, "image_digest": cfg.ImageDigest, "chart_version": cfg.ChartVersion, "sdk_revision": cfg.SDKRevision, "address": cfg.Address, "mongo_resource": cfg.Mongo, "search_resource": cfg.Search}
+	if observer != nil {
+		identity["observer_status"] = cfg.ObserverStatus
+		identity["observer_heartbeat"] = cfg.ObserverHeartbeat
+	}
 	if err := encoder.Encode(identity); err != nil {
 		return err
 	}
@@ -160,6 +182,12 @@ func run(parent context.Context, cfg options, out io.Writer) error {
 	go func() { wg.Wait(); close(events) }()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	var observerTicks <-chan time.Time
+	if observer != nil {
+		observerTicker := time.NewTicker(time.Second)
+		defer observerTicker.Stop()
+		observerTicks = observerTicker.C
+	}
 	var hist histogram
 	var interval histogram
 	var cycles, streams, failures, unknown uint64
@@ -171,10 +199,27 @@ func run(parent context.Context, cfg options, out io.Writer) error {
 		}
 		return encoder.Encode(report)
 	}
+	checkObserver := func() {
+		if observer == nil || firstError != nil {
+			return
+		}
+		if err := observer.check(time.Now()); err != nil {
+			firstError = err
+			failures++
+			cancel()
+			report := map[string]any{"kind": "observer_failure", "run_id": cfg.RunID, "error": err.Error()}
+			if writeErr := encoder.Encode(report); writeErr != nil {
+				firstError = errors.Join(firstError, writeErr)
+			}
+		}
+	}
 	for {
 		select {
+		case <-observerTicks:
+			checkObserver()
 		case item, ok := <-events:
 			if !ok {
+				checkObserver()
 				elapsed := time.Since(start)
 				planned := uint64(cfg.Duration.Seconds() * float64(cfg.Rate*cfg.Workers))
 				if firstError == nil && (parent.Err() != nil || elapsed < cfg.Duration || cycles*100 < planned*98 || hist.p99() > cfg.MaxP99 || interval.p99() > cfg.MaxP99) {

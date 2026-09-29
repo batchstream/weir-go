@@ -22,7 +22,9 @@ and a fresh `-run-id`. Freeze all values and artifact identities before the 24-h
   -run-id weir-soak-UNIQUE-LOWERCASE-ID \
   -duration 24h -workers 6 -cycles-per-second 5 -max-p99 500ms \
   -server-revision FULL_SERVER_COMMIT -image-digest sha256:FULL_IMAGE_DIGEST \
-  -chart-version CHART_VERSION -sdk-revision FULL_SDK_COMMIT
+  -chart-version CHART_VERSION -sdk-revision FULL_SDK_COMMIT \
+  -observer-status /results/observations.jsonl.status.json \
+  -observer-heartbeat /results/observations.jsonl.ready
 ```
 
 Each worker owns a distinct string key, with half the workers assigned to each
@@ -56,6 +58,20 @@ longer than the requested duration, and a task-owned persistent results volume.
 Redirect both stdout/stderr and persist the process exit status; retain the Job
 and its UID. A controller must treat eviction, disappearance, restart or absent
 final evidence as failure, never silently launch a new 24-hour window.
+
+For an externally observed qualification, supply both observer paths. The observer
+must publish its first heartbeat before the workload starts; startup waits at most
+30 seconds. It refreshes the heartbeat by atomic rename after each complete valid
+sample, and atomically publishes terminal JSON with a required `passed` boolean.
+A missing, unreadable or unchanged heartbeat for over 150 seconds, malformed or
+failed status, or an observer that exits early fails the workload. Heartbeat file
+mtime only detects changes; the freshness interval uses the process monotonic
+clock. The runner checks every second and again before reporting success, cancels
+workers on failure and retains their records. It does not wait for observer success:
+the observer verifies the completed Job and persisted runner report afterward.
+Both final reports plus a successful Job exit are required. Use fresh paths per
+run, and start the observer before opening the runner report file. Omitting both
+flags remains useful for standalone functional calibration.
 
 Separately sample each Weir Pod's UID, image digest, readiness, restart count,
 OOM/termination state and Prometheus memory/admission/execution/queue metrics at
