@@ -31,8 +31,12 @@ def main():
         target = refs.get('refs/tags/' + version + '^{}', refs.get('refs/tags/' + version))
         if target != sha:
             raise ValueError('existing version belongs to another commit; refusing overwrite')
-    existing = subprocess.run(['gh', 'release', 'view', version, '--repo', 'batchstream/weir-go', '--json', 'tagName'], capture_output=True, text=True, timeout=30)
-    if existing.returncode != 0:
+    existing = subprocess.run(['gh', 'release', 'view', version, '--repo', 'batchstream/weir-go', '--json', 'tagName,isDraft'], capture_output=True, text=True, timeout=30)
+    if existing.returncode == 0:
+        release = json.loads(existing.stdout)
+        if release['tagName'] != version or release['isDraft']:
+            raise ValueError('existing release identity or publication state differs')
+    else:
         if 'release not found' not in existing.stderr.lower() and '404' not in existing.stderr:
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:

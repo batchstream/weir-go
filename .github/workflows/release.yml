@@ -40,6 +40,7 @@ jobs:
         run: |
           go test -race -count=1 -timeout=90s ./...
           go vet ./...
+          python3 -m unittest discover -s scripts -p '*_test.py' -v
           git diff --exit-code
       - name: Publish immutable tag and verify external installation
         env:
