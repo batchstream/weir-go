@@ -8,9 +8,8 @@ server-streaming `Scan`, and duplex `Native`.
 go get github.com/batchstream/weir-go@v0.1.0
 ```
 
-The first release is being qualified together with Weir v0.1.0. Until that tag is
-published, install an explicitly reviewed commit. See `go.mod` for the exact
-server protocol revision. The module imports the server's generated public
+SDK v0.1.0 uses the stable Weir v0.1.0 protocol; see `go.mod` for the exact
+server dependency. The module imports the server's generated public
 `api/weir/v1` and `api/weir/search/v1` packages; it does not duplicate descriptors,
 generate a second protocol, or depend on server internals. Patch updates preserve
 the SDK API and wire semantics; breaking changes before v1 increment the minor
