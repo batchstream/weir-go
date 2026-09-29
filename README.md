@@ -75,8 +75,10 @@ APPLIED result: the SDK preserves that positive acknowledgement.
 
 ## Completion and retry rules
 
-The client never retries an operation, starts another endpoint attempt, or restarts
+The SDK never retries an operation, redispatches it to another endpoint, or restarts
 a stream. gRPC configured retries, service config, and retry buffering are disabled.
+The underlying connection can reconnect for later calls; this does not replay an
+operation whose result was lost.
 Calls have a default 30-second timeout, shortened by the caller's context deadline.
 Set a positive `Options.Timeout` to change that ceiling. Connection establishment
 is lazy; `New` does not prove a server is reachable.
