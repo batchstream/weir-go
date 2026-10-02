@@ -17,6 +17,7 @@ import (
 	"time"
 
 	weir "github.com/batchstream/weir-go"
+	"github.com/batchstream/weir/api/protocol"
 	spb "github.com/batchstream/weir/api/weir/search/v1"
 	pb "github.com/batchstream/weir/api/weir/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -43,19 +44,18 @@ type event struct {
 	Unknown    bool   `json:"unknown,omitempty"`
 }
 
-type bulkAuditError struct {
-	Cause    error
-	Evidence string
-	Unknown  bool
+type mutationAuditError struct {
+	Cause   error
+	Outcome pb.MutationOutcome
 }
 
-func (e *bulkAuditError) Error() string {
-	return fmt.Sprintf("Bulk terminal evidence %s: %v", e.Evidence, e.Cause)
+func (e *mutationAuditError) Error() string {
+	return fmt.Sprintf("mutation outcome %s: %v", e.Outcome, e.Cause)
 }
-func (e *bulkAuditError) Unwrap() error { return e.Cause }
+func (e *mutationAuditError) Unwrap() error { return e.Cause }
 
 type worker struct {
-	client                                   *weir.Client
+	client                                   pb.StoreServiceClient
 	backend, collection, resource, id, store string
 	number                                   int
 	opts                                     options
@@ -105,7 +105,7 @@ func (h histogram) p99() time.Duration {
 
 func main() {
 	cfg := options{}
-	flag.StringVar(&cfg.Address, "address", "", "application Service host:port; explicit isolated plaintext")
+	flag.StringVar(&cfg.Address, "address", "", "known owner application host:port; explicit isolated plaintext")
 	flag.StringVar(&cfg.Targets, "targets", "", "comma-separated fixed Pod IP:port targets; mutually exclusive with address")
 	flag.StringVar(&cfg.Mongo, "mongo-resource", "", "owned Mongo collection URI")
 	flag.StringVar(&cfg.Search, "search-resource", "", "owned Search index URI")
@@ -139,7 +139,9 @@ func validate(cfg options) error {
 	if (cfg.ObserverStatus == "") != (cfg.ObserverHeartbeat == "") || (cfg.ObserverStatus != "" && cfg.ObserverStatus == cfg.ObserverHeartbeat) {
 		return errors.New("observer-status and observer-heartbeat must be distinct paths supplied together")
 	}
-	if !strings.HasPrefix(cfg.Mongo, "weir://") || len(strings.Split(cfg.Mongo, "/")) != 5 || !strings.HasPrefix(cfg.Search, "weir://") || len(strings.Split(cfg.Search, "/")) != 4 || strings.HasSuffix(cfg.Mongo, "/") || strings.HasSuffix(cfg.Search, "/") {
+	_, mongoSegments, mongoErr := protocol.ParseResource(cfg.Mongo)
+	_, searchSegments, searchErr := protocol.ParseResource(cfg.Search)
+	if mongoErr != nil || searchErr != nil || len(mongoSegments) != 2 || len(searchSegments) != 1 {
 		return errors.New("owned Mongo/Search collection URIs are required")
 	}
 	if !regexp.MustCompile(`^weir-soak-[a-z0-9-]{1,64}$`).MatchString(cfg.RunID) {
@@ -297,23 +299,35 @@ func execute(args workerRun) {
 		backend, collection = "search", cfg.Search
 	}
 	id := fmt.Sprintf("%s-%02d", cfg.RunID, number)
-	w := worker{backend: backend, collection: collection, resource: collection + "/s:" + id, id: id, store: "weir://" + strings.Split(strings.TrimPrefix(collection, "weir://"), "/")[0], number: number, opts: cfg}
+	store, _, parseErr := protocol.ParseResource(collection)
+	relative := strings.TrimPrefix(collection, "weir://"+store+"/")
+	w := worker{backend: backend, collection: relative, resource: relative + "/s:" + id, id: id, store: store, number: number, opts: cfg}
 	report := func(kind string, sequence int64, d time.Duration, err error) {
-		e := event{Kind: kind, Worker: number, Target: args.target, Backend: backend, Resource: w.resource, Sequence: sequence, DurationNS: int64(d)}
+		e := event{Kind: kind, Worker: number, Target: args.target, Backend: backend, Resource: "weir://" + w.store + "/" + w.resource, Sequence: sequence, DurationNS: int64(d)}
 		if err != nil {
 			e.Error = err.Error()
 			e.Unknown = unknownWrite(err)
 		}
 		events <- e
 	}
-	clientOpts := weir.Options{Plaintext: true, Timeout: 2 * time.Second}
-	var err error
-	w.client, err = weir.New(args.target, clientOpts)
+	if parseErr != nil {
+		report("failure", 0, 0, parseErr)
+		return
+	}
+	connection, err := weir.Dial(args.target)
 	if err != nil {
 		report("failure", 0, 0, err)
 		return
 	}
-	defer w.client.Close()
+	defer connection.Close()
+	w.client = pb.NewStoreServiceClient(connection)
+	initialization, cancel := context.WithTimeout(ctx, 2*time.Second)
+	err = verifyOwner(initialization, w.client, args.target, w.store)
+	cancel()
+	if err != nil {
+		report("failure", 0, 0, err)
+		return
+	}
 	create, err := w.mutation("create", 0)
 	if err == nil {
 		err = w.mutate(ctx, create)
@@ -372,7 +386,7 @@ func execute(args workerRun) {
 		return
 	}
 	read := &pb.ReadRequest{Resource: w.resource}
-	result, err := w.client.Read(ctx, read)
+	result, err := w.read(ctx, read)
 	if err == nil && result.GetMissing() == nil {
 		err = errors.New("delete acknowledged but record remains")
 	}
@@ -384,36 +398,19 @@ func execute(args workerRun) {
 }
 
 func unknownWrite(err error) bool {
-	var audited *bulkAuditError
-	if errors.As(err, &audited) {
-		return audited.Unknown
-	}
-	var mutation *weir.MutationError
-	if errors.As(err, &mutation) && mutation.Outcome == pb.MutationOutcome_UNKNOWN {
-		return true
-	}
-	var batch *weir.BatchError
-	if errors.As(err, &batch) {
-		if batch.Cause != nil {
-			return true
-		}
-		for _, failure := range batch.Failures {
-			if unknownWrite(failure) {
-				return true
-			}
-		}
-	}
-	return false
+	var audited *mutationAuditError
+	return errors.As(err, &audited) && audited.Outcome == pb.MutationOutcome_UNKNOWN
 }
+
 func (w worker) mutation(action string, n int64) (*pb.MutateRequest, error) {
-	doc := &pb.Document{MediaType: weir.MediaTypeJSON, Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
+	doc := &pb.Document{MediaType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
 	if w.backend == "mongo" {
 		value := bson.D{{Key: "_id", Value: w.id}, {Key: "n", Value: n}}
 		raw, err := bson.Marshal(value)
 		if err != nil {
 			return nil, err
 		}
-		doc.MediaType = weir.MediaTypeBSON
+		doc.MediaType = "application/bson"
 		doc.Data = raw
 	}
 	request := &pb.MutateRequest{Resource: w.resource}
@@ -433,15 +430,43 @@ func (w worker) mutation(action string, n int64) (*pb.MutateRequest, error) {
 	return request, nil
 }
 func (w worker) mutate(ctx context.Context, request *pb.MutateRequest) error {
-	result, err := w.client.Mutate(ctx, request)
-	if err != nil {
-		return err
-	}
-	if result.Outcome != pb.MutationOutcome_APPLIED {
-		return fmt.Errorf("unexpected mutation outcome %s", result.Outcome)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	variant := &pb.Call_Mutate{Mutate: request}
+	call := &pb.Call{Version: 1, Operation: variant}
+	options := weir.RecordOptions{StoreName: w.store, Call: call}
+	result, err := weir.Record(ctx, w.client, options)
+	mutation := result.GetMutation()
+	if err != nil || mutation.GetOutcome() != pb.MutationOutcome_APPLIED || mutation.GetFailure() != nil {
+		outcome := pb.MutationOutcome_UNKNOWN
+		if mutation != nil {
+			outcome = mutation.Outcome
+		}
+		if err == nil {
+			err = fmt.Errorf("unexpected mutation result: %v", mutation)
+		}
+		audited := &mutationAuditError{Cause: err, Outcome: outcome}
+		return audited
 	}
 	return nil
 }
+func (w worker) read(ctx context.Context, request *pb.ReadRequest) (*pb.ReadResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	variant := &pb.Call_Read{Read: request}
+	call := &pb.Call{Version: 1, Operation: variant}
+	options := weir.RecordOptions{StoreName: w.store, Call: call}
+	result, err := weir.Record(ctx, w.client, options)
+	if err != nil {
+		return nil, err
+	}
+	read := result.GetRead()
+	if read == nil || read.GetFailure() != nil {
+		return nil, fmt.Errorf("unexpected read result: %v", read)
+	}
+	return read, nil
+}
+
 func (w worker) verify(doc *pb.Document, want int64) error {
 	if doc == nil {
 		return errors.New("acknowledged record missing")
@@ -480,7 +505,7 @@ func (w worker) cycle(ctx context.Context, n int64) error {
 		return err
 	}
 	read := &pb.ReadRequest{Resource: w.resource}
-	result, err := w.client.Read(ctx, read)
+	result, err := w.read(ctx, read)
 	if err != nil {
 		return err
 	}
@@ -491,53 +516,20 @@ func (w worker) cycle(ctx context.Context, n int64) error {
 	if err != nil {
 		return err
 	}
-	mutation := weir.Operation{Mutate: replace}
-	retrieval := weir.Operation{Read: read}
-	operations := []weir.Operation{mutation, retrieval}
-	results, err := w.client.Bulk(ctx, w.store, operations)
+	if err := w.mutate(ctx, replace); err != nil {
+		return err
+	}
+	result, err = w.read(ctx, read)
 	if err != nil {
-		failure := &bulkAuditError{Cause: err, Evidence: bulkEvidence(results), Unknown: unknownBulkMutation(results, err)}
-		return failure
+		return err
 	}
-	if len(results) != 2 || results[0].GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED {
-		return errors.New("ordered Bulk mutation acknowledgement missing")
-	}
-	return w.verify(results[1].GetRead().GetDocument(), n*2+1)
+	return w.verify(result.GetDocument(), n*2+1)
 }
 
-func unknownBulkMutation(results []*pb.BulkResult, err error) bool {
-	// The sole mutation in this workload is index zero. A valid APPLIED reply
-	// remains conclusive even if the following Read or final transport fails.
-	if len(results) > 0 && results[0].GetMutation() != nil {
-		return results[0].GetMutation().Outcome == pb.MutationOutcome_UNKNOWN
-	}
-	var batch *weir.BatchError
-	return errors.As(err, &batch)
-}
-
-func bulkEvidence(results []*pb.BulkResult) string {
-	items := make([]string, 0, 2)
-	for index := range 2 {
-		state := "no-result"
-		if index < len(results) && results[index] != nil {
-			if mutation := results[index].GetMutation(); mutation != nil {
-				state = mutation.Outcome.String()
-				if mutation.Failure != nil {
-					state += "/" + mutation.Failure.Code.String()
-				}
-			} else if read := results[index].GetRead(); read != nil {
-				state = "read"
-				if read.GetFailure() != nil {
-					state += "/" + read.GetFailure().Code.String()
-				}
-			}
-		}
-		items = append(items, fmt.Sprintf("%d=%s", index, state))
-	}
-	return strings.Join(items, ",")
-}
 func (w worker) streams(ctx context.Context) error {
-	selector := &pb.Document{MediaType: weir.MediaTypeJSON, Data: []byte(`{"query":{"ids":{"values":["` + w.id + `"]}}}`)}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	selector := &pb.Document{MediaType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + w.id + `"]}}}`)}
 	if w.backend == "mongo" {
 		filter := bson.D{{Key: "_id", Value: w.id}}
 		value := bson.D{{Key: "filter", Value: filter}}
@@ -545,20 +537,25 @@ func (w worker) streams(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		selector.MediaType = weir.MediaTypeBSON
+		selector.MediaType = "application/bson"
 		selector.Data = raw
 	}
-	request := &pb.ScanRequest{Resource: w.collection, Selector: selector, FetchItemsHint: 1}
+	request := &pb.ScanRequest{Resource: w.collection, Selector: selector, PageSize: 1}
 	count := 0
-	_, err := w.client.Scan(ctx, request, func(doc *pb.Document) error { count++; return nil })
+	pageOptions := weir.ScanPageOptions{StoreName: w.store, Request: request}
+	pageOptions.Consume = func(context.Context, *pb.Document) error { count++; return nil }
+	page, err := weir.ScanPage(ctx, w.client, pageOptions)
 	if err != nil {
 		return err
+	}
+	if page.GetFailure() != nil {
+		return fmt.Errorf("ScanPage failed: %v", page.Failure)
 	}
 	if count != 1 {
 		return fmt.Errorf("owned record Scan count=%d", count)
 	}
 	open := &pb.NativeOpen{Resource: w.collection}
-	native := weir.NativeRequest{Open: open}
+	native := &pb.NativeCall{Open: open}
 	if w.backend == "mongo" {
 		parts := strings.Split(w.collection, "/")
 		query := bson.D{{Key: "_id", Value: w.id}}
@@ -569,7 +566,7 @@ func (w worker) streams(ctx context.Context) error {
 		}
 		native.Body = raw
 		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		open.BodyMediaType = weir.MediaTypeBSON
+		open.BodyMediaType = "application/bson"
 	} else {
 		descriptor := &spb.Request{Method: "GET", Path: "/_doc/" + w.id}
 		raw, err := proto.Marshal(descriptor)
@@ -579,16 +576,39 @@ func (w worker) streams(ctx context.Context) error {
 		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.search-http.v1+protobuf", Data: raw}
 	}
 	var body []byte
-	result, err := w.client.Native(ctx, native, func(chunk []byte) error {
-		if len(body)+len(chunk) > 1<<20 {
-			return errors.New("Native response exceeds workload bound")
+	var head *pb.NativeHead
+	var terminal *pb.NativeEnd
+	produced := false
+	variant := &pb.Call_Native{Native: native}
+	call := &pb.Call{Version: 1, Operation: variant}
+	nativeOptions := weir.Options{StoreName: w.store}
+	nativeOptions.Produce = func(context.Context) (*pb.Call, error) {
+		if produced {
+			return nil, io.EOF
 		}
-		body = append(body, chunk...)
+		produced = true
+		return call, nil
+	}
+	nativeOptions.Consume = func(_ context.Context, _ uint64, event *pb.Event) error {
+		if value := event.GetHead(); value != nil {
+			head = value
+		}
+		if len(body)+len(event.GetChunk()) > 1<<20 {
+			return errors.New("native response exceeds workload bound")
+		}
+		body = append(body, event.GetChunk()...)
+		if value := event.GetNativeEnd(); value != nil {
+			terminal = value
+		}
 		return nil
-	})
-	if err != nil {
+	}
+	if err := weir.Execute(ctx, w.client, nativeOptions); err != nil {
 		return err
 	}
+	if terminal.GetCompletion() != pb.NativeCompletion_RESPONSE_COMPLETE {
+		return fmt.Errorf("native completion: %v", terminal)
+	}
+
 	if w.backend == "mongo" {
 		raw := bson.Raw(body)
 		if err := raw.Validate(); err != nil {
@@ -600,11 +620,11 @@ func (w worker) streams(ctx context.Context) error {
 			return errors.New("Native count differs from one owned record")
 		}
 	} else {
-		if result == nil || result.Head == nil || result.Head.Metadata == nil {
+		if head == nil || head.Metadata == nil {
 			return errors.New("Native Search metadata missing")
 		}
 		meta := &spb.Response{}
-		if err := proto.Unmarshal(result.Head.Metadata.Data, meta); err != nil {
+		if err := proto.Unmarshal(head.Metadata.Data, meta); err != nil {
 			return err
 		}
 		if meta.StatusCode != 200 {

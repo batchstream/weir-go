@@ -41,7 +41,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK for all five Weir RPCs, with bounded calls, strict stream completion, partial result evidence, and no automatic replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
+            notes.write_text(f'Go SDK for ResolveStore initialization and direct finite Execute requests, with bounded streaming, completion evidence, and no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -49,7 +49,7 @@ def main():
         root = Path(directory)
         env = dict(os.environ, GOWORK='off', GOPROXY='https://proxy.golang.org,direct', GOMODCACHE=str(root / 'cache'), GOBIN=str(root / 'bin'))
         run(['go', 'mod', 'init', 'example.com/weir-release-check'], cwd=root, env=env)
-        source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go")\nfunc main() { value, err := weir.Resource("mongo", "db", "records", "s:check"); if err != nil { panic(err) }; fmt.Println(value) }\n'
+        source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go"; "github.com/batchstream/weir/api/protocol")\nfunc main() { connection, err := weir.Dial("127.0.0.1:7447"); if err != nil { panic(err) }; defer connection.Close(); fmt.Println(protocol.EncodeSegment("s:check/path")) }\n'
         (root / 'main.go').write_text(source)
         for attempt in range(6):
             result = subprocess.run(['go', 'get', 'github.com/batchstream/weir-go@' + version], cwd=root, env=env, timeout=180)
@@ -58,12 +58,12 @@ def main():
             if attempt == 5:
                 raise RuntimeError('published module could not be installed')
             time.sleep(5)
-        if run(['go', 'run', '.'], cwd=root, env=env) != 'weir://mongo/db/records/s:check':
+        if run(['go', 'run', '.'], cwd=root, env=env) != 's:check%2Fpath':
             raise ValueError('external consumer returned unexpected result')
         resolved = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir-go'], cwd=root, env=env))
         if resolved['Version'] != version or resolved.get('Replace'):
             raise ValueError('external consumer did not use the published module')
-        for example in ('read', 'soak'):
+        for example in ('read', 'basic', 'scan', 'native', 'soak'):
             run(['go', 'install', f'github.com/batchstream/weir-go/examples/{example}@{version}'], cwd=root, env=env)
         print('Verified external module and example installation:', version, sha)
 

@@ -3,26 +3,45 @@
 This record distinguishes protocol tests, real backend integration, and sustained
 production qualification. Passing one does not establish the others.
 
-## Protocol and installation
+## Current protocol migration
 
-The initial implementation was reviewed through
-[PR #1](https://github.com/batchstream/weir-go/pull/1). Both Linux amd64 and arm64
-CI run the complete default race suite and vet with module networking disabled
-after dependency preparation. Protocol tests use in-memory gRPC; the workload's
-failure-path regression uses a loopback gRPC server.
+The SDK now implements ResolveStore initialization followed by direct finite
+Execute RPCs. Source schemas and shared protocol/DNS helpers are supplied by the
+pinned Weir public API revision. CI runs default race, vet, tagged integration
+compilation, Python release preflight tests and formatting on Linux amd64/arm64.
+Its production dependency check rejects all Weir internal packages and locally
+generated protobuf source. No release is published by this migration; the release
+workflow still requires a stable, unreplaced upstream protocol tag.
 
-The suite rejects missing/duplicate Ends, data after End, non-OK status after End,
-incorrect Bulk/Scan counts, duplicate/out-of-range Bulk indexes, wrong result
-families, malformed mutation outcomes and invalid envelopes. It preserves partial
-Bulk results, bounds retained result bytes, joins blocked Native uploads, validates
-whole batches before dispatch, and verifies explicit transport defaults. Review
-found a typed-nil protobuf action panic; commit `ac698a6` rejects all five typed-nil
-action wrappers and nested expression wrappers without making any RPC.
+The current tests cover malformed or incomplete Events, unknown request IDs,
+request completion and final status, bounded input, canceled senders, no replay,
+directory conflicts/expiry, DNS replica refresh, and fixed owner workload routing.
+The integration test explicitly initializes through an application listener and
+uses one owned temporary record per backend. Historical five-RPC and installed
+release evidence below does not establish compatibility or qualification for the
+current protocol. Record new real backend/production results with exact source
+revisions and images before making deployment claims.
 
-Commit `ac698a6` was independently installed from its public GitHub module into a
-new consumer module and a new module cache. The consumer executed `Resource` and
-resolved `v0.0.0-20260929011905-ac698a654e01` with no workspace replacements.
-The stable release workflow repeats external installation for the published tag.
+## Local migration validation, 2026-10-03
+
+The independent SDK passed with `GOWORK=off` against the published public API
+revision `v0.1.1-0.20261002222539-3571ee4f843c`. Loopback tests used the current
+Weir binary and task-owned MongoDB 8.0.32 and Elasticsearch 8.19.22 fixtures.
+Both lifecycle tests passed under race: ResolveStore/Open, Create, duplicate-create
+precondition, Replace, Put, AtomicTransform, Read, Complete-gated mixed Execute,
+ScanPage, Native Execute and Delete. Generated records were cleaned up. Example
+regressions also verify fixed owner routing, actual Execute dispatch, nonowner
+rejection before business traffic, and uncertain-write preservation.
+
+This validation used a local binary; it does not qualify an OCI image, Kubernetes
+rollout or sustained production workload. The historical evidence below remains
+specific to the retired release.
+
+## Historical release qualification
+
+The following dated evidence describes the retired five-RPC protocol and its
+released SDK. It is retained as deployment history, not validation of the current
+SDK API, bounds, or wire contract.
 
 ## Initial EKS integration, 2026-09-29
 

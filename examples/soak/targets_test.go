@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,17 +53,18 @@ func TestFixedTargetValidation(t *testing.T) {
 type targetReceipt struct {
 	target   int
 	resource string
+	store    string
 }
 
 type fixedTargetServer struct {
-	pb.UnimplementedWeirServer
+	ownerFixture
 	number  int
 	created chan<- targetReceipt
 }
 
-func (s *fixedTargetServer) Mutate(ctx context.Context, req *pb.MutateRequest) (*pb.MutationResult, error) {
+func (s *fixedTargetServer) mutate(ctx context.Context, store string, req *pb.MutateRequest) (*pb.MutationResult, error) {
 	if req.GetCreate() != nil {
-		receipt := targetReceipt{target: s.number, resource: req.Resource}
+		receipt := targetReceipt{target: s.number, resource: req.Resource, store: store}
 		s.created <- receipt
 	}
 	if req.GetPut() != nil {
@@ -83,11 +86,17 @@ func TestEachFixedTargetReceivesBothBackendsAndIsAudited(t *testing.T) {
 		addresses[i] = listener.Addr().String()
 		server := grpc.NewServer()
 		backend := &fixedTargetServer{number: i, created: created}
-		pb.RegisterWeirServer(server, backend)
+		backend.endpoint = listener.Addr().String()
+		pb.RegisterStoreServiceServer(server, backend)
 		go server.Serve(listener)
 		t.Cleanup(func() { server.Stop(); _ = listener.Close() })
 	}
 	cfg := options{Targets: strings.Join(addresses, ","), Mongo: "weir://mongo/test/records", Search: "weir://search/records", RunID: "weir-soak-fixed", Duration: 2 * time.Minute, MaxP99: time.Second, Workers: 6, Rate: 5}
+	cfg.ServerRevision, cfg.ImageDigest = strings.Repeat("a", 40), "sha256:"+strings.Repeat("b", 64)
+	cfg.ChartVersion, cfg.SDKRevision = "local-fixture", "local-fixture"
+	if err := validate(cfg); err != nil {
+		t.Fatal("valid fixed target workload rejected", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var output bytes.Buffer
@@ -106,7 +115,7 @@ func TestEachFixedTargetReceivesBothBackendsAndIsAudited(t *testing.T) {
 			if number%2 == 1 {
 				backend = "search"
 			}
-			if receipt.target != number%3 || !strings.HasPrefix(receipt.resource, "weir://"+backend+"/") || seen[key] {
+			if receipt.target != number%3 || receipt.store != backend || seen[key] {
 				t.Fatal("worker did not use its fixed target/backend", receipt, number)
 			}
 			seen[key] = true
@@ -140,5 +149,37 @@ func TestEachFixedTargetReceivesBothBackendsAndIsAudited(t *testing.T) {
 		if worker.Worker != i || worker.Backend != backend || worker.Target != addresses[i%3] {
 			t.Fatal("incorrect target audit", worker)
 		}
+	}
+}
+
+type nonOwnerServer struct {
+	ownerFixture
+	business atomic.Int32
+}
+
+func (s *nonOwnerServer) Execute(grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+	s.business.Add(1)
+	return errors.New("nonowner received business request")
+}
+func TestFixedTargetRejectsNonownerBeforeBusiness(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	backend := &nonOwnerServer{}
+	backend.endpoint = "127.0.0.1:1"
+	pb.RegisterStoreServiceServer(server, backend)
+	go server.Serve(listener)
+	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
+	cfg := options{Targets: listener.Addr().String(), Mongo: "weir://mongo/test/records", Search: "weir://search/records", RunID: "weir-soak-nonowner", Duration: time.Second, MaxP99: time.Second, Workers: 2, Rate: 5}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var output bytes.Buffer
+	if err := run(ctx, cfg, &output); err == nil || !strings.Contains(err.Error(), "does not own") {
+		t.Fatal("nonowner accepted as fixed target", err, output.String())
+	}
+	if backend.business.Load() != 0 {
+		t.Fatal("business requests reached nonowner", backend.business.Load())
 	}
 }

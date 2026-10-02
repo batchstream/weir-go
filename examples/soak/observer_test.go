@@ -110,14 +110,14 @@ func TestObserverReadinessIsBoundedAndAudited(t *testing.T) {
 }
 
 type blockedWriteServer struct {
-	pb.UnimplementedWeirServer
+	ownerFixture
 	mu      sync.Mutex
 	puts    map[string]int
 	deletes int
 	started chan struct{}
 }
 
-func (s *blockedWriteServer) Mutate(ctx context.Context, req *pb.MutateRequest) (*pb.MutationResult, error) {
+func (s *blockedWriteServer) mutate(ctx context.Context, req *pb.MutateRequest) (*pb.MutationResult, error) {
 	s.mu.Lock()
 	if req.GetPut() != nil {
 		s.puts[req.Resource]++
@@ -144,7 +144,8 @@ func TestObserverFailureCancelsWorkAndRetainsUncertainRecords(t *testing.T) {
 	}
 	server := grpc.NewServer()
 	backend := &blockedWriteServer{puts: make(map[string]int), started: make(chan struct{}, 1)}
-	pb.RegisterWeirServer(server, backend)
+	backend.endpoint = listener.Addr().String()
+	pb.RegisterStoreServiceServer(server, backend)
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
 	cfg := observerFiles(t)
