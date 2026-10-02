@@ -84,6 +84,125 @@ type refreshControlFixture struct {
 	initial time.Time
 }
 
+// A deadline can pass before the timer callback publishes Done and Err. gRPC
+// rejects that deadline synchronously even while the parent still reports nil.
+type delayedDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c *delayedDeadlineContext) Deadline() (time.Time, bool) {
+	return c.deadline, true
+}
+
+// Propagate the driver's real deadline cancellation without putting the same
+// deadline on the wire. The remote RPC must stay held until the parent cancels.
+type cancellationOnlyContext struct {
+	context.Context
+}
+
+func (c *cancellationOnlyContext) Deadline() (time.Time, bool) {
+	deadline := time.Time{}
+	return deadline, false
+}
+
+func TestElapsedRefreshDeadlineDoesNotAdvanceAttempt(t *testing.T) {
+	fixture := newRefreshControlFixture(t, []string{"records"})
+	ctx := &delayedDeadlineContext{Context: t.Context(), deadline: time.Now().Add(-time.Second)}
+	entry := fixture.client.stores["records"]
+	round := &refreshRound{ctx: ctx, preferred: entry.channel, control: make(chan struct{}, 2)}
+	defer func() {
+		if round.seed != nil {
+			_ = round.seed.connection.Close()
+		}
+	}()
+	_, err := fixture.client.refreshResolve(round, "records")
+	if !errors.Is(err, context.DeadlineExceeded) && status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("elapsed deadline was not rejected: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("fixture propagated cancellation instead of exercising the elapsed deadline")
+	}
+	select {
+	case call := <-fixture.peer.started:
+		t.Fatalf("elapsed deadline sent an RPC for %s", call.store)
+	default:
+	}
+	entry.mu.RLock()
+	advanced := entry.attempt.After(fixture.initial)
+	entry.mu.RUnlock()
+	if advanced {
+		t.Fatal("Store attempt advanced although the elapsed deadline sent no RPC")
+	}
+	if len(round.control) != 0 {
+		t.Fatal("elapsed deadline leaked a control slot")
+	}
+}
+
+func TestDNSFailureAfterRefreshDeadlineDoesNotAdvanceAttempt(t *testing.T) {
+	fixture := newRefreshControlFixture(t, []string{"records"})
+	parent, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	deadline := time.Now().Add(time.Second)
+	ctx := &delayedDeadlineContext{Context: parent, deadline: deadline}
+	lookupStarted := make(chan struct{})
+	lookupFailed := make(chan struct{})
+	var started sync.Once
+	dns := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		started.Do(func() { close(lookupStarted) })
+		select {
+		case <-lookupFailed:
+			return nil, errors.New("owned DNS failure")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	fixture.client.options.Resolver = dns
+	entry := fixture.client.stores["records"]
+	entry.mu.Lock()
+	entry.endpoints = []string{"executor.weir.test:5000"}
+	entry.mu.Unlock()
+	round := &refreshRound{ctx: ctx, preferred: entry.channel, control: make(chan struct{}, 2)}
+	// Keep RPC admission occupied so only the DNS-failure path could advance
+	// this Store. An elapsed round must return without waiting for these slots.
+	round.control <- struct{}{}
+	round.control <- struct{}{}
+	done := make(chan struct{})
+	go func() { fixture.client.refreshStore(round, "records"); close(done) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-lookupStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("refresh did not start its owned DNS lookup")
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	<-timer.C
+	close(lookupFailed)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("failed DNS lookup waited for admission after the round deadline")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("fixture propagated cancellation instead of exercising the elapsed deadline")
+	}
+	entry.mu.RLock()
+	advanced := entry.attempt.After(fixture.initial)
+	entry.mu.RUnlock()
+	if advanced {
+		t.Fatal("failed DNS lookup advanced the Store after the round deadline")
+	}
+	select {
+	case call := <-fixture.peer.started:
+		t.Fatalf("failed DNS lookup sent an elapsed RPC for %s", call.store)
+	default:
+	}
+	if len(round.control) != 2 {
+		t.Fatal("elapsed DNS failure consumed an occupied control slot")
+	}
+}
+
 // Fairness only depends on refresh admission and the previous attempt state.
 // Prepare every real connection before starting the cache clock or any round;
 // real ingress limits and continuous business traffic are tested by Weir.
@@ -101,7 +220,7 @@ func newRefreshControlFixture(t *testing.T, names []string) *refreshControlFixtu
 	go func() { _ = server.Serve(listener); close(serverDone) }()
 	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-serverDone })
 	address := listener.Addr().String()
-	options := OpenOptions{Seed: address, Stores: names, ResolveTimeout: 8 * time.Second}
+	options := OpenOptions{Seed: address, Stores: names, ResolveTimeout: 20 * time.Second}
 	lifetime, cancel := context.WithCancel(t.Context())
 	client := &Client{options: options, stores: make(map[string]*storeChannel), ctx: lifetime, cancel: cancel, done: make(chan struct{})}
 	ready, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -132,9 +251,9 @@ func newRefreshControlFixture(t *testing.T, names []string) *refreshControlFixtu
 		entry.expires, entry.attempt = initial.Add(30*time.Second), initial
 	}
 	fixture := &refreshControlFixture{client: client, peer: peer, rounds: make(chan *refreshControlRun), initial: initial}
-	// Drive the production round explicitly, with a caller deadline shorter
-	// than its per-RPC budget. A deadline ends a held round before any retry can
-	// turn it into a throughput-dependent number of admitted Stores.
+	// The two-second driver deadline cancels a held round. Its Deadline is
+	// hidden from gRPC, which receives a five-second RPC budget, so remote timers
+	// cannot release slots before the driver's Done/Err is published.
 	go func() {
 		defer close(client.done)
 		for {
@@ -143,7 +262,8 @@ func newRefreshControlFixture(t *testing.T, names []string) *refreshControlFixtu
 				return
 			case run := <-fixture.rounds:
 				bounded, boundedCancel := context.WithTimeout(lifetime, run.timeout)
-				runner := &Client{options: client.options, stores: client.stores, ctx: bounded}
+				forwarded := &cancellationOnlyContext{Context: bounded}
+				runner := &Client{options: client.options, stores: client.stores, ctx: forwarded}
 				runner.refreshStores()
 				run.err = bounded.Err()
 				boundedCancel()
