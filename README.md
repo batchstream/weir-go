@@ -11,11 +11,14 @@ go get github.com/batchstream/weir-go@main
 ```
 
 This source uses the current discovery/Execute protocol and replaces the older
-five-RPC SDK API. See `go.mod` for the exact server protocol revision. Public
-protobuf types and shared validation/DNS helpers come from Weir's `api` packages;
-this module does not generate schemas or import server internals. The migration
-pins an exact upstream commit and does not publish a new release. The release
-workflow requires a stable upstream protocol version before publishing an SDK tag.
+five-RPC SDK API. Public schemas, generated protobuf types and shared
+validation/DNS helpers are owned by the independent
+[weir-protocol](https://github.com/batchstream/weir-protocol) module. Both Weir
+and this SDK depend on that module; the protocol module depends on neither.
+The SDK has no dependency on the Weir server module and does not generate schemas.
+See `go.mod` for the exact protocol revision. This migration pins an upstream
+commit and does not publish a new release. SDK releases require a stable,
+unreplaced `weir-protocol` tag.
 
 ## Initialize and read
 
@@ -40,7 +43,7 @@ fmt.Println("missing:", result.GetRead().GetMissing() != nil)
 ```
 
 Import `weir "github.com/batchstream/weir-go"` and
-`pb "github.com/batchstream/weir/api/weir/v1"`. `Open` completes initialization
+`pb "github.com/batchstream/weir-protocol/api/weir/v1"`. `Open` completes initialization
 and establishes a ready direct connection for every requested Store. Reuse the
 client across goroutines and close it after callers finish. Its refresh worker
 updates directory metadata and DNS replicas; opening context cancellation does
@@ -51,7 +54,7 @@ requests are never replayed. A stale directory cache fails closed after its leas
 `Call` selects a read, mutation, finite scan page, or native exchange. A resource
 is relative to `StoreName`; the Call carries no `weir://STORE/` prefix. Canonically
 encode individual decoded path segments with `protocol.EncodeSegment` from
-`github.com/batchstream/weir/api/protocol`. MongoDB paths are
+`github.com/batchstream/weir-protocol/api/protocol`. MongoDB paths are
 `DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
 `application/bson` with the first `_id` matching the URI key. Search documents
 use `application/json`. The SDK preserves document bytes and business outcomes;
@@ -103,13 +106,17 @@ and [native](examples/native/main.go) consumes native responses. The explicit
 [soak workload](examples/soak/README.md) audits fixed owner traffic and uncertainty.
 
 ```sh
-go mod download
+python3 scripts/download_modules.py
 GOWORK=off GOPROXY=off GOSUMDB=off go test -race -count=1 ./...
 GOWORK=off GOPROXY=off GOSUMDB=off go vet ./...
+GOWORK=off GOPROXY=off GOSUMDB=off python3 scripts/check_dependencies.py
 ```
 
 Default tests use in-memory or loopback fixtures and never start databases or
-contact production. Real backend integration is an explicit opt-in:
+contact production. The dependency check scans both packages and the complete
+module graph, including test and unused requirements. It rejects the Weir server
+module, protocol dependencies leading back to the SDK/server, local module
+replacements and SDK-generated schemas. Real backend integration is an explicit opt-in:
 
 ```sh
 WEIR_ADDRESS=127.0.0.1:7447 \

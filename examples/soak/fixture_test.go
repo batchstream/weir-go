@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 
-	pb "github.com/batchstream/weir/api/weir/v1"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )

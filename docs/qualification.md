@@ -7,11 +7,15 @@ production qualification. Passing one does not establish the others.
 
 The SDK now implements ResolveStore initialization followed by direct finite
 Execute RPCs. Source schemas and shared protocol/DNS helpers are supplied by the
-pinned Weir public API revision. CI runs default race, vet, tagged integration
-compilation, Python release preflight tests and formatting on Linux amd64/arm64.
-Its production dependency check rejects all Weir internal packages and locally
-generated protobuf source. No release is published by this migration; the release
-workflow still requires a stable, unreplaced upstream protocol tag.
+pinned independent `github.com/batchstream/weir-protocol` revision. CI runs default
+race, vet, tagged integration compilation, Python release preflight tests and
+formatting on Linux amd64/arm64. Its dependency check scans normal/tagged test
+package closures and the complete module graph,
+including test and unused requirements. It rejects every Weir server dependency,
+protocol paths leading back to the SDK/server, module replacements and locally
+generated protobuf source. The protocol module owns public schemas and shared
+helpers; neither it nor the SDK depends on the server. No release is published
+by this migration; releases require a stable, unreplaced `weir-protocol` tag.
 
 The current tests cover malformed or incomplete Events, unknown request IDs,
 request completion and final status, bounded input, canceled senders, no replay,
@@ -22,7 +26,7 @@ release evidence below does not establish compatibility or qualification for the
 current protocol. Record new real backend/production results with exact source
 revisions and images before making deployment claims.
 
-## Local migration validation, 2026-10-03
+## Server-owned protocol migration validation, 2026-10-03
 
 The independent SDK passed with `GOWORK=off` against the published public API
 revision `v0.1.1-0.20261002222539-3571ee4f843c`. Loopback tests used the current

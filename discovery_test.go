@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/batchstream/weir-go/internal/testutil/testdns"
-	pb "github.com/batchstream/weir/api/weir/v1"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

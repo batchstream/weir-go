@@ -29,12 +29,23 @@ class ReleaseTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_protocol_must_be_a_stable_unreplaced_release(self):
-        for upstream in (dict(Version='v0.0.0-20260929003705-40e7a13c3c8d'), dict(Version='v0.1.0', Replace=dict(Dir='/local'))):
+        for upstream in (dict(Version='v0.0.0-20260929003705-40e7a13c3c8d'), dict(Version='v0.1.0-rc.1'), dict(Version='v00.1.0'), dict(Version='v0.1.0', Replace=dict(Dir='/local'))):
             responses = ['a' * 40, json.dumps(upstream)]
-            with patch.dict(os.environ, self.environment), patch.object(release.subprocess, 'check_output', side_effect=responses), patch.object(release.subprocess, 'run') as mutation:
+            with patch.dict(os.environ, self.environment), patch.object(release.subprocess, 'check_output', side_effect=responses) as command, patch.object(release.subprocess, 'run') as mutation:
                 with self.assertRaisesRegex(ValueError, 'stable upstream'):
                     release.main()
                 mutation.assert_not_called()
+                self.assertEqual(command.call_args_list[1].args[0], ['go', 'list', '-m', '-json', 'github.com/batchstream/weir-protocol'])
+
+    def test_workspace_cannot_hide_the_pinned_protocol_pseudo_version(self):
+        self.environment['GOWORK'] = '/local/go.work'
+        upstream = dict(Version='v0.0.0-20261003000000-123456789abc')
+        responses = ['a' * 40, json.dumps(upstream)]
+        with patch.dict(os.environ, self.environment), patch.object(release.subprocess, 'check_output', side_effect=responses) as command, patch.object(release.subprocess, 'run') as mutation:
+            with self.assertRaisesRegex(ValueError, 'stable upstream'):
+                release.main()
+            self.assertEqual(command.call_args_list[1].kwargs['env']['GOWORK'], 'off')
+            mutation.assert_not_called()
 
     def test_existing_tag_is_never_retargeted(self):
         for references in ('b' * 40 + '\trefs/tags/v0.1.0\n', 'c' * 40 + '\trefs/tags/v0.1.0\n' + 'b' * 40 + '\trefs/tags/v0.1.0^{}\n'):
