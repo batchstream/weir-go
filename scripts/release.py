@@ -22,9 +22,10 @@ def main():
     sha = run(['git', 'rev-parse', 'HEAD'])
     if sha != os.environ['GITHUB_SHA']:
         raise ValueError('checkout differs from tested commit')
-    upstream = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir']))
-    if not re.fullmatch(r'v\d+\.\d+\.\d+', upstream['Version']) or upstream.get('Replace'):
-        raise ValueError('release requires a stable upstream protocol version and no replace')
+    upstream_env = dict(os.environ, GOWORK='off')
+    upstream = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir-protocol'], env=upstream_env))
+    if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', upstream.get('Version', '')) or upstream.get('Replace'):
+        raise ValueError('release requires a stable upstream protocol version from weir-protocol and no replace')
     tags = run(['git', 'ls-remote', '--tags', 'origin', 'refs/tags/' + version, 'refs/tags/' + version + '^{}'])
     if tags:
         refs = dict(line.split()[::-1] for line in tags.splitlines())
@@ -49,7 +50,7 @@ def main():
         root = Path(directory)
         env = dict(os.environ, GOWORK='off', GOPROXY='https://proxy.golang.org,direct', GOMODCACHE=str(root / 'cache'), GOBIN=str(root / 'bin'))
         run(['go', 'mod', 'init', 'example.com/weir-release-check'], cwd=root, env=env)
-        source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go"; "github.com/batchstream/weir/api/protocol")\nfunc main() { connection, err := weir.Dial("127.0.0.1:7447"); if err != nil { panic(err) }; defer connection.Close(); fmt.Println(protocol.EncodeSegment("s:check/path")) }\n'
+        source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go"; "github.com/batchstream/weir-protocol/api/protocol")\nfunc main() { connection, err := weir.Dial("127.0.0.1:7447"); if err != nil { panic(err) }; defer connection.Close(); fmt.Println(protocol.EncodeSegment("s:check/path")) }\n'
         (root / 'main.go').write_text(source)
         for attempt in range(6):
             result = subprocess.run(['go', 'get', 'github.com/batchstream/weir-go@' + version], cwd=root, env=env, timeout=180)

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Reject server internals and generated schemas in SDK production packages."""
+"""Keep the SDK and public protocol independent from the Weir server module."""
 import json
+import os
 from pathlib import Path
 import subprocess
 
 
-def packages(raw):
+SDK = 'github.com/batchstream/weir-go'
+PROTOCOL = 'github.com/batchstream/weir-protocol'
+SERVER = 'github.com/batchstream/weir'
+
+
+def objects(raw):
     decoder = json.JSONDecoder()
     result = []
     while raw.strip():
@@ -18,8 +24,47 @@ def packages(raw):
 def check_dependencies(items):
     for package in items:
         name = package['ImportPath']
-        if name.startswith('github.com/batchstream/weir/') and not name.startswith('github.com/batchstream/weir/api/'):
-            raise ValueError('SDK production imports server internals: ' + name)
+        if name == SERVER or name.startswith(SERVER + '/'):
+            raise ValueError('SDK imports the server module: ' + name)
+        if name.startswith(PROTOCOL + '/') and not name.startswith(PROTOCOL + '/api/'):
+            raise ValueError('SDK imports a nonpublic protocol package: ' + name)
+
+
+def check_modules(items):
+    for module in items:
+        if module.get('Replace'):
+            raise ValueError('SDK dependency graph contains a module replacement: ' + module['Path'])
+        if module['Path'] == SERVER:
+            raise ValueError('SDK module graph contains the server module')
+
+
+def check_module_graph(raw):
+    edges = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        pair = line.split()
+        if len(pair) != 2:
+            raise ValueError('invalid go mod graph edge: ' + line)
+        source, target = (name.split('@', 1)[0] for name in pair)
+        if SERVER in (source, target):
+            raise ValueError('SDK module graph contains the server module: ' + line)
+        if source == target and source in (SDK, PROTOCOL):
+            raise ValueError('project module depends on itself: ' + line)
+        edges.setdefault(source, set()).add(target)
+    pending = [PROTOCOL]
+    visited = set()
+    while pending:
+        source = pending.pop()
+        if source in visited:
+            continue
+        if source == SDK:
+            raise ValueError('protocol module depends back on the SDK')
+        visited.add(source)
+        targets = edges.get(source, ())
+        if PROTOCOL in targets:
+            raise ValueError('protocol module depends back on itself')
+        pending.extend(targets)
 
 
 def main():
@@ -27,9 +72,17 @@ def main():
     schemas = list(root.rglob('*.proto')) + list(root.rglob('*.pb.go'))
     if schemas:
         raise ValueError('SDK must consume upstream public schemas: ' + ', '.join(str(path.relative_to(root)) for path in schemas))
-    result = subprocess.check_output(['go', 'list', '-deps', '-json', './...'], cwd=root, text=True, timeout=120)
-    check_dependencies(packages(result))
-    print('SDK production dependency boundary passed')
+    # A workspace must not hide the pinned module graph or replacements.
+    env = dict(os.environ, GOWORK='off')
+    graph = subprocess.check_output(['go', 'mod', 'graph'], cwd=root, env=env, text=True, timeout=120)
+    check_module_graph(graph)
+    modules = subprocess.check_output(['go', 'list', '-m', '-json', 'all'], cwd=root, env=env, text=True, timeout=120)
+    check_modules(objects(modules))
+    for tags in ([], ['-tags=integration']):
+        command = ['go', 'list', '-deps', '-test', '-json'] + tags + ['./...']
+        result = subprocess.check_output(command, cwd=root, env=env, text=True, timeout=120)
+        check_dependencies(objects(result))
+    print('SDK protocol module and package dependency boundaries passed')
 
 
 if __name__ == '__main__':

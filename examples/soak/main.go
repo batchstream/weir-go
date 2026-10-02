@@ -17,9 +17,9 @@ import (
 	"time"
 
 	weir "github.com/batchstream/weir-go"
-	"github.com/batchstream/weir/api/protocol"
-	spb "github.com/batchstream/weir/api/weir/search/v1"
-	pb "github.com/batchstream/weir/api/weir/v1"
+	"github.com/batchstream/weir-protocol/api/protocol"
+	spb "github.com/batchstream/weir-protocol/api/weir/search/v1"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"google.golang.org/protobuf/proto"
 )

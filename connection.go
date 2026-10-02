@@ -1,7 +1,7 @@
 package weir
 
 import (
-	"github.com/batchstream/weir/api/protocol"
+	"github.com/batchstream/weir-protocol/api/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

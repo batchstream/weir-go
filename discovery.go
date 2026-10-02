@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/batchstream/weir/api/netlimit"
-	"github.com/batchstream/weir/api/protocol"
-	pb "github.com/batchstream/weir/api/weir/v1"
+	"github.com/batchstream/weir-protocol/api/netlimit"
+	"github.com/batchstream/weir-protocol/api/protocol"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
@@ -79,6 +79,18 @@ type refreshRound struct {
 	seedTried bool
 	err       error
 	control   chan struct{}
+}
+
+// Timer callbacks can publish cancellation after the deadline has passed.
+// gRPC rejects elapsed deadlines synchronously, so admission must do the same.
+func (r *refreshRound) contextError(now time.Time) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, bounded := r.ctx.Deadline(); bounded && !now.Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 type refreshJob struct {
@@ -367,7 +379,7 @@ func (c *Client) refreshStores() {
 	for range min(4, len(c.options.Stores)) {
 		workers.Go(func() {
 			for store := range jobs {
-				if ctx.Err() != nil {
+				if round.contextError(time.Now()) != nil {
 					return
 				}
 				c.refreshStore(round, store)
@@ -378,31 +390,46 @@ func (c *Client) refreshStores() {
 }
 
 func (c *Client) refreshResolve(round *refreshRound, store string) (*pb.ResolveStoreResponse, error) {
+	if err := round.contextError(time.Now()); err != nil {
+		return nil, err
+	}
 	select {
 	case <-round.ctx.Done():
 		return nil, round.ctx.Err()
 	case round.control <- struct{}{}:
 	}
 	defer func() { <-round.control }()
-	if err := round.ctx.Err(); err != nil {
+	if err := round.contextError(time.Now()); err != nil {
 		return nil, err
 	}
 	entry := c.stores[store]
 	entry.mu.Lock()
-	entry.attempt = time.Now()
+	started := time.Now()
+	if err := round.contextError(started); err != nil {
+		entry.mu.Unlock()
+		return nil, err
+	}
+	entry.attempt = started
 	entry.mu.Unlock()
 	if round.preferred != nil {
 		resolve, resolveCancel := context.WithTimeout(round.ctx, max(c.options.ResolveTimeout/4, time.Millisecond))
 		response, err := c.resolve(resolve, round.preferred, store)
 		resolveCancel()
-		if err == nil || status.Code(err) != codes.Unavailable && status.Code(err) != codes.DeadlineExceeded || round.ctx.Err() != nil {
+		if err == nil || status.Code(err) != codes.Unavailable && status.Code(err) != codes.DeadlineExceeded {
 			return response, err
+		}
+		if err := round.contextError(time.Now()); err != nil {
+			return nil, err
 		}
 	}
 	// Any application connection can ResolveStore. Only borrow it: closing it here
 	// would interrupt active finite business streams. A failed directory lookup
 	// falls back to one temporary initialization channel shared by this round.
 	round.mu.Lock()
+	if err := round.contextError(time.Now()); err != nil {
+		round.mu.Unlock()
+		return nil, err
+	}
 	if !round.seedTried {
 		round.seedTried = true
 		seedContext, seedCancel := context.WithTimeout(round.ctx, max(c.options.ResolveTimeout/4, time.Millisecond))
@@ -420,6 +447,9 @@ func (c *Client) refreshResolve(round *refreshRound, store string) (*pb.ResolveS
 }
 
 func (c *Client) refreshStore(round *refreshRound, store string) {
+	if round.contextError(time.Now()) != nil {
+		return
+	}
 	entry := c.stores[store]
 	entry.mu.RLock()
 	endpoints := slices.Clone(entry.endpoints)
@@ -438,9 +468,11 @@ func (c *Client) refreshStore(round *refreshRound, store string) {
 			entry.mu.Lock()
 			entry.channel.update(addresses)
 			entry.mu.Unlock()
-		} else if round.ctx.Err() == nil {
+		} else {
 			entry.mu.Lock()
-			entry.attempt = started
+			if round.contextError(time.Now()) == nil {
+				entry.attempt = started
+			}
 			entry.mu.Unlock()
 		}
 	}
