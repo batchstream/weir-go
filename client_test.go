@@ -1,400 +1,489 @@
 package weir
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/batchstream/weir/api/protocol"
 	pb "github.com/batchstream/weir/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/encoding/protodelim"
 )
 
-type fixtureServer struct {
-	pb.UnimplementedWeirServer
-	mode  string
-	calls atomic.Int32
+type clientTestPeer struct {
+	pb.UnimplementedStoreServiceServer
+	mode      string
+	completed atomic.Int64
+	canceled  chan struct{}
 }
 
-func newFixture(t *testing.T, mode string) (*Client, *fixtureServer) {
+func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+	if strings.HasPrefix(p.mode, "scan_") {
+		return p.scanExecute(stream)
+	}
+	if p.mode == "reject_early" {
+		return status.Error(codes.InvalidArgument, "fixture header rejection")
+	}
+	if p.mode == "early_eof" {
+		return nil
+	}
+	if p.mode == "blocked_receive" {
+		<-stream.Context().Done()
+		close(p.canceled)
+		return stream.Context().Err()
+	}
+	for {
+		request, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if p.canceled != nil {
+				close(p.canceled)
+			}
+			return err
+		}
+		document := &pb.Document{MediaType: "application/octet-stream", Data: bytes.Repeat([]byte{37}, 257<<10)}
+		readValue := &pb.ReadResult_Document{Document: document}
+		read := &pb.ReadResult{Result: readValue}
+		resultValue := &pb.Result_Read{Read: read}
+		result := &pb.Result{Index: request.RequestId, Result: resultValue}
+		value := &pb.Event_Result{Result: result}
+		event := &pb.Event{Version: 1, Value: value}
+		if p.mode == "write_reply_loss" || p.mode == "write_end_failure" {
+			mutation := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
+			result.Result = &pb.Result_Mutation{Mutation: mutation}
+		}
+		if p.mode == "invalid_event" {
+			event.Version = 2
+		}
+		var encoded bytes.Buffer
+		if _, err := protodelim.MarshalTo(&encoded, event); err != nil {
+			return err
+		}
+		raw := encoded.Bytes()
+		if p.mode == "incomplete_event" {
+			raw = raw[:3]
+		}
+		id := request.RequestId
+		if p.mode == "unknown_id" {
+			id++
+		}
+		for len(raw) > 0 {
+			size := min(len(raw), 19<<10)
+			response := &pb.ExecuteResponse{RequestId: id, EventFragment: raw[:size]}
+			if err := stream.Send(response); err != nil {
+				return err
+			}
+			raw = raw[size:]
+		}
+		if p.mode == "write_reply_loss" {
+			return status.Error(codes.Unavailable, "lost terminal after acknowledged write")
+		}
+		if p.mode == "missing_end" {
+			return nil
+		}
+		end := &pb.ExecuteResponse{RequestId: id, RequestComplete: true}
+		if err := stream.Send(end); err != nil {
+			return err
+		}
+		p.completed.Add(1)
+		if p.mode == "non_ok_after_end" || p.mode == "write_end_failure" {
+			return status.Error(codes.Unavailable, "fixture failure after business completion")
+		}
+		if p.mode == "early_eof_after_result" {
+			return nil
+		}
+	}
+}
+
+func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceClient {
 	t.Helper()
-	listener := bufconn.Listen(1 << 20)
-	server := grpc.NewServer()
-	fixture := &fixtureServer{mode: mode}
-	pb.RegisterWeirServer(server, fixture)
-	go server.Serve(listener)
-	conn, err := grpc.NewClient("passthrough:///fixture",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return listener.DialContext(ctx) }),
-		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
-		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallRecvMsgSize(MaxFrameBytes), grpc.MaxCallSendMsgSize(MaxFrameBytes)))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := &Client{conn: conn, rpc: pb.NewWeirClient(conn), timeout: time.Second}
-	t.Cleanup(func() { conn.Close(); server.Stop(); listener.Close() })
-	return client, fixture
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(10 << 20))
+	pb.RegisterStoreServiceServer(server, peer)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
+	options := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(), grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
+		grpc.WithStaticConnWindowSize(65535), grpc.WithStaticStreamWindowSize(65535),
+	}
+	connection, err := grpc.NewClient("passthrough:///"+listener.Addr().String(), options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	return pb.NewStoreServiceClient(connection)
 }
 
-func readRequest() *pb.ReadRequest {
-	req := &pb.ReadRequest{Resource: "weir://mongo/db/records/s:test"}
-	return req
-}
-func mutationRequest() *pb.MutateRequest {
-	doc := &pb.Document{MediaType: MediaTypeJSON, Data: []byte(`{"n":1}`)}
-	action := &pb.MutateRequest_Put{Put: doc}
-	req := &pb.MutateRequest{Resource: readRequest().Resource, Action: action}
-	return req
-}
-func missingResult() *pb.ReadResult {
-	empty := &pb.Empty{}
-	variant := &pb.ReadResult_Missing{Missing: empty}
-	result := &pb.ReadResult{Result: variant}
-	return result
-}
-func (s *fixtureServer) Read(ctx context.Context, _ *pb.ReadRequest) (*pb.ReadResult, error) {
-	s.calls.Add(1)
-	switch s.mode {
-	case "failure":
-		failure := &pb.Failure{Code: pb.FailureCode_UNAVAILABLE, Message: "fixture"}
-		variant := &pb.ReadResult_Failure{Failure: failure}
-		result := &pb.ReadResult{Result: variant}
-		return result, nil
-	case "malformed":
-		result := &pb.ReadResult{}
-		return result, nil
-	case "deadline":
-		<-ctx.Done()
-		return nil, status.FromContextError(ctx.Err()).Err()
-	case "unavailable":
-		return nil, status.Error(codes.Unavailable, "fixture")
-	default:
-		return missingResult(), nil
-	}
-}
-func (s *fixtureServer) Mutate(_ context.Context, _ *pb.MutateRequest) (*pb.MutationResult, error) {
-	s.calls.Add(1)
-	result := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
-	switch s.mode {
-	case "unavailable":
-		return nil, status.Error(codes.Unavailable, "after write")
-	case "malformed":
-		result.Outcome = pb.MutationOutcome_MUTATION_OUTCOME_UNSPECIFIED
-	case "noop":
-		result.Outcome = pb.MutationOutcome_NOT_APPLIED
-	case "failure":
-		result.Outcome = pb.MutationOutcome_NOT_APPLIED
-		result.Failure = &pb.Failure{Code: pb.FailureCode_PRECONDITION_FAILED}
-	case "applied-failure":
-		result.Failure = &pb.Failure{Code: pb.FailureCode_UNAVAILABLE}
-	case "unknown":
-		result.Outcome = pb.MutationOutcome_UNKNOWN
-	}
-	return result, nil
+func clientTestRead() *pb.Call {
+	read := &pb.ReadRequest{Resource: "records/s:key"}
+	value := &pb.Call_Read{Read: read}
+	call := &pb.Call{Version: 1, Operation: value}
+	return call
 }
 
-func TestReadAndMutationOutcomes(t *testing.T) {
-	for _, mode := range []string{"ok", "noop", "failure", "applied-failure", "unknown", "malformed", "unavailable"} {
-		t.Run(mode, func(t *testing.T) {
-			client, fixture := newFixture(t, mode)
-			result, err := client.Mutate(context.Background(), mutationRequest())
-			if fixture.calls.Load() != 1 {
-				t.Fatal("mutation replayed")
-			}
-			switch mode {
-			case "ok", "noop":
-				if err != nil {
-					t.Fatal(err)
-				}
-			case "failure", "applied-failure":
-				var failure *FailureError
-				if !errors.As(err, &failure) {
-					t.Fatalf("missing application failure: %v", err)
-				}
-				if mode == "applied-failure" && result.Outcome != pb.MutationOutcome_APPLIED {
-					t.Fatal("lost known APPLIED outcome")
-				}
-			default:
-				var mutation *MutationError
-				if !errors.As(err, &mutation) || result.Outcome != pb.MutationOutcome_UNKNOWN {
-					t.Fatalf("want UNKNOWN, got %v / %v", result, err)
-				}
-			}
-		})
-	}
-	for _, mode := range []string{"ok", "failure", "malformed", "unavailable"} {
-		t.Run("read-"+mode, func(t *testing.T) {
-			client, fixture := newFixture(t, mode)
-			result, err := client.Read(context.Background(), readRequest())
-			if fixture.calls.Load() != 1 {
-				t.Fatal("Read replayed")
-			}
-			if mode == "ok" && (err != nil || result.GetMissing() == nil) {
-				t.Fatalf("missing is success: %v", err)
-			}
-			if mode != "ok" && err == nil {
-				t.Fatal("missing error")
-			}
-		})
-	}
-}
-
-func TestLocalValidationAndDeadline(t *testing.T) {
-	client, fixture := newFixture(t, "deadline")
-	result, err := client.Mutate(context.Background(), nil)
-	if err == nil || result.Outcome != pb.MutationOutcome_NOT_STARTED || fixture.calls.Load() != 0 {
-		t.Fatal("invalid mutation dispatched")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+func TestExecuteConsumesFragmentedFiniteBatch(t *testing.T) {
+	peer := &clientTestPeer{mode: "normal"}
+	client := clientTestConnection(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := client.Read(ctx, readRequest()); status.Code(err) != codes.DeadlineExceeded {
-		t.Fatalf("context lost: %v", err)
-	}
-	client.timeout = 20 * time.Millisecond
-	if _, err := client.Read(context.Background(), readRequest()); status.Code(err) != codes.DeadlineExceeded {
-		t.Fatalf("default budget lost: %v", err)
-	}
-}
-
-func TestNewOptionsAreExplicitAndBounded(t *testing.T) {
-	unchecked := &tls.Config{InsecureSkipVerify: true}
-	tlsConfig := &tls.Config{}
-	invalid := []Options{{Timeout: -time.Second}, {Plaintext: true, TLSConfig: tlsConfig}, {TLSConfig: unchecked}}
-	for _, options := range invalid {
-		if client, err := New("127.0.0.1:7447", options); err == nil {
-			client.Close()
-			t.Fatal("accepted invalid transport or timeout options")
+	produced, consumed := 0, 0
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(context.Context) (*pb.Call, error) {
+		if produced == 25 {
+			return nil, io.EOF
 		}
+		produced++
+		return clientTestRead(), nil
 	}
-	options := Options{}
-	if _, err := New("", options); err == nil {
-		t.Fatal("accepted empty target")
-	}
-	for _, options := range []Options{{}, {Plaintext: true}, {TLSConfig: tlsConfig}} {
-		client, err := New("127.0.0.1:7447", options)
-		if err != nil {
-			t.Fatal(err)
+	opts.Consume = func(_ context.Context, id uint64, event *pb.Event) error {
+		data := event.GetResult().GetRead().GetDocument().GetData()
+		if id != uint64(consumed+1) || len(data) != 257<<10 || !bytes.Equal(data, bytes.Repeat([]byte{37}, len(data))) {
+			return errors.New("fragmented result corrupt, truncated or miscorrelated")
 		}
-		if client.timeout != 30*time.Second {
-			t.Fatal("missing default timeout")
-		}
-		if err := client.Close(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if tlsConfig.MinVersion != 0 {
-		t.Fatal("mutated caller TLS configuration")
-	}
-}
-
-func TestResource(t *testing.T) {
-	resource, err := Resource("mongo", "db", "records", "s:a/ 中?")
-	if err != nil || resource != "weir://mongo/db/records/s:a%2F%20%E4%B8%AD%3F" {
-		t.Fatalf("resource: %q %v", resource, err)
-	}
-	for _, raw := range []string{"weir://Mongo/x", "weir://mongo/..", "weir://mongo/%2e", "weir://mongo/%2f", "weir://mongo/%00", "weir://mongo/a?b", "weir://mongo/a//b"} {
-		if _, _, err := parseResource(raw); err == nil {
-			t.Fatalf("accepted %q", raw)
-		}
-	}
-}
-
-func (s *fixtureServer) Bulk(stream grpc.BidiStreamingServer[pb.BulkRequestFrame, pb.BulkResponseFrame]) error {
-	s.calls.Add(1)
-	if _, err := stream.Recv(); err != nil {
-		return err
-	}
-	var ops []*pb.BulkOperation
-	for {
-		frame, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		ops = append(ops, frame.GetOperation())
-	}
-	if s.mode == "missing-end" {
+		consumed++
 		return nil
 	}
-	for i := len(ops) - 1; i >= 0; i-- {
-		op := ops[i]
-		result := &pb.BulkResult{Index: op.Index}
-		if op.GetRead() != nil {
-			read := missingResult()
-			if s.mode == "result-limit" {
-				document := &pb.Document{MediaType: MediaTypeJSON, Data: make([]byte, MaxDocumentBytes)}
-				variant := &pb.ReadResult_Document{Document: document}
-				read = &pb.ReadResult{Result: variant}
+	if err := Execute(ctx, client, opts); err != nil {
+		t.Fatal(err)
+	}
+	if produced != 25 || consumed != 25 || peer.completed.Load() != 25 {
+		t.Fatal("finite Execute failed to half-close and drain", produced, consumed, peer.completed.Load())
+	}
+}
+
+func TestRecordRejectsIncompleteAndInvalidResponses(t *testing.T) {
+	for _, mode := range []string{"unknown_id", "invalid_event", "incomplete_event", "missing_end", "non_ok_after_end"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			opts := RecordOptions{StoreName: "records", Call: clientTestRead()}
+			result, err := Record(ctx, client, opts)
+			if err == nil {
+				t.Fatal("invalid or incomplete RPC reported success", mode)
 			}
-			variant := &pb.BulkResult_Read{Read: read}
-			result.Result = variant
-		} else {
-			mutation := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
-			if s.mode == "operation-failure" {
-				mutation.Outcome = pb.MutationOutcome_NOT_APPLIED
-				mutation.Failure = &pb.Failure{Code: pb.FailureCode_PRECONDITION_FAILED}
+			if mode == "missing_end" || mode == "non_ok_after_end" {
+				if len(result.GetRead().GetDocument().GetData()) != 257<<10 {
+					t.Fatal("complete validated business evidence was discarded", mode)
+				}
+			} else if result != nil {
+				t.Fatal("unvalidated response exposed a result", mode)
 			}
-			variant := &pb.BulkResult_Mutation{Mutation: mutation}
-			result.Result = variant
+			if mode == "non_ok_after_end" && !strings.Contains(err.Error(), "indeterminate") {
+				t.Fatal("non-OK transport terminal lost uncertainty semantics", err)
+			}
+		})
+	}
+}
+
+func TestExecuteProducerErrorCancelsAndJoins(t *testing.T) {
+	peer := &clientTestPeer{mode: "normal", canceled: make(chan struct{})}
+	client := clientTestConnection(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	failure := errors.New("producer source failed")
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(context.Context) (*pb.Call, error) { return nil, failure }
+	opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+	if err := Execute(ctx, client, opts); !errors.Is(err, failure) {
+		t.Fatal("producer failure was masked", err)
+	}
+}
+
+func TestExecuteConsumerErrorJoinsBlockedProducer(t *testing.T) {
+	peer := &clientTestPeer{mode: "normal"}
+	client := clientTestConnection(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	failure := errors.New("consumer failed")
+	produced := false
+	joined := make(chan struct{})
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(ctx context.Context) (*pb.Call, error) {
+		if !produced {
+			produced = true
+			return clientTestRead(), nil
 		}
-		if s.mode == "range" {
-			result.Index = 999
-		}
-		if s.mode == "wrong-kind" {
-			variant := &pb.BulkResult_Read{Read: missingResult()}
-			result.Result = variant
-		}
-		variant := &pb.BulkResponseFrame_Result{Result: result}
-		frame := &pb.BulkResponseFrame{Frame: variant}
-		if err := stream.Send(frame); err != nil {
+		<-ctx.Done()
+		close(joined)
+		return nil, ctx.Err()
+	}
+	opts.Consume = func(context.Context, uint64, *pb.Event) error { return failure }
+	if err := Execute(ctx, client, opts); !errors.Is(err, failure) {
+		t.Fatal("consumer failure was masked", err)
+	}
+	select {
+	case <-joined:
+	default:
+		t.Fatal("Execute returned before its canceled producer exited")
+	}
+}
+
+func TestExecuteCanceledBlockedSendReleasesProducer(t *testing.T) {
+	peer := &clientTestPeer{mode: "blocked_receive", canceled: make(chan struct{})}
+	client := clientTestConnection(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	document := &pb.Document{MediaType: "application/octet-stream", Data: make([]byte, 2<<20)}
+	action := &pb.MutateRequest_Put{Put: document}
+	mutation := &pb.MutateRequest{Resource: "records/s:key", Action: action}
+	value := &pb.Call_Mutate{Mutate: mutation}
+	call := &pb.Call{Version: 1, Operation: value}
+	var active atomic.Int64
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(context.Context) (*pb.Call, error) {
+		active.Add(1)
+		defer active.Add(-1)
+		return call, nil
+	}
+	opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+	started := time.Now()
+	if err := Execute(ctx, client, opts); err == nil {
+		t.Fatal("blocked transport completed after cancellation")
+	}
+	if active.Load() != 0 || time.Since(started) > time.Second {
+		t.Fatal("canceled blocked send left active producer", active.Load(), time.Since(started))
+	}
+}
+
+func TestExecuteEarlyEOFJoinsWithoutWaitingForCallerDeadline(t *testing.T) {
+	for _, mode := range []string{"early_eof", "early_eof_after_result"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			produced := false
+			joined := make(chan struct{})
+			opts := Options{StoreName: "records"}
+			opts.Produce = func(ctx context.Context) (*pb.Call, error) {
+				if mode == "early_eof_after_result" && !produced {
+					produced = true
+					return clientTestRead(), nil
+				}
+				<-ctx.Done()
+				close(joined)
+				return nil, ctx.Err()
+			}
+			opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+			started := time.Now()
+			if err := Execute(ctx, client, opts); err == nil {
+				t.Fatal("downstream early EOF was reported as finite batch success")
+			}
+			if time.Since(started) > 500*time.Millisecond {
+				t.Fatal("early EOF stalled while joining an uncanceled producer", time.Since(started))
+			}
+			select {
+			case <-joined:
+			default:
+				t.Fatal("early EOF did not join producer")
+			}
+		})
+	}
+}
+
+func TestExecuteCompleteRequiresEmptyTransportEnd(t *testing.T) {
+	for _, mode := range []string{"normal", "missing_end", "non_ok_after_end"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			produced, consumed, completed := false, 0, 0
+			opts := Options{StoreName: "records"}
+			opts.Produce = func(context.Context) (*pb.Call, error) {
+				if produced {
+					return nil, io.EOF
+				}
+				produced = true
+				return clientTestRead(), nil
+			}
+			opts.Consume = func(context.Context, uint64, *pb.Event) error { consumed++; return nil }
+			opts.Complete = func(_ context.Context, id uint64) error {
+				if consumed != 1 || id != 1 {
+					return errors.New("Complete fired before validated business result")
+				}
+				completed++
+				return nil
+			}
+			err := Execute(ctx, client, opts)
+			if mode == "normal" && err != nil || mode != "normal" && err == nil {
+				t.Fatal("unexpected finite RPC status", mode, err)
+			}
+			wantCompleted := 1
+			if mode == "missing_end" {
+				wantCompleted = 0
+			}
+			if consumed != 1 || completed != wantCompleted {
+				t.Fatal("business and transport completion were conflated", mode, consumed, completed)
+			}
+		})
+	}
+}
+
+func TestRecordPreservesAppliedEvidenceWithRPCError(t *testing.T) {
+	for _, mode := range []string{"write_reply_loss", "write_end_failure"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			document := &pb.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+			action := &pb.MutateRequest_Put{Put: document}
+			mutation := &pb.MutateRequest{Resource: "records/s:key", Action: action}
+			variant := &pb.Call_Mutate{Mutate: mutation}
+			call := &pb.Call{Version: 1, Operation: variant}
+			opts := RecordOptions{StoreName: "records", Call: call}
+			result, err := Record(ctx, client, opts)
+			if status.Code(err) != codes.Unavailable || result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || result.Index != 1 {
+				t.Fatal("lost RPC terminal erased validated write evidence or reported success", result, err)
+			}
+		})
+	}
+}
+
+func TestExecuteEarlyRejectionPreservesAuthoritativeStatus(t *testing.T) {
+	peer := &clientTestPeer{mode: "reject_early"}
+	client := clientTestConnection(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(context.Context) (*pb.Call, error) {
+		// Bounded source work can finish after the peer rejects RPC headers.
+		// A subsequent Send EOF must not mask the authoritative receive status.
+		time.Sleep(20 * time.Millisecond)
+		return clientTestRead(), nil
+	}
+	opts.Consume = func(context.Context, uint64, *pb.Event) error { return errors.New("rejected RPC returned a result") }
+	if err := Execute(ctx, client, opts); status.Code(err) != codes.InvalidArgument {
+		t.Fatal("Send EOF or cancellation replaced peer rejection", err)
+	}
+}
+
+func TestExecuteOversizedInputDoesNotAllocateEncodedCopy(t *testing.T) {
+	peer := &clientTestPeer{mode: "normal"}
+	client := clientTestConnection(t, peer)
+	body := make([]byte, protocol.MaxPayload+1)
+	descriptor := &pb.Document{MediaType: "application/vnd.weir.search-http.v1+protobuf"}
+	open := &pb.NativeOpen{Resource: "records", Descriptor_: descriptor}
+	native := &pb.NativeCall{Open: open, Body: body}
+	variant := &pb.Call_Native{Native: native}
+	call := &pb.Call{Version: 1, Operation: variant}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	opts := Options{StoreName: "records"}
+	opts.Produce = func(context.Context) (*pb.Call, error) { return call, nil }
+	opts.Consume = func(context.Context, uint64, *pb.Event) error {
+		return errors.New("oversized input returned a response")
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err := Execute(ctx, client, opts)
+	runtime.ReadMemStats(&after)
+	if err == nil || peer.completed.Load() != 0 {
+		t.Fatal("oversized input was transmitted", err, peer.completed.Load())
+	}
+	if after.TotalAlloc-before.TotalAlloc >= uint64(protocol.MaxPayload) {
+		t.Fatal("SDK encoded an oversized input before rejecting it", after.TotalAlloc-before.TotalAlloc)
+	}
+}
+
+func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error {
+	request, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		return errors.New("expected scan half close")
+	}
+	send := func(event *pb.Event) error {
+		var raw bytes.Buffer
+		if _, err := protodelim.MarshalTo(&raw, event); err != nil {
 			return err
 		}
-		if s.mode == "duplicate" {
-			if err := stream.Send(frame); err != nil {
-				return err
-			}
-		}
-		if s.mode == "partial" {
-			return status.Error(codes.Unavailable, "lost connection")
+		frame := &pb.ExecuteResponse{RequestId: request.RequestId, EventFragment: raw.Bytes()}
+		return stream.Send(frame)
+	}
+	count := uint64(1)
+	if p.mode == "scan_overbound" {
+		count = 2
+	}
+	for i := uint64(0); i < count; i++ {
+		document := &pb.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+		value := &pb.Event_Document{Document: document}
+		event := &pb.Event{Version: 1, Value: value}
+		if err := send(event); err != nil {
+			return err
 		}
 	}
-	end := &pb.BulkEnd{ReceivedCount: uint64(len(ops)), ResultCount: uint64(len(ops))}
-	if s.mode == "count" {
-		end.ResultCount++
+	if p.mode == "scan_missing_business_end" {
+		return nil
 	}
-	variant := &pb.BulkResponseFrame_End{End: end}
-	frame := &pb.BulkResponseFrame{Frame: variant}
+	end := &pb.ScanEnd{DocumentCount: count, NextContinuationToken: []byte("checkpoint")}
+	if p.mode == "scan_invalid_end" {
+		end.Exhausted = true
+	}
+	value := &pb.Event_ScanEnd{ScanEnd: end}
+	event := &pb.Event{Version: 1, Value: value}
+	if err := send(event); err != nil {
+		return err
+	}
+	if p.mode == "scan_missing_request_end" {
+		return nil
+	}
+	frame := &pb.ExecuteResponse{RequestId: request.RequestId, RequestComplete: true}
 	if err := stream.Send(frame); err != nil {
 		return err
 	}
-	if s.mode == "duplicate-end" {
-		return stream.Send(frame)
-	}
-	if s.mode == "after-end" {
-		result := &pb.BulkResult{Index: 0}
-		read := &pb.BulkResult_Read{Read: missingResult()}
-		result.Result = read
-		variant := &pb.BulkResponseFrame_Result{Result: result}
-		frame := &pb.BulkResponseFrame{Frame: variant}
-		return stream.Send(frame)
-	}
-	if s.mode == "status-after-end" {
-		return status.Error(codes.Unavailable, "after End")
+	if p.mode == "scan_non_ok" {
+		return status.Error(codes.Unavailable, "fixture status after page")
 	}
 	return nil
 }
 
-func TestBulkCompletionAndPartialResults(t *testing.T) {
-	for _, mode := range []string{"ok", "operation-failure", "missing-end", "duplicate", "range", "wrong-kind", "partial", "count", "duplicate-end", "after-end", "status-after-end"} {
+func TestScanPageCommitsOnlyCompleteBoundedPage(t *testing.T) {
+	for _, mode := range []string{"scan_normal", "scan_missing_business_end", "scan_missing_request_end", "scan_non_ok", "scan_overbound", "scan_invalid_end", "scan_consumer_failure"} {
 		t.Run(mode, func(t *testing.T) {
-			client, fixture := newFixture(t, mode)
-			operations := []Operation{{Read: readRequest()}, {Mutate: mutationRequest()}}
-			results, err := client.Bulk(context.Background(), "weir://mongo", operations)
-			if fixture.calls.Load() != 1 {
-				t.Fatal("Bulk replayed")
-			}
-			if mode == "ok" {
-				if err != nil || len(results) != 2 || results[0].Index != 0 || results[1].Index != 1 {
-					t.Fatalf("bad ordered results: %v %v", results, err)
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			request := &pb.ScanRequest{Resource: "records", PageSize: 1}
+			consumed := 0
+			opts := ScanPageOptions{StoreName: "search", Request: request}
+			opts.Consume = func(context.Context, *pb.Document) error {
+				consumed++
+				if mode == "scan_consumer_failure" {
+					return errors.New("fixture consumer failed")
 				}
-				return
+				return nil
 			}
-			var batch *BatchError
-			if !errors.As(err, &batch) {
-				t.Fatalf("want BatchError: %v", err)
-			}
-			if mode == "operation-failure" && (batch.Cause != nil || batch.Failures[1] == nil) {
-				t.Fatalf("bad operation failure: %v", batch)
-			}
-			if mode == "partial" && (results[0] != nil || results[1] == nil) {
-				t.Fatal("partial evidence lost")
+			end, err := ScanPage(ctx, client, opts)
+			if mode == "scan_normal" {
+				if err != nil || end == nil || end.DocumentCount != 1 || string(end.NextContinuationToken) != "checkpoint" || end.Exhausted || consumed != 1 {
+					t.Fatal("complete page was not committed", end, err, consumed)
+				}
+			} else if err == nil || end != nil {
+				t.Fatal("incomplete or invalid page exposed checkpoint", end, err)
 			}
 		})
-	}
-}
-
-func TestBulkValidatesAllBeforeSending(t *testing.T) {
-	client, fixture := newFixture(t, "ok")
-	invalid := mutationRequest()
-	invalid.Resource = "weir://other/db/records/s:test"
-	operations := []Operation{{Mutate: mutationRequest()}, {Mutate: invalid}}
-	if _, err := client.Bulk(context.Background(), "weir://mongo", operations); err == nil || fixture.calls.Load() != 0 {
-		t.Fatal("partial batch dispatched before validation")
-	}
-	operations = make([]Operation, MaxBulkOperations+1)
-	if _, err := client.Bulk(context.Background(), "weir://mongo", operations); err == nil {
-		t.Fatal("unbounded batch accepted")
-	}
-}
-
-func ExampleResource() {
-	resource, _ := Resource("mongo", "orders", "records", "s:order/42")
-	fmt.Println(resource)
-	// Output: weir://mongo/orders/records/s:order%2F42
-}
-
-func TestBulkResultMemoryBound(t *testing.T) {
-	client, _ := newFixture(t, "result-limit")
-	operations := make([]Operation, 34)
-	for index := range operations {
-		operations[index].Read = readRequest()
-	}
-	results, err := client.Bulk(context.Background(), "weir://mongo", operations)
-	var batch *BatchError
-	if !errors.As(err, &batch) || batch.Cause == nil {
-		t.Fatalf("missing memory bound error: %v", err)
-	}
-	retained := 0
-	for _, result := range results {
-		if result != nil {
-			retained++
-		}
-	}
-	if retained == 0 || retained >= 32 {
-		t.Fatalf("retained %d oversized results", retained)
-	}
-}
-
-func TestTypedNilMutationOneofsAreRejectedBeforeDispatch(t *testing.T) {
-	var put *pb.MutateRequest_Put
-	var create *pb.MutateRequest_Create
-	var replace *pb.MutateRequest_Replace
-	var deletion *pb.MutateRequest_Delete
-	var transform *pb.MutateRequest_AtomicTransform
-	var expression *pb.Transform_BackendExpression
-	invalidTransform := &pb.Transform{Form: expression}
-	transformAction := &pb.MutateRequest_AtomicTransform{AtomicTransform: invalidTransform}
-	requests := []*pb.MutateRequest{
-		{Resource: readRequest().Resource, Action: put},
-		{Resource: readRequest().Resource, Action: create},
-		{Resource: readRequest().Resource, Action: replace},
-		{Resource: readRequest().Resource, Action: deletion},
-		{Resource: readRequest().Resource, Action: transform},
-		{Resource: readRequest().Resource, Action: transformAction},
-	}
-	client, fixture := newFixture(t, "ok")
-	for _, request := range requests {
-		result, err := client.Mutate(context.Background(), request)
-		if err == nil || result.Outcome != pb.MutationOutcome_NOT_STARTED {
-			t.Fatalf("invalid oneof reached RPC: %v %v", result, err)
-		}
-		operations := []Operation{{Mutate: mutationRequest()}, {Mutate: request}}
-		if _, err := client.Bulk(context.Background(), "weir://mongo", operations); err == nil {
-			t.Fatal("invalid later oneof accepted")
-		}
-	}
-	if fixture.calls.Load() != 0 {
-		t.Fatal("invalid mutation batch dispatched")
 	}
 }

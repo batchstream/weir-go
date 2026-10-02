@@ -6,7 +6,7 @@ qualification requires verified network isolation. It does not install infrastru
 writes. Use only disposable, pre-created collections/indexes owned by this run.
 
 The published command can be installed outside this checkout with
-`go install github.com/batchstream/weir-go/examples/soak@v0.1.1`. Go resolves the
+`go install github.com/batchstream/weir-go/examples/soak@main`. Go resolves the
 command's BSON dependency even when a consumer only imported the SDK root package.
 
 Build once from the exact reviewed SDK revision for the worker architecture:
@@ -16,18 +16,22 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o soak ./examples/soak
 ```
 
 Run inside the acceptance namespace and the real client NetworkPolicy path.
-Use `-address SERVICE:PORT` for Service behavior or `-targets IP:PORT,IP:PORT,IP:PORT`
+Use `-address OWNER:PORT` for a known owner or `-targets IP:PORT,IP:PORT,IP:PORT`
 for fixed three-Pod coverage. These flags are mutually exclusive. Fixed targets
 must be distinct literal Pod IPs with valid ports, never DNS names that can resolve
-to changing Pods. A worker always uses `targets[worker_index % target_count]`;
+to changing Pods. Before any write, ResolveStore must advertise the target IP (directly or through
+DNS); a mismatched seed is rejected. ResolveStore runs on the same connection
+used for business Execute, without Open or redirection. `-address` must identify
+an owner of both configured Stores; it is not an arbitrary discovery Service.
+A worker always uses `targets[worker_index % target_count]`;
 there is no failover or replay. The target count must be odd and workers must be a
 multiple of twice that count, so every target gets equal MongoDB and Search load.
 For three targets and six workers, each Pod receives one worker per backend.
 The start record and worker events preserve the exact target assignments. Freeze
 the corresponding Pod UIDs and image identities in the observer baseline.
 
-Service invocation and rolling-update checks passed separately during deployment
-qualification. The 24-hour fixed-target run proves per-Pod steady coverage; it
+Historical Service invocation and rolling-update checks belong to the earlier
+release qualification; they do not qualify the current protocol. The 24-hour fixed-target run proves per-Pod steady coverage; it
 does not establish Service load balancing behavior. A short calibration uses the same arguments with `-duration 3m`
 and a fresh `-run-id`. Freeze all values and artifact identities before the 24-hour run:
 
@@ -43,12 +47,14 @@ and a fresh `-run-id`. Freeze all values and artifact identities before the 24-h
   -observer-heartbeat /results/observations.jsonl.ready
 ```
 
+Collection flags use `weir://STORE/...` only as operator input and audit metadata.
+The runner separates StoreName and sends canonical relative Call targets.
 Each worker owns a distinct string key, with half the workers assigned to each
-backend. It Creates that record once, then schedules Put → Read → Bulk(Replace,
-Read) cycles. Every acknowledged value and Bulk order is checked. Each cycle
-performs three RPCs and two mutations; the default steady load is approximately
-90 RPC/s and 60 mutations/s. Once a minute and at normal completion, one leader
-per backend additionally checks Scan End/count/EOF and read-only Native completion/body semantics.
+backend. It Creates that record once, then schedules Put → Read → Replace → Read cycles, each using Record over a finite Execute
+RPC. Every acknowledged value is checked before the next dependent operation.
+Each cycle performs four RPCs and two mutations; the default steady load is approximately
+120 RPC/s and 60 mutations/s. Once a minute and at normal completion, one leader
+per backend additionally checks ScanPage end/count/final status and read-only Native completion/body semantics.
 This respects the server's single Native/Scan session per Store. Search
 Scan runs after the first minute, allowing its normal asynchronous refresh.
 
@@ -58,7 +64,7 @@ an implementation of the server's broader historical capacity matrix.
 JSON lines include the run start UTC, exact artifact identities, monotonic elapsed
 time, owned keys, periodic counters, cumulative and per-minute cycle p99 bucket
 upper bounds, and a final `passed` or `failed` record. Errors include worker, key,
-sequence, mutation uncertainty and available Bulk terminal outcomes. Successful
+sequence, mutation uncertainty and available mutation outcomes. Successful
 cycle counts require all four logical operations to pass; they are not total
 backend execution counters. Initial/final records and stream checks are separate.
 

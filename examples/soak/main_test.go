@@ -10,19 +10,18 @@ import (
 	"testing"
 	"time"
 
-	weir "github.com/batchstream/weir-go"
 	pb "github.com/batchstream/weir/api/weir/v1"
 	"google.golang.org/grpc"
 )
 
 type uncertainServer struct {
-	pb.UnimplementedWeirServer
+	ownerFixture
 	mu      sync.Mutex
 	puts    map[string]int
 	deletes int
 }
 
-func (s *uncertainServer) Mutate(_ context.Context, req *pb.MutateRequest) (*pb.MutationResult, error) {
+func (s *uncertainServer) mutate(_ context.Context, req *pb.MutateRequest) (*pb.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
@@ -44,7 +43,8 @@ func TestUnknownStopsWorkWithoutReplayOrCleanup(t *testing.T) {
 	}
 	server := grpc.NewServer()
 	backend := &uncertainServer{puts: make(map[string]int)}
-	pb.RegisterWeirServer(server, backend)
+	backend.endpoint = listener.Addr().String()
+	pb.RegisterStoreServiceServer(server, backend)
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
 	cfg := options{Address: listener.Addr().String(), Mongo: "weir://mongo/test/records", Search: "weir://search/records", RunID: "weir-soak-negative", Duration: 2 * time.Second, MaxP99: time.Second, Workers: 2, Rate: 100}
@@ -69,25 +69,17 @@ func TestUnknownStopsWorkWithoutReplayOrCleanup(t *testing.T) {
 	}
 }
 
-func TestBulkUnknownIsIncludedInFailureAccounting(t *testing.T) {
-	mutation := &weir.MutationError{Outcome: pb.MutationOutcome_UNKNOWN, Cause: errors.New("uncertain")}
-	batch := &weir.BatchError{Failures: map[int]error{0: mutation}}
-	if !unknownWrite(batch) {
-		t.Fatal("item UNKNOWN was omitted")
+func TestMutationEvidenceIsIncludedInFailureAccounting(t *testing.T) {
+	unknown := &mutationAuditError{Outcome: pb.MutationOutcome_UNKNOWN, Cause: errors.New("uncertain")}
+	if !unknownWrite(unknown) {
+		t.Fatal("UNKNOWN was omitted")
 	}
 	if unknownWrite(errors.New("ordinary read failure")) {
 		t.Fatal("read error became unknown mutation")
 	}
-	mutationResult := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
-	variant := &pb.BulkResult_Mutation{Mutation: mutationResult}
-	result := &pb.BulkResult{Result: variant}
-	results := []*pb.BulkResult{result, nil}
-	interrupted := &weir.BatchError{Cause: errors.New("response interrupted")}
-	if unknownBulkMutation(results, interrupted) {
-		t.Fatal("known APPLIED was downgraded after a read transport failure")
-	}
-	if !unknownBulkMutation(nil, interrupted) {
-		t.Fatal("unreported mutation lost uncertainty")
+	acknowledged := &mutationAuditError{Outcome: pb.MutationOutcome_APPLIED, Cause: errors.New("response interrupted")}
+	if unknownWrite(acknowledged) {
+		t.Fatal("APPLIED was downgraded after transport failure")
 	}
 }
 
