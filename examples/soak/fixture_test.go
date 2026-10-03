@@ -25,8 +25,8 @@ func receiveMutation(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.Execu
 	if err != nil {
 		return nil, nil, err
 	}
-	call := &pb.Call{}
-	if err := proto.Unmarshal(frame.CallPayload, call); err != nil {
+	call := &pb.Command{}
+	if err := proto.Unmarshal(frame.CommandPayload, call); err != nil {
 		return nil, nil, err
 	}
 	if call.GetMutate() == nil {

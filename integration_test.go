@@ -15,10 +15,7 @@ import (
 
 	weir "github.com/batchstream/weir-go"
 	"github.com/batchstream/weir-protocol/api/protocol"
-	spb "github.com/batchstream/weir-protocol/api/weir/search/v1"
-	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"google.golang.org/protobuf/proto"
 )
 
 // Only an explicit tag and operator-provided endpoint enable backend I/O. Each
@@ -47,8 +44,8 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	defer client.Close()
 	id := fmt.Sprintf("sdk-%s-%d", backend, time.Now().UnixNano())
 	builder := mutationBuilder{t: t, backend: backend, resource: collection + "/s:" + id, id: id}
-	recordOptions := weir.RecordOptions{StoreName: store, Call: builder.call("create", 1)}
-	result, err := client.Record(ctx, recordOptions)
+	write := weir.WriteOptions{StoreName: store, Request: builder.write(1)}
+	result, err := client.Create(ctx, write)
 	applied(t, result, err)
 	deleted := false
 	t.Cleanup(func() {
@@ -63,37 +60,40 @@ func testLifecycle(t *testing.T, backend, variable string) {
 			return
 		}
 		defer cleanupClient.Close()
-		remove := weir.RecordOptions{StoreName: store, Call: builder.call("delete", 0)}
-		result, err := cleanupClient.Record(cleanup, remove)
-		if err != nil || result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || result.GetMutation().GetFailure() != nil {
+		request := &weir.DeleteRequest{Resource: builder.resource}
+		remove := weir.DeleteOptions{StoreName: store, Request: request}
+		result, err := cleanupClient.Delete(cleanup, remove)
+		if err != nil || result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
 			t.Error("owned record cleanup:", result, err)
 		}
 	})
-	duplicate, err := client.Record(ctx, recordOptions)
-	if err != nil || duplicate.GetMutation().GetOutcome() != pb.MutationOutcome_NOT_APPLIED || duplicate.GetMutation().GetFailure().GetCode() != pb.FailureCode_PRECONDITION_FAILED {
+	duplicate, err := client.Create(ctx, write)
+	if err != nil || duplicate.GetOutcome() != weir.MutationNotApplied || duplicate.GetFailure().GetCode() != weir.FailurePreconditionFailed {
 		t.Fatalf("duplicate create: %v %v", duplicate, err)
 	}
-	for _, action := range []string{"replace", "put", "transform"} {
-		recordOptions.Call = builder.call(action, 4)
-		result, err = client.Record(ctx, recordOptions)
-		applied(t, result, err)
+	write.Request = builder.write(4)
+	result, err = client.Replace(ctx, write)
+	applied(t, result, err)
+	result, err = client.Put(ctx, write)
+	applied(t, result, err)
+	transform := weir.AtomicTransformOptions{StoreName: store, Request: builder.transform(4)}
+	result, err = client.AtomicTransform(ctx, transform)
+	applied(t, result, err)
+	read := &weir.ReadRequest{Resource: builder.resource}
+	readOptions := weir.ReadOptions{StoreName: store, Request: read}
+	readResult, err := client.Read(ctx, readOptions)
+	if err != nil || readResult.GetDocument() == nil || number(t, backend, readResult.GetDocument().GetData()) != 4 {
+		t.Fatalf("persisted read: %v %v", readResult, err)
 	}
-	read := &pb.ReadRequest{Resource: builder.resource}
-	readVariant := &pb.Call_Read{Read: read}
-	readCall := &pb.Call{Version: 1, Operation: readVariant}
-	readOptions := weir.RecordOptions{StoreName: store, Call: readCall}
-	result, err = client.Record(ctx, readOptions)
-	if err != nil || result.GetRead().GetDocument() == nil || number(t, backend, result.GetRead().GetDocument().GetData()) != 4 {
-		t.Fatalf("persisted read: %v %v", result, err)
-	}
+	readCommand := weir.NewReadCommand(read)
 	// Execute can have several requests in flight. This application explicitly
 	// waits for Complete before sending dependent reads and mutations.
-	calls := []*pb.Call{readCall, builder.call("replace", 5), readCall}
-	results := make([]*pb.Result, len(calls))
+	calls := []*weir.Command{readCommand, builder.command("replace", 5), readCommand}
+	results := make([]*weir.Result, len(calls))
 	completed := make(chan uint64, 1)
 	produced := 0
-	batch := weir.Options{StoreName: store}
-	batch.Produce = func(ctx context.Context) (*pb.Call, error) {
+	batch := weir.ExecuteOptions{StoreName: store}
+	batch.Produce = func(ctx context.Context) (*weir.Command, error) {
 		if produced > 0 {
 			select {
 			case <-completed:
@@ -108,7 +108,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 		produced++
 		return call, nil
 	}
-	batch.Consume = func(_ context.Context, id uint64, event *pb.Event) error {
+	batch.Consume = func(_ context.Context, id uint64, event *weir.Event) error {
 		results[id-1] = event.GetResult()
 		return nil
 	}
@@ -123,65 +123,52 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	if err := client.Execute(ctx, batch); err != nil {
 		t.Fatal("finite mixed Execute:", err)
 	}
-	applied(t, results[1], nil)
+	applied(t, results[1].Mutation, nil)
 	if number(t, backend, results[2].GetRead().GetDocument().GetData()) != 5 {
 		t.Fatal("Complete-gated read-after-write failed")
 	}
-	selector := &pb.Document{MediaType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
+	selector := &weir.Document{MediaType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
 	if backend == "mongo" {
 		filter := bson.D{{Key: "_id", Value: id}}
 		query := bson.D{{Key: "filter", Value: filter}}
 		selector = bsonDocument(t, query)
 	}
-	scan := &pb.ScanRequest{Resource: collection, Selector: selector, PageSize: 1}
+	scan := &weir.ScanRequest{Resource: collection, Selector: selector, PageSize: 1}
 	count := 0
-	scanOptions := weir.ScanPageOptions{StoreName: store, Request: scan}
-	scanOptions.Consume = func(context.Context, *pb.Document) error { count++; return nil }
+	scanOptions := weir.ScanOptions{StoreName: store, Request: scan}
+	scanOptions.Consume = func(context.Context, *weir.Document) error { count++; return nil }
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		count = 0
-		end, err := client.ScanPage(ctx, scanOptions)
+		end, err := client.Scan(ctx, scanOptions)
 		if err != nil || end.GetFailure() != nil {
-			t.Fatal("ScanPage:", end, err)
+			t.Fatal("Scan:", end, err)
 		}
 		if count == 1 {
 			break
 		}
 		if count > 1 || time.Now().After(deadline) {
-			t.Fatalf("ScanPage count=%d", count)
+			t.Fatalf("Scan count=%d", count)
 		}
 		time.Sleep(100 * time.Millisecond) // Explicit read-only Search visibility poll.
 	}
-	native := nativeCall(t, backend, collection, id)
-	nativeVariant := &pb.Call_Native{Native: native}
-	nativeRequest := &pb.Call{Version: 1, Operation: nativeVariant}
-	producedNative := false
+	native := nativeRequest(t, backend, collection, id)
 	var body []byte
-	var head *pb.NativeHead
-	var end *pb.NativeEnd
-	nativeOptions := weir.Options{StoreName: store}
-	nativeOptions.Produce = func(context.Context) (*pb.Call, error) {
-		if producedNative {
-			return nil, io.EOF
+	var head *weir.NativeHead
+	nativeOptions := weir.NativeOptions{StoreName: store, Request: native}
+	nativeOptions.Consume = func(_ context.Context, event *weir.Event) error {
+		if event.Head != nil {
+			head = event.Head
 		}
-		producedNative = true
-		return nativeRequest, nil
-	}
-	nativeOptions.Consume = func(_ context.Context, _ uint64, event *pb.Event) error {
-		if value := event.GetHead(); value != nil {
-			head = value
-		}
-		if len(body)+len(event.GetChunk()) > 1<<20 {
+		if len(body)+len(event.Chunk) > 1<<20 {
 			return errors.New("fixture response too large")
 		}
-		body = append(body, event.GetChunk()...)
-		if value := event.GetNativeEnd(); value != nil {
-			end = value
-		}
+		body = append(body, event.Chunk...)
 		return nil
 	}
-	if err := client.Execute(ctx, nativeOptions); err != nil || end.GetCompletion() != pb.NativeCompletion_RESPONSE_COMPLETE {
-		t.Fatalf("native Execute: %v %v", end, err)
+	end, err := client.Native(ctx, nativeOptions)
+	if err != nil || end.GetCompletion() != weir.NativeResponseComplete {
+		t.Fatalf("Native: %v %v", end, err)
 	}
 	if backend == "mongo" {
 		raw := bson.Raw(body)
@@ -189,38 +176,39 @@ func testLifecycle(t *testing.T, backend, variable string) {
 			t.Fatal("native count mismatch")
 		}
 	} else {
-		metadata := &spb.Response{}
-		if err := proto.Unmarshal(head.GetMetadata().GetData(), metadata); err != nil {
+		metadata, err := weir.DecodeSearchHTTPResponse(head.GetMetadata())
+		if err != nil {
 			t.Fatal(err)
 		}
 		if metadata.StatusCode != 200 {
 			t.Fatalf("native HTTP status %d", metadata.StatusCode)
 		}
 	}
-	recordOptions.Call = builder.call("delete", 0)
-	result, err = client.Record(ctx, recordOptions)
+	deleteRequest := &weir.DeleteRequest{Resource: builder.resource}
+	deleteOptions := weir.DeleteOptions{StoreName: store, Request: deleteRequest}
+	result, err = client.Delete(ctx, deleteOptions)
 	applied(t, result, err)
 	deleted = true
-	result, err = client.Record(ctx, readOptions)
-	if err != nil || result.GetRead().GetMissing() == nil {
-		t.Fatalf("deleted read: %v %v", result, err)
+	readResult, err = client.Read(ctx, readOptions)
+	if err != nil || !readResult.GetMissing() {
+		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
-	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, Complete-gated mixed Execute, ScanPage, native Execute and Delete verified", backend)
+	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, Complete-gated mixed Execute, Scan, native Execute and Delete verified", backend)
 }
 
-func applied(t *testing.T, result *pb.Result, err error) {
+func applied(t *testing.T, result *weir.MutationResult, err error) {
 	t.Helper()
-	if err != nil || result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || result.GetMutation().GetFailure() != nil {
+	if err != nil || result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
 		t.Fatalf("mutation acknowledgement: %v %v", result, err)
 	}
 }
-func bsonDocument(t *testing.T, value bson.D) *pb.Document {
+func bsonDocument(t *testing.T, value bson.D) *weir.Document {
 	t.Helper()
 	data, err := bson.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	document := &pb.Document{MediaType: "application/bson", Data: data}
+	document := &weir.Document{MediaType: "application/bson", Data: data}
 	return document
 }
 
@@ -229,42 +217,46 @@ type mutationBuilder struct {
 	backend, resource, id string
 }
 
-func (b mutationBuilder) call(action string, n int) *pb.Call {
-	t := b.t
-	t.Helper()
-	document := &pb.Document{MediaType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
+func (b mutationBuilder) write(n int) *weir.WriteRequest {
+	b.t.Helper()
+	document := &weir.Document{MediaType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
 	if b.backend == "mongo" {
 		value := bson.D{{Key: "_id", Value: b.id}, {Key: "n", Value: n}}
-		document = bsonDocument(t, value)
+		document = bsonDocument(b.t, value)
 	}
-	request := &pb.MutateRequest{Resource: b.resource}
+	request := &weir.WriteRequest{Resource: b.resource, Document: document}
+	return request
+}
+func (b mutationBuilder) transform(n int) *weir.AtomicTransformRequest {
+	b.t.Helper()
+	expression := &weir.Document{MediaType: "application/vnd.weir.search-update.v1+json", Data: []byte(fmt.Sprintf(`{"doc":{"n":%d}}`, n))}
+	if b.backend == "mongo" {
+		fields := bson.D{{Key: "n", Value: n}}
+		update := bson.D{{Key: "$set", Value: fields}}
+		expression = bsonDocument(b.t, update)
+		expression.MediaType = "application/vnd.weir.mongodb-update.v1+bson"
+	}
+	request := &weir.AtomicTransformRequest{Resource: b.resource, BackendExpression: expression}
+	return request
+}
+func (b mutationBuilder) command(action string, n int) *weir.Command {
+	b.t.Helper()
+	request := b.write(n)
 	switch action {
 	case "create":
-		request.Action = &pb.MutateRequest_Create{Create: document}
+		return weir.NewCreateCommand(request)
 	case "replace":
-		request.Action = &pb.MutateRequest_Replace{Replace: document}
+		return weir.NewReplaceCommand(request)
 	case "put":
-		request.Action = &pb.MutateRequest_Put{Put: document}
+		return weir.NewPutCommand(request)
 	case "delete":
-		empty := &pb.Empty{}
-		request.Action = &pb.MutateRequest_Delete{Delete: empty}
+		request := &weir.DeleteRequest{Resource: b.resource}
+		return weir.NewDeleteCommand(request)
 	case "transform":
-		expression := &pb.Document{MediaType: "application/vnd.weir.search-update.v1+json", Data: []byte(fmt.Sprintf(`{"doc":{"n":%d}}`, n))}
-		if b.backend == "mongo" {
-			fields := bson.D{{Key: "n", Value: n}}
-			update := bson.D{{Key: "$set", Value: fields}}
-			expression = bsonDocument(t, update)
-			expression.MediaType = "application/vnd.weir.mongodb-update.v1+bson"
-		}
-		form := &pb.Transform_BackendExpression{BackendExpression: expression}
-		transform := &pb.Transform{Form: form}
-		request.Action = &pb.MutateRequest_AtomicTransform{AtomicTransform: transform}
-	default:
-		t.Fatal("unknown mutation action", action)
+		return weir.NewAtomicTransformCommand(b.transform(n))
 	}
-	variant := &pb.Call_Mutate{Mutate: request}
-	call := &pb.Call{Version: 1, Operation: variant}
-	return call
+	b.t.Fatal("unknown mutation action", action)
+	return nil
 }
 func number(t *testing.T, backend string, data []byte) int64 {
 	t.Helper()
@@ -279,24 +271,23 @@ func number(t *testing.T, backend string, data []byte) int64 {
 	}
 	return value.N
 }
-func nativeCall(t *testing.T, backend, collection, id string) *pb.NativeCall {
+func nativeRequest(t *testing.T, backend, collection, id string) *weir.NativeRequest {
 	t.Helper()
-	open := &pb.NativeOpen{Resource: collection}
-	call := &pb.NativeCall{Open: open}
+	request := &weir.NativeRequest{Resource: collection}
 	if backend == "mongo" {
 		parts := strings.Split(collection, "/")
 		query := bson.D{{Key: "_id", Value: id}}
 		command := bson.D{{Key: "count", Value: parts[len(parts)-1]}, {Key: "query", Value: query}}
-		call.Body = bsonDocument(t, command).Data
-		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		open.BodyMediaType = "application/bson"
+		request.Body = bsonDocument(t, command).Data
+		request.Descriptor = &weir.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
+		request.BodyMediaType = "application/bson"
 	} else {
-		descriptor := &spb.Request{Method: "GET", Path: "/_doc/" + id}
-		raw, err := proto.Marshal(descriptor)
+		descriptor := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/" + id}
+		encoded, err := weir.SearchHTTPDescriptor(descriptor)
 		if err != nil {
 			t.Fatal(err)
 		}
-		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.search-http.v1+protobuf", Data: raw}
+		request.Descriptor = encoded
 	}
-	return call
+	return request
 }

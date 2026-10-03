@@ -6,7 +6,7 @@ qualification requires verified network isolation. It does not install infrastru
 writes. Use only disposable, pre-created collections/indexes owned by this run.
 
 The published command can be installed outside this checkout with
-`go install github.com/batchstream/weir-go/examples/soak@main`. Go resolves the
+`go install github.com/batchstream/weir-go/examples/soak@v0.2.0`. Go resolves the
 command's BSON dependency even when a consumer only imported the SDK root package.
 
 Build once from the exact reviewed SDK revision for the worker architecture:
@@ -48,13 +48,13 @@ and a fresh `-run-id`. Freeze all values and artifact identities before the 24-h
 ```
 
 Collection flags use `weir://STORE/...` only as operator input and audit metadata.
-The runner separates StoreName and sends canonical relative Call targets.
+The runner separates StoreName and sends canonical relative Command targets.
 Each worker owns a distinct string key, with half the workers assigned to each
-backend. It Creates that record once, then schedules Put → Read → Replace → Read cycles, each using Record over a finite Execute
+backend. It Creates that record once, then schedules Put → Read → Replace → Read cycles, each using typed SDK commands over a finite Execute
 RPC. Every acknowledged value is checked before the next dependent operation.
 Each cycle performs four RPCs and two mutations; the default steady load is approximately
 120 RPC/s and 60 mutations/s. Once a minute and at normal completion, one leader
-per backend additionally checks ScanPage end/count/final status and read-only Native completion/body semantics.
+per backend additionally checks Scan end/count/final status and read-only Native completion/body semantics.
 This respects the server's single Native/Scan session per Store. Search
 Scan runs after the first minute, allowing its normal asynchronous refresh.
 

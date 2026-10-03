@@ -1,26 +1,23 @@
 # Weir Go SDK
 
-Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.1.
-Initialize through any application's `StoreService.ResolveStore` endpoint, then
-send finite `StoreService.Execute` RPCs directly to each Store's replicas. Weir
-does not relay business traffic. IP and DNS addresses work in Kubernetes and
-other deployments; URI affinity is not implemented.
+Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.1.
+Initialize through any application node, then send business requests directly to
+its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
+work in Kubernetes and other deployments; URI affinity is not implemented.
 
 ```sh
-go get github.com/batchstream/weir-go@main
+go get github.com/batchstream/weir-go@v0.2.0
 ```
 
-This source uses the current discovery/Execute protocol and replaces the older
-five-RPC SDK API. Public schemas, generated protobuf types and shared
-validation/DNS helpers are owned by the independent
-[weir-protocol](https://github.com/batchstream/weir-protocol) module. Both Weir
-and this SDK depend on that module; the protocol module depends on neither.
-The SDK has no dependency on the Weir server module and does not generate schemas.
-See `go.mod` for the exact protocol revision. This migration pins an upstream
-commit and does not publish a new release. SDK releases require a stable,
-unreplaced `weir-protocol` tag.
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.1.0`
+release. The independent protocol repository owns public schemas, generated
+protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
+it; neither the protocol nor SDK module depends on the server. The SDK does not
+generate schemas, and CI rejects first-party pseudo versions and module replacements.
 
 ## Initialize and read
+
+Import only `weir "github.com/batchstream/weir-go"` for ordinary business calls:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -30,80 +27,103 @@ client, err := weir.Open(ctx, options)
 if err != nil { return err }
 defer client.Close()
 
-request := &pb.ReadRequest{Resource: "records/s:example"}
-variant := &pb.Call_Read{Read: request}
-call := &pb.Call{Version: 1, Operation: variant}
-recordOptions := weir.RecordOptions{StoreName: "search", Call: call}
-result, err := client.Record(ctx, recordOptions)
+request := &weir.ReadRequest{Resource: "records/s:example"}
+readOptions := weir.ReadOptions{StoreName: "search", Request: request}
+result, err := client.Read(ctx, readOptions)
 if err != nil { return err }
-if result.GetRead().GetFailure() != nil {
-    return fmt.Errorf("read failed: %v", result.GetRead().GetFailure())
-}
-fmt.Println("missing:", result.GetRead().GetMissing() != nil)
+if result.Failure != nil { return fmt.Errorf("read failed: %v", result.Failure) }
+fmt.Println("missing:", result.Missing)
 ```
 
-Import `weir "github.com/batchstream/weir-go"` and
-`pb "github.com/batchstream/weir-protocol/api/weir/v1"`. `Open` completes initialization
-and establishes a ready direct connection for every requested Store. Reuse the
-client across goroutines and close it after callers finish. Its refresh worker
-updates directory metadata and DNS replicas; opening context cancellation does
-not own the returned client. Open accepts 1–16 Stores. DNS balances replicas
-without Kubernetes APIs. Discovery can retry read-only initialization; business
-requests are never replayed. A stale directory cache fails closed after its lease.
+`Open` resolves ownership and establishes a ready direct connection for every
+requested Store. Reuse the client across goroutines and close it after callers
+finish. Its worker refreshes directory metadata and DNS replicas. The opening
+context bounds initialization; it does not own the returned client. Open accepts
+1–16 Stores. Discovery may retry read-only initialization; business requests are
+never replayed. A stale directory cache fails closed when its lease expires.
 
-`Call` selects a read, mutation, finite scan page, or native exchange. A resource
-is relative to `StoreName`; the Call carries no `weir://STORE/` prefix. Canonically
-encode individual decoded path segments with `protocol.EncodeSegment` from
-`github.com/batchstream/weir-protocol/api/protocol`. MongoDB paths are
-`DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
+Resources are relative to `StoreName`, without a `weir://STORE/` prefix.
+`weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
+are `DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
 `application/bson` with the first `_id` matching the URI key. Search documents
-use `application/json`. The SDK preserves document bytes and business outcomes;
-inspect `Result.GetMutation()` or `Result.GetRead()` for backend failures.
+use `application/json`. The caller owns its document codec; the SDK preserves bytes.
 
-## Finite execution and completion
+## Business operations
 
-`client.Execute(ctx, options)` executes one finite batch with named `Options`
-fields `StoreName`, `Produce`, `Consume`, and `Complete`. `Produce` returns a versioned protobuf `Call`, then `io.EOF` when
-input ends. `Consume` receives decoded Events incrementally. `Complete` runs once
-a request has a validated terminal Event and empty `request_complete` frame.
-Every request must complete and the RPC must finish with gRPC OK for Execute to
-succeed. Consume and Complete callbacks must honor their context and return
-promptly. Do not retain unbounded Events or mutate input while execution runs.
+Each method takes named options with `StoreName` and `Request`:
 
-One Execute stream has a fixed Store. Requests may be in flight concurrently,
-and completion order can differ from input order. An application requiring
-read-after-write waits for Complete or ends one Record before the next call.
-`Record` collects one read/mutation Result. It may return a validated result with
-a transport error: an APPLIED acknowledgement remains evidence even if a later
-frame or final status is lost. Incomplete writes are indeterminate; reconcile
-through application knowledge and never automatically replay them.
+| Method | Options / request | Result |
+| --- | --- | --- |
+| `Read` | `ReadOptions` / `ReadRequest` | `ReadResult`: Document, Missing, Failure |
+| `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
+| `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
+| `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
+| `Scan` | `ScanOptions` / `ScanRequest`, document consumer | `ScanEnd` |
+| `Native` | `NativeOptions` / `NativeRequest`, event consumer | `NativeEnd` |
 
-`ScanPage` consumes each document and returns a finite page's ScanEnd. Its next
-continuation token is usable only after a successful page and final gRPC OK. Keep
-the previous token on interruption; retrying that page can repeat documents.
-Native Calls use Execute and produce NativeHead, chunks, and NativeEnd. Native
-completion describes transport evidence; a complete response can contain a
-backend error that the caller must interpret.
+`WriteRequest` contains Resource, Document and optional AdapterOptions. Create
+requires absence; Replace requires an existing resource; Put creates or replaces.
+AtomicTransform requires exactly one Program or BackendExpression. Its invalid
+combinations are rejected before any business frame is sent, including in a batch.
 
-The SDK keeps at most eight requests and 16 MiB of encoded pending input in flight.
-Documents are bounded at 2 MiB, Calls at 9 MiB, event fragments at 64 KiB, scan pages
-at 256 documents, and native responses are consumed incrementally. The server may
-apply smaller Store budgets. Scan selectors and transform expressions have 16 KiB
-bounds. Use caller deadlines; business operations have no implicit retry or
-failover. `Dial` and the package-level Execute/Record/ScanPage functions expose a
-low-level connection for an already known owner; `Dial` is lazy and does not
-initialize or validate ownership.
+Read and mutation results may accompany a transport error. Preserve their
+validated backend evidence: `weir.MutationApplied` remains an acknowledgement if
+a later frame or final status is lost. A missing acknowledgement is indeterminate;
+reconcile through application knowledge and never automatically replay a write.
+Backend failures remain in the result separately from RPC completion errors.
 
-The current application and peer listeners use plaintext gRPC. Restrict their
-network access; the SDK only contacts application listeners. It reads no secret
-or credential files and contains no backend provisioning or transaction API.
+`Scan` executes one finite page and consumes documents incrementally. It returns
+a checkpoint only after the matching document count, request completion frame
+and final gRPC OK. A failed page returns no ScanEnd; keep the previous token.
+Retrying that page may repeat documents, so the caller owns deduplication and
+committing output together with its checkpoint. A completed RPC can still carry
+`ScanEnd.Failure`, which has no continuation token.
 
-## Examples and tests
+`NativeRequest` contains Resource, Descriptor, BodyMediaType and a bounded Body.
+Its consumer sees flat SDK Events containing Head, Chunk or NativeEnd. Chunks are
+nonempty and consumed incrementally; the SDK does not collect a whole response.
+A validated NativeEnd is returned with a later transport or consumer error.
+Completion describes response transport evidence, not a normalized mutation
+outcome. Interpret backend response status/body separately. For Search HTTP,
+use `SearchHTTPRequest`, `SearchHTTPDescriptor` and `DecodeSearchHTTPResponse`
+without importing generated protobuf packages. Mongo command bodies use BSON and
+`MongoCommandMediaType` for the descriptor.
 
-[read](examples/read/main.go) reads one record, [basic](examples/basic/main.go)
-executes a finite batch, [scan](examples/scan/main.go) commits page checkpoints,
-and [native](examples/native/main.go) consumes native responses. The explicit
-[soak workload](examples/soak/README.md) audits fixed owner traffic and uncertainty.
+## Finite batches
+
+`client.Execute(ctx, ExecuteOptions)` uses a fixed Store, with `Produce`, `Consume`
+and optional `Complete` callbacks. Produce returns an opaque SDK Command, then
+`io.EOF` when its finite input ends. Use `NewReadCommand`, `NewCreateCommand`,
+`NewPutCommand`, `NewReplaceCommand`, `NewDeleteCommand`,
+`NewAtomicTransformCommand`, `NewScanCommand` or `NewNativeCommand`; callers never
+construct a wire version or protobuf oneof. Consume receives validated flat SDK
+Events incrementally. Complete runs after one request's terminal business event
+and empty completion frame. Every request must complete and the RPC must finish with gRPC OK
+for the whole Execute to succeed. Backend failures remain business results.
+
+Requests can be in flight concurrently and complete out of input order. Wait
+for Complete, or finish one typed method, before dependent operations. This is
+a framing barrier; check Outcome/Failure before depending on business success. Callbacks
+must honor their context and return promptly. Do not retain unbounded events or
+mutate requests/documents while execution runs. The SDK keeps at most eight
+requests and 16 MiB of encoded pending input in flight. Documents are bounded at
+2 MiB, Commands at 9 MiB, event fragments at 64 KiB, scan pages at 256 documents,
+and selectors/transform expressions at 16 KiB. Servers may use smaller budgets.
+
+Use caller deadlines. Business operations have no implicit retry or failover.
+`Dial` and package-level operation functions provide an advanced fixed-owner
+gRPC seam; the caller owns target validation and connection lifetime. That seam
+can accept a generated StoreService client for raw protocol fixtures. Ordinary
+applications use Open and the typed Client methods shown above.
+
+## Examples and validation
+
+[read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
+puts a document then executes a finite read batch, [scan](examples/scan/main.go)
+commits finite-page checkpoints, and [native](examples/native/main.go) consumes
+native responses. These examples use SDK request/result/event types. The explicit
+[soak workload](examples/soak/README.md) audits fixed owners and write uncertainty;
+its advanced owner check uses the public discovery transport on the same connection.
 
 ```sh
 python3 scripts/download_modules.py
@@ -112,11 +132,16 @@ GOWORK=off GOPROXY=off GOSUMDB=off go vet ./...
 GOWORK=off GOPROXY=off GOSUMDB=off python3 scripts/check_dependencies.py
 ```
 
-Default tests use in-memory or loopback fixtures and never start databases or
-contact production. The dependency check scans both packages and the complete
-module graph, including test and unused requirements. It rejects the Weir server
-module, protocol dependencies leading back to the SDK/server, local module
-replacements and SDK-generated schemas. Real backend integration is an explicit opt-in:
+Default tests use owned loopback fixtures, without databases or production I/O.
+CI checks typed operation dispatch, acknowledgements with transport errors,
+malformed/empty native chunks, incremental consumption, scan checkpoints,
+completion/cancellation, no replay, deadline admission, directory expiry/conflicts,
+DNS refresh and fixed-owner workload routing. The full module graph and normal/
+integration package closures must remain independent of the Weir server. Releases
+require stable unreplaced dependencies and compile a separate ordinary consumer
+that imports only this SDK for all business operations.
+
+Real backend tests require an explicit tag and operator-provided fixtures:
 
 ```sh
 WEIR_ADDRESS=127.0.0.1:7447 \
@@ -125,12 +150,11 @@ WEIR_SEARCH_RESOURCE=weir://search/weir_acceptance \
 go test -race -tags integration -run 'Test(Mongo|Search)Lifecycle' -v .
 ```
 
-Create the database/collection and concrete Search index beforehand. Each enabled
-backend owns one temporary record and checks Create, duplicate precondition,
-Replace, Put, AtomicTransform, Read, a Complete-gated mixed Execute, ScanPage,
-Native and Delete. Omit a backend resource variable to skip its test. Use dedicated
-test datasets. The [qualification record](docs/qualification.md) distinguishes
-historical release evidence from checks of the current protocol.
+Pre-create disposable collections/indexes. Each backend owns one generated record
+and checks the typed operations, Complete-gated mixed Execute, Scan and Native.
+The [qualification record](docs/qualification.md) separates current protocol checks
+from historical release/deployment evidence.
 
+Application and peer listeners use plaintext gRPC; restrict their network access.
 This repository follows the upstream project's current licensing status; no new
 license grant is introduced here.

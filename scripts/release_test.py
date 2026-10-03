@@ -10,7 +10,7 @@ import release
 
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
-        self.environment = dict(RELEASE_VERSION='v0.1.0', GITHUB_REPOSITORY='batchstream/weir-go',
+        self.environment = dict(RELEASE_VERSION='v0.2.0', GITHUB_REPOSITORY='batchstream/weir-go',
                                 GITHUB_REF='refs/heads/main', GITHUB_SHA='a' * 40)
 
     def test_invalid_version_does_no_io(self):
@@ -48,7 +48,7 @@ class ReleaseTests(unittest.TestCase):
             mutation.assert_not_called()
 
     def test_existing_tag_is_never_retargeted(self):
-        for references in ('b' * 40 + '\trefs/tags/v0.1.0\n', 'c' * 40 + '\trefs/tags/v0.1.0\n' + 'b' * 40 + '\trefs/tags/v0.1.0^{}\n'):
+        for references in ('b' * 40 + '\trefs/tags/v0.2.0\n', 'c' * 40 + '\trefs/tags/v0.2.0\n' + 'b' * 40 + '\trefs/tags/v0.2.0^{}\n'):
             responses = ['a' * 40, json.dumps(dict(Version='v0.1.0')), references]
             with patch.dict(os.environ, self.environment), patch.object(release.subprocess, 'check_output', side_effect=responses), patch.object(release.subprocess, 'run') as mutation:
                 with self.assertRaisesRegex(ValueError, 'refusing overwrite'):

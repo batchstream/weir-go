@@ -524,7 +524,7 @@ func (c *Client) storeClient(store string) (pb.StoreServiceClient, error) {
 	return pb.NewStoreServiceClient(entry.channel.connection), nil
 }
 
-func (c *Client) Execute(ctx context.Context, options Options) error {
+func (c *Client) Execute(ctx context.Context, options ExecuteOptions) error {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return err
@@ -532,20 +532,68 @@ func (c *Client) Execute(ctx context.Context, options Options) error {
 	return Execute(ctx, client, options)
 }
 
-func (c *Client) Record(ctx context.Context, options RecordOptions) (*pb.Result, error) {
+func (c *Client) Read(ctx context.Context, options ReadOptions) (*ReadResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err
 	}
-	return Record(ctx, client, options)
+	return Read(ctx, client, options)
 }
 
-func (c *Client) ScanPage(ctx context.Context, options ScanPageOptions) (*pb.ScanEnd, error) {
+func (c *Client) Create(ctx context.Context, options WriteOptions) (*MutationResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err
 	}
-	return ScanPage(ctx, client, options)
+	return Create(ctx, client, options)
+}
+
+func (c *Client) Put(ctx context.Context, options WriteOptions) (*MutationResult, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return Put(ctx, client, options)
+}
+
+func (c *Client) Replace(ctx context.Context, options WriteOptions) (*MutationResult, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return Replace(ctx, client, options)
+}
+
+func (c *Client) Delete(ctx context.Context, options DeleteOptions) (*MutationResult, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return Delete(ctx, client, options)
+}
+
+func (c *Client) AtomicTransform(ctx context.Context, options AtomicTransformOptions) (*MutationResult, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return AtomicTransform(ctx, client, options)
+}
+
+func (c *Client) Scan(ctx context.Context, options ScanOptions) (*ScanEnd, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return Scan(ctx, client, options)
+}
+
+func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeEnd, error) {
+	client, err := c.storeClient(options.StoreName)
+	if err != nil {
+		return nil, err
+	}
+	return Native(ctx, client, options)
 }
 
 func (c *Client) closeChannels() {

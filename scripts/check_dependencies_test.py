@@ -62,9 +62,23 @@ class DependencyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'module replacement'):
             check_dependencies.check_modules(modules)
 
+    def test_protocol_module_must_be_published_and_stable(self):
+        for version in ('', 'main', 'v0.1.0-rc.1', 'v01.0.0', 'v0.0.0-20261002231331-9eb76acccdcf'):
+            module = {'Path': check_dependencies.PROTOCOL, 'Version': version}
+            with self.assertRaisesRegex(ValueError, 'canonical stable protocol'):
+                check_dependencies.check_modules([module])
+            graph = f'{check_dependencies.SDK} {check_dependencies.PROTOCOL}@{version}\n'
+            with self.assertRaisesRegex(ValueError, 'canonical stable protocol'):
+                check_dependencies.check_module_graph(graph)
+        with self.assertRaisesRegex(ValueError, 'published protocol module'):
+            check_dependencies.check_modules([{'Path': check_dependencies.SDK, 'Main': True}])
+        check_dependencies.check_modules([{'Path': check_dependencies.PROTOCOL, 'Version': 'v0.1.0'}])
+
     def test_main_checks_modules_before_imports_and_ignores_workspace(self):
         graph = f'{check_dependencies.SDK} {check_dependencies.PROTOCOL}@v0.1.0\n'
-        modules = '\n'.join(json.dumps({'Path': name}) for name in (check_dependencies.SDK, check_dependencies.PROTOCOL))
+        modules = '\n'.join(json.dumps(item) for item in (
+            {'Path': check_dependencies.SDK, 'Main': True},
+            {'Path': check_dependencies.PROTOCOL, 'Version': 'v0.1.0'}))
         packages = json.dumps({'ImportPath': 'context'})
         with patch.dict(os.environ, {'GOWORK': '/local/go.work'}), patch.object(Path, 'rglob', return_value=[]), patch.object(check_dependencies.subprocess, 'check_output', side_effect=[graph, modules, packages, packages]) as command:
             check_dependencies.main()

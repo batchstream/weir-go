@@ -3,19 +3,20 @@
 This record distinguishes protocol tests, real backend integration, and sustained
 production qualification. Passing one does not establish the others.
 
-## Current protocol migration
+## Current typed SDK and stable protocol
 
 The SDK now implements ResolveStore initialization followed by direct finite
 Execute RPCs. Source schemas and shared protocol/DNS helpers are supplied by the
-pinned independent `github.com/batchstream/weir-protocol` revision. CI runs default
+stable independent `github.com/batchstream/weir-protocol v0.1.0` release. CI runs default
 race, vet, tagged integration compilation, Python release preflight tests and
 formatting on Linux amd64/arm64. Its dependency check scans normal/tagged test
 package closures and the complete module graph,
 including test and unused requirements. It rejects every Weir server dependency,
 protocol paths leading back to the SDK/server, module replacements and locally
 generated protobuf source. The protocol module owns public schemas and shared
-helpers; neither it nor the SDK depends on the server. No release is published
-by this migration; releases require a stable, unreplaced `weir-protocol` tag.
+helpers; neither it nor the SDK depends on the server. The SDK release target is v0.2.0; publication requires a stable, unreplaced protocol tag and verifies a clean consumer using the typed SDK without protobuf imports.
+
+The typed API hides operation and result oneofs, preserves Read/Mutation/Native evidence alongside transport failures, and keeps Scan checkpoints gated on final RPC success. Default tests include actual typed operation dispatch and reject ambiguous transforms before business traffic.
 
 The current tests cover malformed or incomplete Events, unknown request IDs,
 request completion and final status, bounded input, canceled senders, no replay,
@@ -23,7 +24,7 @@ directory conflicts/expiry, DNS replica refresh, and fixed owner workload routin
 The integration test explicitly initializes through an application listener and
 uses one owned temporary record per backend. Historical five-RPC and installed
 release evidence below does not establish compatibility or qualification for the
-current protocol. Record new real backend/production results with exact source
+current typed API. Record new real backend/production results with exact source
 revisions and images before making deployment claims.
 
 ## Server-owned protocol migration validation, 2026-10-03
