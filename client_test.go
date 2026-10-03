@@ -25,12 +25,17 @@ type clientTestPeer struct {
 	pb.UnimplementedStoreServiceServer
 	mode      string
 	completed atomic.Int64
+	received  atomic.Int64
+	commands  chan *pb.Command
 	canceled  chan struct{}
 }
 
 func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 	if strings.HasPrefix(p.mode, "scan_") {
 		return p.scanExecute(stream)
+	}
+	if strings.HasPrefix(p.mode, "native_") {
+		return p.nativeExecute(stream)
 	}
 	if p.mode == "reject_early" {
 		return status.Error(codes.InvalidArgument, "fixture header rejection")
@@ -54,14 +59,30 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 			}
 			return err
 		}
+		p.received.Add(1)
+		if p.commands != nil {
+			command, err := protocol.DecodeCommand(request.CommandPayload)
+			if err != nil {
+				return err
+			}
+			p.commands <- command
+		}
 		document := &pb.Document{MediaType: "application/octet-stream", Data: bytes.Repeat([]byte{37}, 257<<10)}
 		readValue := &pb.ReadResult_Document{Document: document}
 		read := &pb.ReadResult{Result: readValue}
+		if p.mode == "read_missing" {
+			empty := &pb.Empty{}
+			read.Result = &pb.ReadResult_Missing{Missing: empty}
+		}
+		if p.mode == "read_failure" {
+			failure := &pb.Failure{Code: pb.FailureCode_PERMISSION_DENIED, Message: "fixture backend denied read"}
+			read.Result = &pb.ReadResult_Failure{Failure: failure}
+		}
 		resultValue := &pb.Result_Read{Read: read}
 		result := &pb.Result{Index: request.RequestId, Result: resultValue}
 		value := &pb.Event_Result{Result: result}
 		event := &pb.Event{Version: 1, Value: value}
-		if p.mode == "write_reply_loss" || p.mode == "write_end_failure" {
+		if p.mode == "write_reply_loss" || p.mode == "write_end_failure" || p.mode == "typed_mutation" {
 			mutation := &pb.MutationResult{Outcome: pb.MutationOutcome_APPLIED}
 			result.Result = &pb.Result_Mutation{Mutation: mutation}
 		}
@@ -131,12 +152,12 @@ func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceCli
 	return pb.NewStoreServiceClient(connection)
 }
 
-func clientTestRead() *pb.Call {
-	read := &pb.ReadRequest{Resource: "records/s:key"}
-	value := &pb.Call_Read{Read: read}
-	call := &pb.Call{Version: 1, Operation: value}
-	return call
+func clientTestReadRequest() *ReadRequest {
+	request := &ReadRequest{Resource: "records/s:key"}
+	return request
 }
+
+func clientTestRead() *Command { return NewReadCommand(clientTestReadRequest()) }
 
 func TestExecuteConsumesFragmentedFiniteBatch(t *testing.T) {
 	peer := &clientTestPeer{mode: "normal"}
@@ -144,15 +165,15 @@ func TestExecuteConsumesFragmentedFiniteBatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	produced, consumed := 0, 0
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(context.Context) (*pb.Call, error) {
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(context.Context) (*Command, error) {
 		if produced == 25 {
 			return nil, io.EOF
 		}
 		produced++
 		return clientTestRead(), nil
 	}
-	opts.Consume = func(_ context.Context, id uint64, event *pb.Event) error {
+	opts.Consume = func(_ context.Context, id uint64, event *Event) error {
 		data := event.GetResult().GetRead().GetDocument().GetData()
 		if id != uint64(consumed+1) || len(data) != 257<<10 || !bytes.Equal(data, bytes.Repeat([]byte{37}, len(data))) {
 			return errors.New("fragmented result corrupt, truncated or miscorrelated")
@@ -168,20 +189,20 @@ func TestExecuteConsumesFragmentedFiniteBatch(t *testing.T) {
 	}
 }
 
-func TestRecordRejectsIncompleteAndInvalidResponses(t *testing.T) {
+func TestReadRejectsIncompleteAndInvalidResponses(t *testing.T) {
 	for _, mode := range []string{"unknown_id", "invalid_event", "incomplete_event", "missing_end", "non_ok_after_end"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			opts := RecordOptions{StoreName: "records", Call: clientTestRead()}
-			result, err := Record(ctx, client, opts)
+			opts := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
+			result, err := Read(ctx, client, opts)
 			if err == nil {
 				t.Fatal("invalid or incomplete RPC reported success", mode)
 			}
 			if mode == "missing_end" || mode == "non_ok_after_end" {
-				if len(result.GetRead().GetDocument().GetData()) != 257<<10 {
+				if len(result.GetDocument().GetData()) != 257<<10 {
 					t.Fatal("complete validated business evidence was discarded", mode)
 				}
 			} else if result != nil {
@@ -200,9 +221,9 @@ func TestExecuteProducerErrorCancelsAndJoins(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	failure := errors.New("producer source failed")
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(context.Context) (*pb.Call, error) { return nil, failure }
-	opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(context.Context) (*Command, error) { return nil, failure }
+	opts.Consume = func(context.Context, uint64, *Event) error { return nil }
 	if err := Execute(ctx, client, opts); !errors.Is(err, failure) {
 		t.Fatal("producer failure was masked", err)
 	}
@@ -216,8 +237,8 @@ func TestExecuteConsumerErrorJoinsBlockedProducer(t *testing.T) {
 	failure := errors.New("consumer failed")
 	produced := false
 	joined := make(chan struct{})
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(ctx context.Context) (*pb.Call, error) {
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(ctx context.Context) (*Command, error) {
 		if !produced {
 			produced = true
 			return clientTestRead(), nil
@@ -226,7 +247,7 @@ func TestExecuteConsumerErrorJoinsBlockedProducer(t *testing.T) {
 		close(joined)
 		return nil, ctx.Err()
 	}
-	opts.Consume = func(context.Context, uint64, *pb.Event) error { return failure }
+	opts.Consume = func(context.Context, uint64, *Event) error { return failure }
 	if err := Execute(ctx, client, opts); !errors.Is(err, failure) {
 		t.Fatal("consumer failure was masked", err)
 	}
@@ -245,16 +266,17 @@ func TestExecuteCanceledBlockedSendReleasesProducer(t *testing.T) {
 	document := &pb.Document{MediaType: "application/octet-stream", Data: make([]byte, 2<<20)}
 	action := &pb.MutateRequest_Put{Put: document}
 	mutation := &pb.MutateRequest{Resource: "records/s:key", Action: action}
-	value := &pb.Call_Mutate{Mutate: mutation}
-	call := &pb.Call{Version: 1, Operation: value}
+	value := &pb.Command_Mutate{Mutate: mutation}
+	wire := &pb.Command{Version: 1, Operation: value}
+	call := &Command{wire: wire}
 	var active atomic.Int64
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(context.Context) (*pb.Call, error) {
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(context.Context) (*Command, error) {
 		active.Add(1)
 		defer active.Add(-1)
 		return call, nil
 	}
-	opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+	opts.Consume = func(context.Context, uint64, *Event) error { return nil }
 	started := time.Now()
 	if err := Execute(ctx, client, opts); err == nil {
 		t.Fatal("blocked transport completed after cancellation")
@@ -273,8 +295,8 @@ func TestExecuteEarlyEOFJoinsWithoutWaitingForCallerDeadline(t *testing.T) {
 			defer cancel()
 			produced := false
 			joined := make(chan struct{})
-			opts := Options{StoreName: "records"}
-			opts.Produce = func(ctx context.Context) (*pb.Call, error) {
+			opts := ExecuteOptions{StoreName: "records"}
+			opts.Produce = func(ctx context.Context) (*Command, error) {
 				if mode == "early_eof_after_result" && !produced {
 					produced = true
 					return clientTestRead(), nil
@@ -283,7 +305,7 @@ func TestExecuteEarlyEOFJoinsWithoutWaitingForCallerDeadline(t *testing.T) {
 				close(joined)
 				return nil, ctx.Err()
 			}
-			opts.Consume = func(context.Context, uint64, *pb.Event) error { return nil }
+			opts.Consume = func(context.Context, uint64, *Event) error { return nil }
 			started := time.Now()
 			if err := Execute(ctx, client, opts); err == nil {
 				t.Fatal("downstream early EOF was reported as finite batch success")
@@ -308,15 +330,15 @@ func TestExecuteCompleteRequiresEmptyTransportEnd(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			produced, consumed, completed := false, 0, 0
-			opts := Options{StoreName: "records"}
-			opts.Produce = func(context.Context) (*pb.Call, error) {
+			opts := ExecuteOptions{StoreName: "records"}
+			opts.Produce = func(context.Context) (*Command, error) {
 				if produced {
 					return nil, io.EOF
 				}
 				produced = true
 				return clientTestRead(), nil
 			}
-			opts.Consume = func(context.Context, uint64, *pb.Event) error { consumed++; return nil }
+			opts.Consume = func(context.Context, uint64, *Event) error { consumed++; return nil }
 			opts.Complete = func(_ context.Context, id uint64) error {
 				if consumed != 1 || id != 1 {
 					return errors.New("Complete fired before validated business result")
@@ -339,21 +361,18 @@ func TestExecuteCompleteRequiresEmptyTransportEnd(t *testing.T) {
 	}
 }
 
-func TestRecordPreservesAppliedEvidenceWithRPCError(t *testing.T) {
+func TestPutPreservesAppliedEvidenceWithRPCError(t *testing.T) {
 	for _, mode := range []string{"write_reply_loss", "write_end_failure"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			document := &pb.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
-			action := &pb.MutateRequest_Put{Put: document}
-			mutation := &pb.MutateRequest{Resource: "records/s:key", Action: action}
-			variant := &pb.Call_Mutate{Mutate: mutation}
-			call := &pb.Call{Version: 1, Operation: variant}
-			opts := RecordOptions{StoreName: "records", Call: call}
-			result, err := Record(ctx, client, opts)
-			if status.Code(err) != codes.Unavailable || result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || result.Index != 1 {
+			document := &Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+			request := &WriteRequest{Resource: "records/s:key", Document: document}
+			opts := WriteOptions{StoreName: "records", Request: request}
+			result, err := Put(ctx, client, opts)
+			if status.Code(err) != codes.Unavailable || result.GetOutcome() != MutationApplied {
 				t.Fatal("lost RPC terminal erased validated write evidence or reported success", result, err)
 			}
 		})
@@ -365,14 +384,14 @@ func TestExecuteEarlyRejectionPreservesAuthoritativeStatus(t *testing.T) {
 	client := clientTestConnection(t, peer)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(context.Context) (*pb.Call, error) {
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(context.Context) (*Command, error) {
 		// Bounded source work can finish after the peer rejects RPC headers.
 		// A subsequent Send EOF must not mask the authoritative receive status.
 		time.Sleep(20 * time.Millisecond)
 		return clientTestRead(), nil
 	}
-	opts.Consume = func(context.Context, uint64, *pb.Event) error { return errors.New("rejected RPC returned a result") }
+	opts.Consume = func(context.Context, uint64, *Event) error { return errors.New("rejected RPC returned a result") }
 	if err := Execute(ctx, client, opts); status.Code(err) != codes.InvalidArgument {
 		t.Fatal("Send EOF or cancellation replaced peer rejection", err)
 	}
@@ -384,14 +403,15 @@ func TestExecuteOversizedInputDoesNotAllocateEncodedCopy(t *testing.T) {
 	body := make([]byte, protocol.MaxPayload+1)
 	descriptor := &pb.Document{MediaType: "application/vnd.weir.search-http.v1+protobuf"}
 	open := &pb.NativeOpen{Resource: "records", Descriptor_: descriptor}
-	native := &pb.NativeCall{Open: open, Body: body}
-	variant := &pb.Call_Native{Native: native}
-	call := &pb.Call{Version: 1, Operation: variant}
+	native := &pb.NativeRequest{Open: open, Body: body}
+	variant := &pb.Command_Native{Native: native}
+	wire := &pb.Command{Version: 1, Operation: variant}
+	call := &Command{wire: wire}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	opts := Options{StoreName: "records"}
-	opts.Produce = func(context.Context) (*pb.Call, error) { return call, nil }
-	opts.Consume = func(context.Context, uint64, *pb.Event) error {
+	opts := ExecuteOptions{StoreName: "records"}
+	opts.Produce = func(context.Context) (*Command, error) { return call, nil }
+	opts.Consume = func(context.Context, uint64, *Event) error {
 		return errors.New("oversized input returned a response")
 	}
 	var before, after runtime.MemStats
@@ -438,6 +458,10 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error
 		return nil
 	}
 	end := &pb.ScanEnd{DocumentCount: count, NextContinuationToken: []byte("checkpoint")}
+	if p.mode == "scan_business_failure" {
+		end.Failure = &pb.Failure{Code: pb.FailureCode_UNAVAILABLE, Message: "backend failed the scan"}
+		end.NextContinuationToken = nil
+	}
 	if p.mode == "scan_invalid_end" {
 		end.Exhausted = true
 	}
@@ -459,7 +483,7 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error
 	return nil
 }
 
-func TestScanPageCommitsOnlyCompleteBoundedPage(t *testing.T) {
+func TestScanCommitsOnlyCompleteBoundedPage(t *testing.T) {
 	for _, mode := range []string{"scan_normal", "scan_missing_business_end", "scan_missing_request_end", "scan_non_ok", "scan_overbound", "scan_invalid_end", "scan_consumer_failure"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
@@ -468,7 +492,7 @@ func TestScanPageCommitsOnlyCompleteBoundedPage(t *testing.T) {
 			defer cancel()
 			request := &pb.ScanRequest{Resource: "records", PageSize: 1}
 			consumed := 0
-			opts := ScanPageOptions{StoreName: "search", Request: request}
+			opts := ScanOptions{StoreName: "search", Request: request}
 			opts.Consume = func(context.Context, *pb.Document) error {
 				consumed++
 				if mode == "scan_consumer_failure" {
@@ -476,7 +500,7 @@ func TestScanPageCommitsOnlyCompleteBoundedPage(t *testing.T) {
 				}
 				return nil
 			}
-			end, err := ScanPage(ctx, client, opts)
+			end, err := Scan(ctx, client, opts)
 			if mode == "scan_normal" {
 				if err != nil || end == nil || end.DocumentCount != 1 || string(end.NextContinuationToken) != "checkpoint" || end.Exhausted || consumed != 1 {
 					t.Fatal("complete page was not committed", end, err, consumed)

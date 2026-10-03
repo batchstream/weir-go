@@ -8,7 +8,6 @@ import (
 	"time"
 
 	weir "github.com/batchstream/weir-go"
-	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
 func main() {
@@ -34,9 +33,9 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	request := &pb.ScanRequest{Resource: *resource, PageSize: uint32(*pageSize)}
-	options := weir.ScanPageOptions{StoreName: *storeName, Request: request}
-	options.Consume = func(ctx context.Context, document *pb.Document) error {
+	request := &weir.ScanRequest{Resource: *resource, PageSize: uint32(*pageSize)}
+	options := weir.ScanOptions{StoreName: *storeName, Request: request}
+	options.Consume = func(ctx context.Context, document *weir.Document) error {
 		fmt.Printf("document: media=%s bytes=%d\n", document.MediaType, len(document.Data))
 		// Process and discard each document. Retrying a page can repeat documents,
 		// so a persistent consumer should commit output and its checkpoint together.
@@ -44,7 +43,7 @@ func run() error {
 	}
 	for page := uint64(1); ; page++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		end, err := client.ScanPage(ctx, options)
+		end, err := client.Scan(ctx, options)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("page %d incomplete; previous checkpoint retained: %w", page, err)
@@ -56,7 +55,7 @@ func run() error {
 		if end.Exhausted {
 			return nil
 		}
-		// ScanPage exposes this token only after the request end and final gRPC OK.
+		// Scan exposes this token only after the request end and final gRPC OK.
 		// The next RPC may be handled by a different Weir instance.
 		request.ContinuationToken = end.NextContinuationToken
 	}

@@ -6,15 +6,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"time"
 
 	weir "github.com/batchstream/weir-go"
-	"github.com/batchstream/weir-protocol/api/protocol"
-	spb "github.com/batchstream/weir-protocol/api/weir/search/v1"
-	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"google.golang.org/protobuf/proto"
 )
 
 func main() {
@@ -30,13 +25,13 @@ func run() error {
 	index := flag.String("index", "weir_m2_example", "configured Search index")
 	flag.Parse()
 
-	open := &pb.NativeOpen{}
+	request := &weir.NativeRequest{}
 	var body []byte
 	switch *store {
 	case "mongo":
-		open.Resource = protocol.EncodeSegment(*database) + "/records"
-		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		open.BodyMediaType = "application/bson"
+		request.Resource = weir.EncodeSegment(*database) + "/records"
+		request.Descriptor = &weir.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
+		request.BodyMediaType = "application/bson"
 		command := bson.D{{Key: "count", Value: "records"}}
 		var err error
 		body, err = bson.Marshal(command)
@@ -44,13 +39,13 @@ func run() error {
 			return err
 		}
 	case "search":
-		open.Resource = protocol.EncodeSegment(*index)
-		descriptor := &spb.Request{Method: "GET", Path: "/_doc/example"}
-		raw, err := proto.Marshal(descriptor)
+		request.Resource = weir.EncodeSegment(*index)
+		descriptor := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
+		encoded, err := weir.SearchHTTPDescriptor(descriptor)
 		if err != nil {
 			return err
 		}
-		open.Descriptor_ = &pb.Document{MediaType: "application/vnd.weir.search-http.v1+protobuf", Data: raw}
+		request.Descriptor = encoded
 	default:
 		return fmt.Errorf("unsupported store")
 	}
@@ -63,35 +58,22 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	native := &pb.NativeCall{Open: open, Body: body}
-	variant := &pb.Call_Native{Native: native}
-	call := &pb.Call{Version: 1, Operation: variant}
-	produced := false
+	request.Body = body
 	total := 0
-	var terminal *pb.NativeEnd
-	opts := weir.Options{StoreName: *store}
-	opts.Produce = func(context.Context) (*pb.Call, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return call, nil
-	}
-	opts.Consume = func(_ context.Context, _ uint64, event *pb.Event) error {
+	opts := weir.NativeOptions{StoreName: *store, Request: request}
+	opts.Consume = func(_ context.Context, event *weir.Event) error {
 		if head := event.GetHead(); head != nil {
 			fmt.Printf("metadata=%v media=%s\n", head.Metadata, head.BodyMediaType)
 		}
 		total += len(event.GetChunk())
-		if end := event.GetNativeEnd(); end != nil {
-			terminal = end
-		}
 		// Consume native bytes here without collecting the entire response.
 		return nil
 	}
-	if err := client.Execute(ctx, opts); err != nil {
+	terminal, err := client.Native(ctx, opts)
+	if err != nil {
 		return fmt.Errorf("native response incomplete; effects indeterminate: %w", err)
 	}
-	if terminal == nil || terminal.Completion != pb.NativeCompletion_RESPONSE_COMPLETE {
+	if terminal == nil || terminal.Completion != weir.NativeResponseComplete {
 		return fmt.Errorf("native exchange: %v; effects indeterminate", terminal)
 	}
 	fmt.Printf("complete native response: %d bytes\n", total)

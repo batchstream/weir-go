@@ -124,9 +124,9 @@ func discoveryRead(t *testing.T, client *Client, store string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	options := RecordOptions{StoreName: store, Call: clientTestRead()}
-	result, err := client.Record(ctx, options)
-	if err != nil || result == nil || result.GetRead() == nil {
+	options := ReadOptions{StoreName: store, Request: clientTestReadRequest()}
+	result, err := client.Read(ctx, options)
+	if err != nil || result == nil || result.GetDocument() == nil {
 		t.Fatalf("direct Store read: result=%v error=%v", result, err)
 	}
 }
@@ -174,8 +174,8 @@ func TestOpenResolvesMultipleStoresAndBalancesDirectStreams(t *testing.T) {
 	if first.resolves.Load() != 0 || second.resolves.Load() != 0 {
 		t.Fatal("business replicas received initialization traffic")
 	}
-	unknown := RecordOptions{StoreName: "uninitialized", Call: clientTestRead()}
-	if _, err := client.Record(t.Context(), unknown); err == nil {
+	unknown := ReadOptions{StoreName: "uninitialized", Request: clientTestReadRequest()}
+	if _, err := client.Read(t.Context(), unknown); err == nil {
 		t.Fatal("uninitialized Store accepted")
 	}
 }
@@ -245,8 +245,8 @@ func TestClientRefreshChangesEndpointsWithoutReplayingActiveStream(t *testing.T)
 	defer cancel()
 	finished := make(chan error, 1)
 	go func() {
-		options := RecordOptions{StoreName: "records", Call: clientTestRead()}
-		_, err := client.Record(ctx, options)
+		options := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
+		_, err := client.Read(ctx, options)
 		finished <- err
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -307,8 +307,8 @@ func TestClientLeaseExpiresAndConflictInvalidates(t *testing.T) {
 			}
 			time.Sleep(wait)
 			before := target.executions.Load()
-			optionsRecord := RecordOptions{StoreName: "records", Call: clientTestRead()}
-			if _, err := client.Record(t.Context(), optionsRecord); err == nil {
+			optionsRecord := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
+			if _, err := client.Read(t.Context(), optionsRecord); err == nil {
 				t.Fatal("expired or conflicting mapping accepted business request")
 			}
 			if target.executions.Load() != before {
@@ -416,8 +416,8 @@ func TestOpenCancellationAndCloseJoinDiscovery(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	record := RecordOptions{StoreName: "records", Call: clientTestRead()}
-	if _, err := client.Record(t.Context(), record); !errors.Is(err, ErrClosed) {
+	record := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
+	if _, err := client.Read(t.Context(), record); !errors.Is(err, ErrClosed) {
 		t.Fatal("closed client admitted request", err)
 	}
 	queries = dns.Queries.Load()
@@ -436,16 +436,13 @@ func TestDiscoveredWriteLossIsNeverReplayed(t *testing.T) {
 	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
 	options := OpenOptions{Seed: seedListener.address, Stores: []string{"records"}}
 	client := openDiscovery(t, options)
-	document := &pb.Document{MediaType: "application/octet-stream", Data: []byte("one write")}
-	action := &pb.MutateRequest_Put{Put: document}
-	mutation := &pb.MutateRequest{Resource: "records/s:key", Action: action}
-	variant := &pb.Call_Mutate{Mutate: mutation}
-	call := &pb.Call{Version: 1, Operation: variant}
-	record := RecordOptions{StoreName: "records", Call: call}
+	document := &Document{MediaType: "application/octet-stream", Data: []byte("one write")}
+	request := &WriteRequest{Resource: "records/s:key", Document: document}
+	record := WriteOptions{StoreName: "records", Request: request}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	result, err := client.Record(ctx, record)
-	if err == nil || result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || target.executions.Load() != 1 || seed.executions.Load() != 0 {
+	result, err := client.Put(ctx, record)
+	if err == nil || result.GetOutcome() != pb.MutationOutcome_APPLIED || target.executions.Load() != 1 || seed.executions.Load() != 0 {
 		t.Fatalf("write evidence/replay: result=%v error=%v direct=%d seed=%d", result, err, target.executions.Load(), seed.executions.Load())
 	}
 }

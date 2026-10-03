@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -31,11 +32,18 @@ def check_dependencies(items):
 
 
 def check_modules(items):
+    protocol_found = False
     for module in items:
         if module.get('Replace'):
             raise ValueError('SDK dependency graph contains a module replacement: ' + module['Path'])
         if module['Path'] == SERVER:
             raise ValueError('SDK module graph contains the server module')
+        if module['Path'] == PROTOCOL:
+            protocol_found = True
+            if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', module.get('Version', '')):
+                raise ValueError('SDK requires a canonical stable protocol version')
+    if not protocol_found:
+        raise ValueError('SDK requires the published protocol module')
 
 
 def check_module_graph(raw):
@@ -51,6 +59,10 @@ def check_module_graph(raw):
             raise ValueError('SDK module graph contains the server module: ' + line)
         if source == target and source in (SDK, PROTOCOL):
             raise ValueError('project module depends on itself: ' + line)
+        for node in pair:
+            path, _, version = node.partition('@')
+            if path == PROTOCOL and not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+                raise ValueError('SDK requires a canonical stable protocol version: ' + node)
         edges.setdefault(source, set()).add(target)
     pending = [PROTOCOL]
     visited = set()

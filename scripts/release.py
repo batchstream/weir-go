@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK for ResolveStore initialization and direct finite Execute requests, with bounded streaming, completion evidence, and no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization and direct finite Execute requests, with bounded streaming, completion evidence, and no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -50,7 +50,60 @@ def main():
         root = Path(directory)
         env = dict(os.environ, GOWORK='off', GOPROXY='https://proxy.golang.org,direct', GOMODCACHE=str(root / 'cache'), GOBIN=str(root / 'bin'))
         run(['go', 'mod', 'init', 'example.com/weir-release-check'], cwd=root, env=env)
-        source = 'package main\nimport ("fmt"; weir "github.com/batchstream/weir-go"; "github.com/batchstream/weir-protocol/api/protocol")\nfunc main() { connection, err := weir.Dial("127.0.0.1:7447"); if err != nil { panic(err) }; defer connection.Close(); fmt.Println(protocol.EncodeSegment("s:check/path")) }\n'
+        source = """package main
+import (
+    "context"
+    "fmt"
+    "io"
+    weir "github.com/batchstream/weir-go"
+)
+// Compile the ordinary API using only SDK-owned request/result/event names.
+func typedAPI(ctx context.Context, client *weir.Client) {
+    read := &weir.ReadRequest{Resource: "records/s:key"}
+    readOptions := weir.ReadOptions{StoreName: "records", Request: read}
+    _, _ = client.Read(ctx, readOptions)
+    document := &weir.Document{MediaType: "application/json", Data: []byte(`{}`)}
+    write := &weir.WriteRequest{Resource: read.Resource, Document: document}
+    writeOptions := weir.WriteOptions{StoreName: "records", Request: write}
+    _, _ = client.Create(ctx, writeOptions)
+    _, _ = client.Put(ctx, writeOptions)
+    _, _ = client.Replace(ctx, writeOptions)
+    remove := &weir.DeleteRequest{Resource: read.Resource}
+    deleteOptions := weir.DeleteOptions{StoreName: "records", Request: remove}
+    _, _ = client.Delete(ctx, deleteOptions)
+    program := &weir.ProgramTransform{Runtime: "lua", Source: []byte("return doc")}
+    transform := &weir.AtomicTransformRequest{Resource: read.Resource, Program: program}
+    transformOptions := weir.AtomicTransformOptions{StoreName: "records", Request: transform}
+    _, _ = client.AtomicTransform(ctx, transformOptions)
+    scan := &weir.ScanRequest{Resource: "records", PageSize: 1}
+    scanOptions := weir.ScanOptions{StoreName: "records", Request: scan}
+    scanOptions.Consume = func(context.Context, *weir.Document) error { return nil }
+    _, _ = client.Scan(ctx, scanOptions)
+    http := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/key"}
+    descriptor, _ := weir.SearchHTTPDescriptor(http)
+    native := &weir.NativeRequest{Resource: "records", Descriptor: descriptor}
+    nativeOptions := weir.NativeOptions{StoreName: "records", Request: native}
+    nativeOptions.Consume = func(context.Context, *weir.Event) error { return nil }
+    _, _ = client.Native(ctx, nativeOptions)
+    commands := []*weir.Command{weir.NewReadCommand(read), weir.NewCreateCommand(write), weir.NewPutCommand(write), weir.NewReplaceCommand(write), weir.NewDeleteCommand(remove), weir.NewAtomicTransformCommand(transform), weir.NewScanCommand(scan), weir.NewNativeCommand(native)}
+    produced := 0
+    batch := weir.ExecuteOptions{StoreName: "records"}
+    batch.Produce = func(context.Context) (*weir.Command, error) {
+        if produced == len(commands) { return nil, io.EOF }
+        command := commands[produced]
+        produced++
+        return command, nil
+    }
+    batch.Consume = func(context.Context, uint64, *weir.Event) error { return nil }
+    _ = client.Execute(ctx, batch)
+}
+func main() {
+    connection, err := weir.Dial("127.0.0.1:7447")
+    if err != nil { panic(err) }
+    defer connection.Close()
+    fmt.Println(weir.EncodeSegment("s:check/path"))
+}
+"""
         (root / 'main.go').write_text(source)
         for attempt in range(6):
             result = subprocess.run(['go', 'get', 'github.com/batchstream/weir-go@' + version], cwd=root, env=env, timeout=180)

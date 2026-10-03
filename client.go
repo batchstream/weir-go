@@ -19,14 +19,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type Options struct {
+type ExecuteOptions struct {
 	StoreName string
-	// Produce returns io.EOF after the finite batch. Only one Produce call runs at
-	// a time and at most eight calls are retained, regardless of total batch size.
-	Produce func(context.Context) (*pb.Call, error)
+	// Produce returns io.EOF after the finite batch. Only one Produce wireCommand runs at
+	// a time and at most eight commands are retained, regardless of total batch size.
+	Produce func(context.Context) (*Command, error)
 	// Consume receives one complete bounded business Event, not a transport chunk.
 	// A scan produces a bounded page; native exchanges produce sequential Events.
-	Consume func(context.Context, uint64, *pb.Event) error
+	Consume func(context.Context, uint64, *Event) error
 	// Complete runs after one request has a validated terminal business Event and
 	// empty end frame. Other requests and the RPC can still fail later.
 	Complete func(context.Context, uint64) error
@@ -90,7 +90,7 @@ func (l *ledger) register(ctx context.Context, id uint64, entry *pending) error 
 
 // Execute opens exactly one Execute RPC, half-closes after Produce finishes and drains
 // all responses. It does not retry. Reuse the supplied gRPC connection across calls.
-func Execute(ctx context.Context, client pb.StoreServiceClient, opts Options) error {
+func Execute(ctx context.Context, client pb.StoreServiceClient, opts ExecuteOptions) error {
 	if client == nil || opts.Produce == nil || opts.Consume == nil {
 		return errors.New("Execute requires client, producer and consumer")
 	}
@@ -203,7 +203,7 @@ func Execute(ctx context.Context, client pb.StoreServiceClient, opts Options) er
 			if err := validateEvent(entry, frame.RequestId, event); err != nil {
 				return err
 			}
-			if err := opts.Consume(ctx, frame.RequestId, event); err != nil {
+			if err := opts.Consume(ctx, frame.RequestId, businessEvent(event)); err != nil {
 				return err
 			}
 			consumed := n + int(length)
@@ -216,13 +216,13 @@ func Execute(ctx context.Context, client pb.StoreServiceClient, opts Options) er
 	}
 }
 
-func produce(ctx context.Context, stream grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse], opts Options, l *ledger) error {
+func produce(ctx context.Context, stream grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse], opts ExecuteOptions, l *ledger) error {
 	var id uint64
 	for {
 		if err := l.reserve(ctx); err != nil {
 			return err
 		}
-		call, err := opts.Produce(ctx)
+		command, err := opts.Produce(ctx)
 		if errors.Is(err, io.EOF) {
 			l.Lock()
 			l.reserved--
@@ -238,22 +238,29 @@ func produce(ctx context.Context, stream grpc.BidiStreamingClient[pb.ExecuteRequ
 			return errors.New("Execute ID space exhausted")
 		}
 		id++
-		if call == nil || call.Version != 1 || call.Operation == nil || proto.Size(call) > protocol.MaxPayload {
-			return errors.New("invalid Call")
+		if command == nil {
+			return errors.New("invalid Command")
 		}
-		data, err := proto.Marshal(call)
+		if command.err != nil {
+			return command.err
+		}
+		wireCommand := command.wire
+		if wireCommand == nil || wireCommand.Version != 1 || wireCommand.Operation == nil || proto.Size(wireCommand) > protocol.MaxPayload {
+			return errors.New("invalid Command")
+		}
+		data, err := proto.Marshal(wireCommand)
 		if err != nil {
 			return err
 		}
-		if _, err := protocol.DecodeCall(data); err != nil {
+		if _, err := protocol.DecodeCommand(data); err != nil {
 			return err
 		}
-		request := &pb.ExecuteRequest{RequestId: id, StoreName: opts.StoreName, CallPayload: data}
+		request := &pb.ExecuteRequest{RequestId: id, StoreName: opts.StoreName, CommandPayload: data}
 		if err := protocol.ValidateExecuteRequest(request, opts.StoreName, id-1); err != nil {
 			return err
 		}
-		entry := &pending{bytes: len(data), kind: callKind(call)}
-		if request := call.GetScan(); request != nil {
+		entry := &pending{bytes: len(data), kind: commandKind(wireCommand)}
+		if request := wireCommand.GetScan(); request != nil {
 			if request.PageSize > protocol.MaxScanPageSize || len(request.ContinuationToken) > protocol.MaxScanToken {
 				return errors.New("Scan page size or continuation exceeds bound")
 			}
@@ -268,15 +275,15 @@ func produce(ctx context.Context, stream grpc.BidiStreamingClient[pb.ExecuteRequ
 	}
 }
 
-func callKind(call *pb.Call) string {
-	switch call.Operation.(type) {
-	case *pb.Call_Read:
+func commandKind(wireCommand *pb.Command) string {
+	switch wireCommand.Operation.(type) {
+	case *pb.Command_Read:
 		return "read"
-	case *pb.Call_Mutate:
+	case *pb.Command_Mutate:
 		return "mutate"
-	case *pb.Call_Scan:
+	case *pb.Command_Scan:
 		return "scan"
-	case *pb.Call_Native:
+	case *pb.Command_Native:
 		return "native"
 	}
 	return ""
@@ -333,80 +340,4 @@ func validateEvent(p *pending, id uint64, e *pb.Event) error {
 		return errors.New("missing Event value")
 	}
 	return nil
-}
-
-// Record executes one read or mutation. It collects its single bounded result.
-// Use Execute for batches, scans and native streaming results. It never retries.
-// A transport error can accompany a validated business result. Check the error
-// for RPC completion and retain the result as backend evidence; APPLIED is not
-// invalidated by a missing end frame or a later non-OK RPC status.
-type RecordOptions struct {
-	StoreName string
-	Call      *pb.Call
-}
-
-func Record(ctx context.Context, client pb.StoreServiceClient, opts RecordOptions) (*pb.Result, error) {
-	if opts.Call == nil || opts.Call.GetRead() == nil && opts.Call.GetMutate() == nil {
-		return nil, errors.New("Record requires a read or mutation Call")
-	}
-	produced := false
-	var result *pb.Result
-	batch := Options{StoreName: opts.StoreName}
-	batch.Produce = func(context.Context) (*pb.Call, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return opts.Call, nil
-	}
-	batch.Consume = func(_ context.Context, _ uint64, e *pb.Event) error { result = e.GetResult(); return nil }
-	if err := Execute(ctx, client, batch); err != nil {
-		return result, err
-	}
-	if result == nil {
-		return nil, errors.New("missing record result")
-	}
-	return result, nil
-}
-
-// ScanPage executes one finite page and consumes each document incrementally.
-// Only a successful Execute end and final gRPC OK expose its next checkpoint.
-// Retrying an interrupted page uses the previous checkpoint and may redeliver
-// documents; the caller owns deduplication and committing consumed output.
-type ScanPageOptions struct {
-	StoreName string
-	Request   *pb.ScanRequest
-	Consume   func(context.Context, *pb.Document) error
-}
-
-func ScanPage(ctx context.Context, client pb.StoreServiceClient, opts ScanPageOptions) (*pb.ScanEnd, error) {
-	if opts.Request == nil || opts.Consume == nil {
-		return nil, errors.New("ScanPage requires a request and document consumer")
-	}
-	variant := &pb.Call_Scan{Scan: opts.Request}
-	call := &pb.Call{Version: 1, Operation: variant}
-	produced := false
-	var end *pb.ScanEnd
-	batch := Options{StoreName: opts.StoreName}
-	batch.Produce = func(context.Context) (*pb.Call, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return call, nil
-	}
-	batch.Consume = func(ctx context.Context, _ uint64, event *pb.Event) error {
-		if document := event.GetDocument(); document != nil {
-			return opts.Consume(ctx, document)
-		}
-		end = event.GetScanEnd()
-		return nil
-	}
-	if err := Execute(ctx, client, batch); err != nil {
-		return nil, err
-	}
-	if end == nil {
-		return nil, errors.New("missing Scan completion")
-	}
-	return end, nil
 }

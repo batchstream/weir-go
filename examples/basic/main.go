@@ -9,8 +9,6 @@ import (
 	"time"
 
 	weir "github.com/batchstream/weir-go"
-	"github.com/batchstream/weir-protocol/api/protocol"
-	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
@@ -37,50 +35,45 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	target := protocol.EncodeSegment(*database) + "/records/s:example"
+	target := weir.EncodeSegment(*database) + "/records/s:example"
 	record := bson.D{{Key: "_id", Value: "example"}, {Key: "n", Value: int32(1)}}
 	data, err := bson.Marshal(record)
 	if err != nil {
 		return err
 	}
-	document := &pb.Document{MediaType: "application/bson", Data: data}
+	document := &weir.Document{MediaType: "application/bson", Data: data}
 	if *storeName == "search" {
-		target = protocol.EncodeSegment(*index) + "/s:example"
-		document = &pb.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+		target = weir.EncodeSegment(*index) + "/s:example"
+		document = &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
 	}
-	action := &pb.MutateRequest_Put{Put: document}
-	mutation := &pb.MutateRequest{Resource: target, Action: action}
-	variant := &pb.Call_Mutate{Mutate: mutation}
-	call := &pb.Call{Version: 1, Operation: variant}
-	opts := weir.RecordOptions{StoreName: *storeName, Call: call}
-	result, err := client.Record(ctx, opts)
+	request := &weir.WriteRequest{Resource: target, Document: document}
+	opts := weir.WriteOptions{StoreName: *storeName, Request: request}
+	result, err := client.Put(ctx, opts)
 	if err != nil {
 		if result != nil {
 			return fmt.Errorf("write RPC incomplete; backend evidence=%v: %w", result, err)
 		}
 		return fmt.Errorf("write result unavailable; effects indeterminate: %w", err)
 	}
-	if result.GetMutation().GetOutcome() != pb.MutationOutcome_APPLIED || result.GetMutation().GetFailure() != nil {
+	if result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
 		return fmt.Errorf("write: %v", result)
 	}
 	produced := 0
-	batch := weir.Options{StoreName: *storeName}
-	batch.Produce = func(context.Context) (*pb.Call, error) {
+	batch := weir.ExecuteOptions{StoreName: *storeName}
+	batch.Produce = func(context.Context) (*weir.Command, error) {
 		if produced == *count {
 			return nil, io.EOF
 		}
 		produced++
-		read := &pb.ReadRequest{Resource: target}
-		variant := &pb.Call_Read{Read: read}
-		call := &pb.Call{Version: 1, Operation: variant}
-		return call, nil
+		read := &weir.ReadRequest{Resource: target}
+		return weir.NewReadCommand(read), nil
 	}
-	batch.Consume = func(_ context.Context, id uint64, event *pb.Event) error {
+	batch.Consume = func(_ context.Context, id uint64, event *weir.Event) error {
 		read := event.GetResult().GetRead()
 		if read.GetFailure() != nil {
 			return fmt.Errorf("read %d: %v", id, read.GetFailure())
 		}
-		fmt.Printf("id=%d record=%d bytes missing=%t\n", id, len(read.GetDocument().GetData()), read.GetMissing() != nil)
+		fmt.Printf("id=%d record=%d bytes missing=%t\n", id, len(read.GetDocument().GetData()), read.GetMissing())
 		// Consume and discard here: retaining Events would require the full batch memory.
 		return nil
 	}
