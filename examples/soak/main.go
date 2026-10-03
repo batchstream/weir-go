@@ -458,8 +458,8 @@ func (w worker) mutate(ctx context.Context, command *weir.Command) error {
 func (w worker) read(ctx context.Context, request *weir.ReadRequest) (*weir.ReadResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	options := weir.ReadOptions{StoreName: w.store, Request: request}
-	read, err := weir.Read(ctx, w.client, options)
+	options := weir.ReadOneOptions{StoreName: w.store, Request: request}
+	read, err := weir.ReadOne(ctx, w.client, options)
 	if err != nil {
 		return read, err
 	}

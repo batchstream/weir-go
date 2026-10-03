@@ -20,8 +20,8 @@ func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
-			options := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
-			result, err := Read(t.Context(), client, options)
+			options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
+			result, err := ReadOne(t.Context(), client, options)
 			if err != nil || result == nil || result.Document != nil {
 				t.Fatal("Read lost backend result", result, err)
 			}

@@ -25,12 +25,17 @@ type clientTestPeer struct {
 	pb.UnimplementedStoreServiceServer
 	mode      string
 	completed atomic.Int64
+	streams   atomic.Int64
 	received  atomic.Int64
 	commands  chan *pb.Command
 	canceled  chan struct{}
 }
 
 func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+	p.streams.Add(1)
+	if strings.HasPrefix(p.mode, "batch_") {
+		return p.batchExecute(stream)
+	}
 	if strings.HasPrefix(p.mode, "scan_") {
 		return p.scanExecute(stream)
 	}
@@ -196,8 +201,8 @@ func TestReadRejectsIncompleteAndInvalidResponses(t *testing.T) {
 			client := clientTestConnection(t, peer)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			opts := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
-			result, err := Read(ctx, client, opts)
+			opts := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
+			result, err := ReadOne(ctx, client, opts)
 			if err == nil {
 				t.Fatal("invalid or incomplete RPC reported success", mode)
 			}

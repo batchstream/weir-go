@@ -8,9 +8,9 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
-// Read executes one read without replay. A validated result remains evidence if
+// ReadOne executes one read without replay. A validated result remains evidence if
 // a later frame or final RPC status is lost, and is returned with that error.
-func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) (*ReadResult, error) {
+func ReadOne(ctx context.Context, client pb.StoreServiceClient, options ReadOneOptions) (*ReadResult, error) {
 	result, err := executeResult(ctx, client, options.StoreName, NewReadCommand(options.Request))
 	if result == nil {
 		return nil, err

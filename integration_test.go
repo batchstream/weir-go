@@ -80,8 +80,8 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	result, err = client.AtomicTransform(ctx, transform)
 	applied(t, result, err)
 	read := &weir.ReadRequest{Resource: builder.resource}
-	readOptions := weir.ReadOptions{StoreName: store, Request: read}
-	readResult, err := client.Read(ctx, readOptions)
+	readOptions := weir.ReadOneOptions{StoreName: store, Request: read}
+	readResult, err := client.ReadOne(ctx, readOptions)
 	if err != nil || readResult.GetDocument() == nil || number(t, backend, readResult.GetDocument().GetData()) != 4 {
 		t.Fatalf("persisted read: %v %v", readResult, err)
 	}
@@ -189,7 +189,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	result, err = client.Delete(ctx, deleteOptions)
 	applied(t, result, err)
 	deleted = true
-	readResult, err = client.Read(ctx, readOptions)
+	readResult, err = client.ReadOne(ctx, readOptions)
 	if err != nil || !readResult.GetMissing() {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}

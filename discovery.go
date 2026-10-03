@@ -532,12 +532,12 @@ func (c *Client) Execute(ctx context.Context, options ExecuteOptions) error {
 	return Execute(ctx, client, options)
 }
 
-func (c *Client) Read(ctx context.Context, options ReadOptions) (*ReadResult, error) {
+func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err
 	}
-	return Read(ctx, client, options)
+	return ReadOne(ctx, client, options)
 }
 
 func (c *Client) Create(ctx context.Context, options WriteOptions) (*MutationResult, error) {

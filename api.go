@@ -76,9 +76,49 @@ type NativeRequest struct {
 	Body          []byte
 }
 
-type ReadOptions struct {
+// ReadOneOptions describes a single read. Use ReadOptions to share one RPC across
+// multiple independent requests in the same Store.
+type ReadOneOptions struct {
 	StoreName string
 	Request   *ReadRequest
+}
+
+// ReadOptions describes a finite read batch addressed to one Store. Resources
+// are canonical paths relative to StoreName. Results have the input order. Do
+// not mutate requests or their document bytes until the call returns.
+type ReadOptions struct {
+	StoreName string
+	Requests  []*ReadRequest
+}
+
+// MutationAction selects one business operation without a protobuf oneof.
+type MutationAction uint8
+
+const (
+	MutationCreate MutationAction = iota + 1
+	MutationPut
+	MutationReplace
+	MutationDelete
+	MutationAtomicTransform
+)
+
+// MutateRequest describes one mutation. Create, Put and Replace require Document;
+// Delete accepts no payload; AtomicTransform requires Program or BackendExpression.
+type MutateRequest struct {
+	Resource          string
+	Action            MutationAction
+	Document          *Document
+	Program           *ProgramTransform
+	BackendExpression *Document
+	AdapterOptions    *Document
+}
+
+// MutateOptions describes independent mutations addressed to one Store. It is
+// not a transaction; use separate calls for operations that depend on each other.
+// Do not mutate requests or their document bytes until the call returns.
+type MutateOptions struct {
+	StoreName string
+	Requests  []*MutateRequest
 }
 
 type WriteOptions struct {
@@ -233,8 +273,10 @@ func businessEvent(wire *pb.Event) *Event {
 // Execute validates each command before sending it. Do not mutate its request
 // or document bytes while execution runs.
 type Command struct {
-	wire *pb.Command
-	err  error
+	wire    *pb.Command
+	err     error
+	payload []byte
+	kind    string
 }
 
 func NewReadCommand(request *ReadRequest) *Command {
