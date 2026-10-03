@@ -62,12 +62,26 @@ func (p *discoveryPeer) ResolveStore(ctx context.Context, request *pb.ResolveSto
 	return response, nil
 }
 
-func (p *discoveryPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+func (p *discoveryPeer) Read(ctx context.Context, request *pb.ReadBatchRequest) (*pb.ReadBatchResponse, error) {
+	p.executions.Add(1)
+	if p.business == nil {
+		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
+	}
+	return p.business.Read(ctx, request)
+}
+func (p *discoveryPeer) Mutate(ctx context.Context, request *pb.MutateBatchRequest) (*pb.MutateBatchResponse, error) {
+	p.executions.Add(1)
+	if p.business == nil {
+		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
+	}
+	return p.business.Mutate(ctx, request)
+}
+func (p *discoveryPeer) Execute(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
 	p.executions.Add(1)
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(stream)
+	return p.business.Execute(request, stream)
 }
 
 func (p *discoveryPeer) set(store string, response *pb.ResolveStoreResponse) {
@@ -442,7 +456,7 @@ func TestDiscoveredWriteLossIsNeverReplayed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	result, err := client.Put(ctx, record)
-	if err == nil || result.GetOutcome() != pb.MutationOutcome_APPLIED || target.executions.Load() != 1 || seed.executions.Load() != 0 {
+	if err == nil || result != nil || target.executions.Load() != 1 || seed.executions.Load() != 0 {
 		t.Fatalf("write evidence/replay: result=%v error=%v direct=%d seed=%d", result, err, target.executions.Load(), seed.executions.Load())
 	}
 }

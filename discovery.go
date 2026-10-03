@@ -524,14 +524,6 @@ func (c *Client) storeClient(store string) (pb.StoreServiceClient, error) {
 	return pb.NewStoreServiceClient(entry.channel.connection), nil
 }
 
-func (c *Client) Execute(ctx context.Context, options ExecuteOptions) error {
-	client, err := c.storeClient(options.StoreName)
-	if err != nil {
-		return err
-	}
-	return Execute(ctx, client, options)
-}
-
 func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {

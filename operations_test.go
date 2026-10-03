@@ -1,18 +1,14 @@
 package weir
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"testing"
 	"time"
 
-	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protodelim"
 )
 
 func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
@@ -48,7 +44,7 @@ func TestScanPreservesBackendFailureWithoutCheckpoint(t *testing.T) {
 }
 
 func TestTypedMutationsSelectBackendOperation(t *testing.T) {
-	peer := &clientTestPeer{mode: "typed_mutation", commands: make(chan *pb.Command, 5)}
+	peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 5)}
 	client := clientTestConnection(t, peer)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
@@ -71,7 +67,7 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 			options := DeleteOptions{StoreName: "records", Request: request}
 			result, err = Delete(ctx, client, options)
 		case "transform":
-			program := &ProgramTransform{Runtime: "lua", Source: []byte("return doc")}
+			program := &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
 			request := &AtomicTransformRequest{Resource: "records/s:key", Program: program, AdapterOptions: adapter}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
 			result, err = AtomicTransform(ctx, client, options)
@@ -79,8 +75,7 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 		if err != nil || result.GetOutcome() != MutationApplied {
 			t.Fatal(action, result, err)
 		}
-		wire := <-peer.commands
-		mutation := wire.GetMutate()
+		mutation := <-peer.mutations
 		if mutation.Resource != request.Resource || string(mutation.AdapterOptions.Data) != string(adapter.Data) {
 			t.Fatal("typed operation lost resource or adapter options", action, mutation)
 		}
@@ -113,7 +108,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 			client := clientTestConnection(t, peer)
 			request := &AtomicTransformRequest{Resource: "records/s:key"}
 			if both {
-				request.Program = &ProgramTransform{Runtime: "lua", Source: []byte("return doc")}
+				request.Program = &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
 				request.BackendExpression = &Document{MediaType: "application/json", Data: []byte(`{}`)}
 			}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
@@ -121,19 +116,6 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 			defer cancel()
 			if result, err := AtomicTransform(ctx, client, options); err == nil || result != nil {
 				t.Fatal("invalid transform was not rejected", result, err)
-			}
-			produced := false
-			batch := ExecuteOptions{StoreName: "records"}
-			batch.Produce = func(context.Context) (*Command, error) {
-				if produced {
-					return nil, io.EOF
-				}
-				produced = true
-				return NewAtomicTransformCommand(request), nil
-			}
-			batch.Consume = func(context.Context, uint64, *Event) error { return errors.New("invalid transform produced evidence") }
-			if err := Execute(ctx, client, batch); err == nil {
-				t.Fatal("batch sent an ambiguous transform")
 			}
 			if peer.received.Load() != 0 {
 				t.Fatal("invalid transform sent business data", peer.received.Load())
@@ -143,14 +125,6 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 }
 
 func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
-	request, err := stream.Recv()
-	if err != nil {
-		return err
-	}
-	p.received.Add(1)
-	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
-		return errors.New("expected finite Native input")
-	}
 	head := &pb.NativeHead{BodyMediaType: "application/octet-stream"}
 	headValue := &pb.Event_Head{Head: head}
 	headEvent := &pb.Event{Version: 1, Value: headValue}
@@ -166,29 +140,10 @@ func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) err
 		events = []*pb.Event{headEvent, emptyEvent, endEvent}
 	}
 	for _, event := range events {
-		var raw []byte
-		var err error
-		if p.mode == "native_empty_chunk" && event == emptyEvent {
-			var encoded bytes.Buffer
-			_, err = protodelim.MarshalTo(&encoded, event)
-			raw = encoded.Bytes()
-		} else {
-			raw, err = protocol.MarshalEvent(event)
-		}
-		if err != nil {
-			return err
-		}
-		frame := &pb.ExecuteResponse{RequestId: request.RequestId, EventFragment: raw}
+		frame := &pb.ExecuteResponse{Event: event}
 		if err := stream.Send(frame); err != nil {
 			return err
 		}
-	}
-	if p.mode == "native_missing_transport_end" {
-		return nil
-	}
-	frame := &pb.ExecuteResponse{RequestId: request.RequestId, RequestComplete: true}
-	if err := stream.Send(frame); err != nil {
-		return err
 	}
 	if p.mode == "native_final_status_error" {
 		return status.Error(codes.Unavailable, "lost Native final status")
@@ -197,7 +152,7 @@ func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) err
 }
 
 func TestNativeIncrementalEventsPreserveTerminalEvidence(t *testing.T) {
-	for _, mode := range []string{"native_normal", "native_missing_transport_end", "native_final_status_error", "native_consumer_terminal_error"} {
+	for _, mode := range []string{"native_normal", "native_final_status_error", "native_consumer_terminal_error"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)

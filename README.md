@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments; URI affinity is not implemented.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.3.0
+go get github.com/batchstream/weir-go@v0.4.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.1.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.2.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -31,7 +31,7 @@ first := &weir.ReadRequest{Resource: "records/s:example"}
 second := &weir.ReadRequest{Resource: "records/s:another"}
 readOptions := weir.ReadOptions{StoreName: "search", Requests: []*weir.ReadRequest{first, second}}
 results, err := client.Read(ctx, readOptions)
-if err != nil { return fmt.Errorf("read RPC incomplete; preserve results %v: %w", results, err) }
+if err != nil { return fmt.Errorf("read RPC failed; unacknowledged results %v: %w", results, err) }
 for index, result := range results {
     if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
     fmt.Println(index, "missing:", result.Missing)
@@ -68,14 +68,14 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Native` | `NativeOptions` / `NativeRequest`, event consumer | `NativeEnd` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
-connection or opening their single Execute RPC. An empty batch, nil request,
+connection or opening their single typed unary RPC. An empty batch, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one outer `StoreName`; full `weir://STORE/` URIs are rejected. Both methods preserve
-input order even when responses arrive out of order or resources are repeated.
-Individual backend failures stay in their result positions. With a transport
-error, validated results remain evidence and nil positions are unacknowledged;
-mutations at those positions may have been applied. The SDK never retries them.
+one outer `StoreName`; full `weir://STORE/` URIs are rejected. Results preserve
+input order, including repeated resources. Individual backend failures stay in
+their result positions. A failed RPC returns a result slice of the submitted
+length with nil entries: the whole response is unacknowledged and any mutation
+may have applied. The SDK never automatically replays business requests.
 
 ```go
 firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
@@ -91,28 +91,27 @@ results, err := client.Mutate(ctx, options)
 `MutateRequest.Action` selects `MutationCreate`, `MutationPut`, `MutationReplace`,
 `MutationDelete` or `MutationAtomicTransform`. Writes require Document, Delete
 accepts no payload, and AtomicTransform requires exactly one Program or
-BackendExpression. A batch is not a transaction and its items are independent;
-use separate completed calls for dependent operations. Convenience batch methods
-accept 1–128 requests (`MaxBatchRequests`) and at most 32 MiB of encoded input
-(`MaxBatchInputBytes`). Preflight retains that bounded encoding and Execute reuses
-it. Pending transport input still has the independent eight-request / 16 MiB
-limit. A read batch retains its results, potentially 256 MiB of document bytes at
-the maximum size, so choose smaller batches when documents are large. Use Execute
-consumers for incremental processing of larger workloads.
+BackendExpression. A batch is not a transaction. Mutations to the same resource
+execute in input order, including after an item failure; different resources may
+run concurrently. Across RPCs, ordering follows the database semantics.
+
+There is no independent request-count or in-flight-item limit. Complete protobuf
+request and response envelopes are each bounded at 32 MiB
+(`MaxBatchRequestBytes`, `MaxBatchResponseBytes`). Documents are bounded at 2 MiB.
+Use smaller batches when documents are large. The SDK validates every result and
+requires exactly one result per input before exposing any unary batch evidence.
 
 `WriteRequest` contains Resource, Document and optional AdapterOptions. Create
 requires absence; Replace requires an existing resource; Put creates or replaces.
-AtomicTransform requires exactly one Program or BackendExpression. Its invalid
-combinations are rejected before any business frame is sent, including in a batch.
+AtomicTransform requires exactly one Program or BackendExpression.
 
-Read and mutation results may accompany a transport error. Preserve their
-validated backend evidence: `weir.MutationApplied` remains an acknowledgement if
-a later frame or final status is lost. A missing acknowledgement is indeterminate;
+On a successful RPC, `weir.MutationApplied` may also carry a subsequent
+acknowledgement failure. Inspect both Outcome and Failure. Other outcomes always
+carry a Failure. A failed unary RPC provides no confirmed individual results;
 reconcile through application knowledge and never automatically replay a write.
-Backend failures remain in the result separately from RPC completion errors.
 
 `Scan` executes one finite page and consumes documents incrementally. It returns
-a checkpoint only after the matching document count, request completion frame
+a checkpoint only after the matching document count, terminal ScanEnd
 and final gRPC OK. A failed page returns no ScanEnd; keep the previous token.
 Retrying that page may repeat documents, so the caller owns deduplication and
 committing output together with its checkpoint. A completed RPC can still carry
@@ -128,32 +127,20 @@ use `SearchHTTPRequest`, `SearchHTTPDescriptor` and `DecodeSearchHTTPResponse`
 without importing generated protobuf packages. Mongo command bodies use BSON and
 `MongoCommandMediaType` for the descriptor.
 
-## Finite batches
+## Streaming and deadlines
 
-`client.Execute(ctx, ExecuteOptions)` uses a fixed Store, with `Produce`, `Consume`
-and optional `Complete` callbacks. Produce returns an opaque SDK Command, then
-`io.EOF` when its finite input ends. Use `NewReadCommand`, `NewCreateCommand`,
-`NewPutCommand`, `NewReplaceCommand`, `NewDeleteCommand`,
-`NewAtomicTransformCommand`, `NewScanCommand` or `NewNativeCommand`; callers never
-construct a wire version or protobuf oneof. Consume receives validated flat SDK
-Events incrementally. Complete runs after one request's terminal business event
-and empty completion frame. Every request must complete and the RPC must finish with gRPC OK
-for the whole Execute to succeed. Backend failures remain business results.
-
-Requests can be in flight concurrently and complete out of input order. Wait
-for Complete, or finish one typed method, before dependent operations. This is
-a framing barrier; check Outcome/Failure before depending on business success. Callbacks
-must honor their context and return promptly. Do not retain unbounded events or
-mutate requests/documents while execution runs. The SDK keeps at most eight
-requests and 16 MiB of encoded pending input in flight. Documents are bounded at
-2 MiB, Commands at 9 MiB, event fragments at 64 KiB, scan pages at 256 documents,
-and selectors/transform expressions at 16 KiB. Servers may use smaller budgets.
+Scan and Native each issue one server-streaming RPC with one typed request and
+incrementally consume typed Events. Native chunks are bounded at 64 KiB, Scan
+pages at 256 documents and selectors/transform expressions at 16 KiB. There are
+no per-record Commands, request IDs, fragments, producer callbacks or completion
+frames in the SDK API. Consumers must honor their context and return promptly.
+Do not retain unbounded events or mutate requests/documents while a call runs.
 
 Use caller deadlines. Business operations have no implicit retry or failover.
-`Dial` and package-level operation functions provide an advanced fixed-owner
-gRPC seam; the caller owns target validation and connection lifetime. That seam
-can accept a generated StoreService client for raw protocol fixtures. Ordinary
-applications use Open and the typed Client methods shown above.
+`Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
+operation functions accept a generated StoreService client for fixed-owner
+connections and protocol fixtures; ordinary applications use Open and typed Client
+methods. The caller owns target validation and connection lifetime for Dial.
 
 ## Examples and validation
 

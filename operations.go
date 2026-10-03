@@ -3,74 +3,63 @@ package weir
 import (
 	"context"
 	"errors"
-	"io"
 
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
-// ReadOne executes one read without replay. A validated result remains evidence if
-// a later frame or final RPC status is lost, and is returned with that error.
+// ReadOne sends a one-item Read batch without replay.
 func ReadOne(ctx context.Context, client pb.StoreServiceClient, options ReadOneOptions) (*ReadResult, error) {
-	result, err := executeResult(ctx, client, options.StoreName, NewReadCommand(options.Request))
-	if result == nil {
+	batch := ReadOptions{StoreName: options.StoreName, Requests: []*ReadRequest{options.Request}}
+	results, err := Read(ctx, client, batch)
+	if len(results) == 0 {
 		return nil, err
 	}
-	return result.Read, err
+	return results[0], err
 }
 
-// Create writes only when the resource does not exist. The MutationResult is
-// backend evidence; an APPLIED acknowledgement remains valid with a transport
-// error. Missing acknowledgements are indeterminate and are never replayed.
 func Create(ctx context.Context, client pb.StoreServiceClient, options WriteOptions) (*MutationResult, error) {
-	return executeMutation(ctx, client, options.StoreName, NewCreateCommand(options.Request))
+	return writeOne(ctx, client, options, MutationCreate)
 }
-
-// Put creates or replaces one resource without replaying a failed request.
 func Put(ctx context.Context, client pb.StoreServiceClient, options WriteOptions) (*MutationResult, error) {
-	return executeMutation(ctx, client, options.StoreName, NewPutCommand(options.Request))
+	return writeOne(ctx, client, options, MutationPut)
+}
+func Replace(ctx context.Context, client pb.StoreServiceClient, options WriteOptions) (*MutationResult, error) {
+	return writeOne(ctx, client, options, MutationReplace)
 }
 
-// Replace writes only when the resource already exists.
-func Replace(ctx context.Context, client pb.StoreServiceClient, options WriteOptions) (*MutationResult, error) {
-	return executeMutation(ctx, client, options.StoreName, NewReplaceCommand(options.Request))
+func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOptions, action MutationAction) (*MutationResult, error) {
+	var request *MutateRequest
+	if options.Request != nil {
+		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document, AdapterOptions: options.Request.AdapterOptions}
+	}
+	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
+	return mutateOne(ctx, client, batch)
 }
 
 func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOptions) (*MutationResult, error) {
-	return executeMutation(ctx, client, options.StoreName, NewDeleteCommand(options.Request))
+	var request *MutateRequest
+	if options.Request != nil {
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete, AdapterOptions: options.Request.AdapterOptions}
+	}
+	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
+	return mutateOne(ctx, client, batch)
 }
 
 func AtomicTransform(ctx context.Context, client pb.StoreServiceClient, options AtomicTransformOptions) (*MutationResult, error) {
-	return executeMutation(ctx, client, options.StoreName, NewAtomicTransformCommand(options.Request))
+	var request *MutateRequest
+	if options.Request != nil {
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Program: options.Request.Program, BackendExpression: options.Request.BackendExpression, AdapterOptions: options.Request.AdapterOptions}
+	}
+	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
+	return mutateOne(ctx, client, batch)
 }
 
-func executeMutation(ctx context.Context, client pb.StoreServiceClient, store string, command *Command) (*MutationResult, error) {
-	result, err := executeResult(ctx, client, store, command)
-	if result == nil {
+func mutateOne(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) (*MutationResult, error) {
+	results, err := Mutate(ctx, client, options)
+	if len(results) == 0 {
 		return nil, err
 	}
-	return result.Mutation, err
-}
-
-func executeResult(ctx context.Context, client pb.StoreServiceClient, store string, command *Command) (*Result, error) {
-	produced := false
-	var result *Result
-	batch := ExecuteOptions{StoreName: store}
-	batch.Produce = func(context.Context) (*Command, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return command, nil
-	}
-	batch.Consume = func(_ context.Context, _ uint64, event *Event) error { result = event.Result; return nil }
-	err := Execute(ctx, client, batch)
-	if err != nil {
-		return result, err
-	}
-	if result == nil {
-		return nil, errors.New("missing business result")
-	}
-	return result, nil
+	return results[0], err
 }
 
 // Scan consumes one finite page incrementally. Only final RPC OK exposes its
@@ -80,25 +69,19 @@ func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions
 	if options.Request == nil || options.Consume == nil {
 		return nil, errors.New("Scan requires a request and document consumer")
 	}
-	command := NewScanCommand(options.Request)
-	produced := false
+	variant := &pb.Command_Scan{Scan: options.Request}
+	command := &pb.Command{Version: 1, Operation: variant}
+	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
 	var end *ScanEnd
-	batch := ExecuteOptions{StoreName: options.StoreName}
-	batch.Produce = func(context.Context) (*Command, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return command, nil
-	}
-	batch.Consume = func(ctx context.Context, _ uint64, event *Event) error {
+	consume := func(ctx context.Context, event *Event) error {
 		if event.Document != nil {
 			return options.Consume(ctx, event.Document)
 		}
 		end = event.ScanEnd
 		return nil
 	}
-	if err := Execute(ctx, client, batch); err != nil {
+	err := execute(ctx, client, request, consume)
+	if err != nil {
 		return nil, err
 	}
 	if end == nil {
@@ -113,24 +96,19 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	if options.Request == nil || options.Consume == nil {
 		return nil, errors.New("Native requires a request and event consumer")
 	}
-	command := NewNativeCommand(options.Request)
-	produced := false
+	open := &pb.NativeOpen{Resource: options.Request.Resource, Descriptor_: options.Request.Descriptor, BodyMediaType: options.Request.BodyMediaType}
+	native := &pb.NativeRequest{Open: open, Body: options.Request.Body}
+	variant := &pb.Command_Native{Native: native}
+	command := &pb.Command{Version: 1, Operation: variant}
+	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
 	var end *NativeEnd
-	batch := ExecuteOptions{StoreName: options.StoreName}
-	batch.Produce = func(context.Context) (*Command, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return command, nil
-	}
-	batch.Consume = func(ctx context.Context, _ uint64, event *Event) error {
+	consume := func(ctx context.Context, event *Event) error {
 		if event.NativeEnd != nil {
 			end = event.NativeEnd
 		}
 		return options.Consume(ctx, event)
 	}
-	err := Execute(ctx, client, batch)
+	err := execute(ctx, client, request, consume)
 	if err != nil {
 		return end, err
 	}

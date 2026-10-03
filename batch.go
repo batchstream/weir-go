@@ -4,47 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/grpc"
 )
 
-// MaxBatchRequests bounds retained results in Read and Mutate. Use Execute for
-// larger workloads that consume their results incrementally.
-const MaxBatchRequests = 128
+const MaxBatchRequestBytes = protocol.MaxBatchRequestBytes
+const MaxBatchResponseBytes = protocol.MaxBatchResponseBytes
 
-// MaxBatchInputBytes bounds the total encoded commands retained by preflight.
-const MaxBatchInputBytes = 32 << 20
-
-// Read sends all requests over one finite Execute RPC. The entire input is
-// validated before opening the RPC. Results have the input order; a nil entry
-// has no validated backend evidence. Results remain available with a later
-// transport error. A missing resource or backend failure is an individual result.
+// Read validates the entire input and sends one typed unary batch. Results have
+// input order. A failed RPC yields no confirmed results and is never replayed.
 func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) ([]*ReadResult, error) {
-	commands, err := prepareReads(ctx, options)
+	request, err := prepareReads(ctx, options)
 	if err != nil {
 		return nil, err
 	}
-	return readBatch(ctx, client, options.StoreName, commands)
+	return readBatch(ctx, client, request)
 }
 
-// Mutate sends independent mutations over one finite Execute RPC without retry.
-// All requests are validated before any is sent. Results have the input order;
-// nil entries are unacknowledged and may have been applied. An APPLIED result
-// remains backend evidence when a later transport error is returned with it.
-// The batch is not atomic and does not impose ordering between its mutations.
+// Mutate executes one unary batch without retry. Same-resource mutations run in
+// input order, including after item failures; different resources may run in
+// parallel. The batch is not a transaction. A failed RPC leaves every submitted
+// mutation unacknowledged, so any may have applied.
 func Mutate(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) ([]*MutationResult, error) {
-	commands, err := prepareMutations(ctx, options)
+	request, err := prepareMutations(ctx, options)
 	if err != nil {
 		return nil, err
 	}
-	return mutationBatch(ctx, client, options.StoreName, commands)
+	return mutationBatch(ctx, client, request)
 }
 
 func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, error) {
-	commands, err := prepareReads(ctx, options)
+	request, err := prepareReads(ctx, options)
 	if err != nil {
 		return nil, err
 	}
@@ -52,11 +44,11 @@ func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, 
 	if err != nil {
 		return nil, err
 	}
-	return readBatch(ctx, client, options.StoreName, commands)
+	return readBatch(ctx, client, request)
 }
 
 func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*MutationResult, error) {
-	commands, err := prepareMutations(ctx, options)
+	request, err := prepareMutations(ctx, options)
 	if err != nil {
 		return nil, err
 	}
@@ -64,158 +56,112 @@ func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*Mutation
 	if err != nil {
 		return nil, err
 	}
-	return mutationBatch(ctx, client, options.StoreName, commands)
+	return mutationBatch(ctx, client, request)
 }
 
-func prepareReads(ctx context.Context, options ReadOptions) ([]*Command, error) {
-	if !protocol.ValidStoreName(options.StoreName) || len(options.Requests) == 0 || len(options.Requests) > MaxBatchRequests {
-		return nil, fmt.Errorf("Read requires a valid Store name and 1-%d nonempty requests", MaxBatchRequests)
+func prepareReads(ctx context.Context, options ReadOptions) (*pb.ReadBatchRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	commands := make([]*Command, len(options.Requests))
-	remaining := MaxBatchInputBytes
-	for index, request := range options.Requests {
+	request := &pb.ReadBatchRequest{StoreName: options.StoreName, Requests: options.Requests}
+	if err := protocol.ValidateReadBatchRequest(request); err != nil {
+		return nil, err
+	}
+	return request, nil
+}
+
+func prepareMutations(ctx context.Context, options MutateOptions) (*pb.MutateBatchRequest, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	request := &pb.MutateBatchRequest{StoreName: options.StoreName, Requests: make([]*pb.MutateRequest, len(options.Requests))}
+	for index, item := range options.Requests {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		command := NewReadCommand(request)
-		if err := validateBatchCommand(options.StoreName, command, remaining); err != nil {
-			return nil, fmt.Errorf("Read request %d: %w", index, err)
-		}
-		remaining -= len(command.payload)
-		commands[index] = command
-	}
-	return commands, nil
-}
-
-func prepareMutations(ctx context.Context, options MutateOptions) ([]*Command, error) {
-	if !protocol.ValidStoreName(options.StoreName) || len(options.Requests) == 0 || len(options.Requests) > MaxBatchRequests {
-		return nil, fmt.Errorf("Mutate requires a valid Store name and 1-%d nonempty requests", MaxBatchRequests)
-	}
-	commands := make([]*Command, len(options.Requests))
-	remaining := MaxBatchInputBytes
-	for index, request := range options.Requests {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		command, err := batchMutationCommand(request)
+		mutation, err := wireMutation(item)
 		if err != nil {
 			return nil, fmt.Errorf("Mutate request %d: %w", index, err)
 		}
-		if err := validateBatchCommand(options.StoreName, command, remaining); err != nil {
-			return nil, fmt.Errorf("Mutate request %d: %w", index, err)
-		}
-		remaining -= len(command.payload)
-		commands[index] = command
+		request.Requests[index] = mutation
 	}
-	return commands, nil
+	if err := protocol.ValidateMutateBatchRequest(request); err != nil {
+		return nil, err
+	}
+	return request, nil
 }
 
-func batchMutationCommand(request *MutateRequest) (*Command, error) {
+func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
 	if request == nil {
 		return nil, errors.New("missing mutation")
 	}
+	mutation := &pb.MutateRequest{Resource: request.Resource, AdapterOptions: request.AdapterOptions}
 	switch request.Action {
 	case MutationCreate, MutationPut, MutationReplace:
 		if request.Document == nil || request.Program != nil || request.BackendExpression != nil {
 			return nil, errors.New("write requires only a document")
 		}
-		write := &WriteRequest{Resource: request.Resource, Document: request.Document, AdapterOptions: request.AdapterOptions}
 		switch request.Action {
 		case MutationCreate:
-			return NewCreateCommand(write), nil
+			mutation.Action = &pb.MutateRequest_Create{Create: request.Document}
 		case MutationPut:
-			return NewPutCommand(write), nil
-		default:
-			return NewReplaceCommand(write), nil
+			mutation.Action = &pb.MutateRequest_Put{Put: request.Document}
+		case MutationReplace:
+			mutation.Action = &pb.MutateRequest_Replace{Replace: request.Document}
 		}
 	case MutationDelete:
 		if request.Document != nil || request.Program != nil || request.BackendExpression != nil {
 			return nil, errors.New("delete accepts no document or transform")
 		}
-		remove := &DeleteRequest{Resource: request.Resource, AdapterOptions: request.AdapterOptions}
-		return NewDeleteCommand(remove), nil
+		empty := &pb.Empty{}
+		mutation.Action = &pb.MutateRequest_Delete{Delete: empty}
 	case MutationAtomicTransform:
 		if request.Document != nil || (request.Program == nil) == (request.BackendExpression == nil) {
 			return nil, errors.New("AtomicTransform requires exactly one program or backend expression")
 		}
-		transform := &AtomicTransformRequest{Resource: request.Resource, Program: request.Program, BackendExpression: request.BackendExpression, AdapterOptions: request.AdapterOptions}
-		return NewAtomicTransformCommand(transform), nil
+		transform := &pb.Transform{}
+		if request.Program != nil {
+			transform.Form = &pb.Transform_Program{Program: request.Program}
+		} else {
+			transform.Form = &pb.Transform_BackendExpression{BackendExpression: request.BackendExpression}
+		}
+		mutation.Action = &pb.MutateRequest_AtomicTransform{AtomicTransform: transform}
 	default:
 		return nil, errors.New("unknown mutation action")
 	}
+	return mutation, nil
 }
 
-func validateBatchCommand(store string, command *Command, remaining int) error {
-	if command == nil || command.wire == nil || command.wire.Version != 1 || command.wire.Operation == nil {
-		return errors.New("invalid Command")
+func readBatch(ctx context.Context, client pb.StoreServiceClient, request *pb.ReadBatchRequest) ([]*ReadResult, error) {
+	if client == nil {
+		return nil, errors.New("Read requires a client")
 	}
-	if command.err != nil {
-		return command.err
-	}
-	encodedSize := proto.Size(command.wire)
-	if encodedSize > protocol.MaxPayload || encodedSize > remaining {
-		return errors.New("command exceeds payload or total batch input bound")
-	}
-	data, err := proto.Marshal(command.wire)
+	results := make([]*ReadResult, len(request.Requests))
+	response, err := client.Read(ctx, request, grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
-		return err
+		return results, err
 	}
-	decoded, err := protocol.DecodeCommand(data)
+	if err := protocol.ValidateReadBatchResponse(response, len(request.Requests)); err != nil {
+		return results, err
+	}
+	for index, item := range response.Results {
+		result := &ReadResult{Document: item.GetDocument(), Missing: item.GetMissing() != nil, Failure: item.GetFailure()}
+		results[index] = result
+	}
+	return results, nil
+}
+
+func mutationBatch(ctx context.Context, client pb.StoreServiceClient, request *pb.MutateBatchRequest) ([]*MutationResult, error) {
+	if client == nil {
+		return nil, errors.New("Mutate requires a client")
+	}
+	results := make([]*MutationResult, len(request.Requests))
+	response, err := client.Mutate(ctx, request, grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
-		return err
+		return results, fmt.Errorf("Mutate RPC failed; every submitted mutation is unacknowledged: %w", err)
 	}
-	operation := &pb.Operation{}
-	if read := decoded.GetRead(); read != nil {
-		read.Resource = "weir://" + store + "/" + read.Resource
-		variant := &pb.Operation_Read{Read: read}
-		operation.Operation = variant
-	} else if mutation := decoded.GetMutate(); mutation != nil {
-		mutation.Resource = "weir://" + store + "/" + mutation.Resource
-		variant := &pb.Operation_Mutate{Mutate: mutation}
-		operation.Operation = variant
-	} else {
-		return errors.New("batch requires read or mutation commands")
+	if err := protocol.ValidateMutateBatchResponse(response, len(request.Requests)); err != nil {
+		return results, fmt.Errorf("Mutate response invalid; every submitted mutation is unacknowledged: %w", err)
 	}
-	if failure := protocol.Validate(operation, store); failure != nil {
-		return errors.New(failure.Message)
-	}
-	command.payload = data
-	command.kind = commandKind(decoded)
-	return nil
-}
-
-func readBatch(ctx context.Context, client pb.StoreServiceClient, store string, commands []*Command) ([]*ReadResult, error) {
-	results := make([]*ReadResult, len(commands))
-	batch := batchOptions(store, commands)
-	batch.Consume = func(_ context.Context, id uint64, event *Event) error {
-		results[id-1] = event.Result.Read
-		return nil
-	}
-	err := Execute(ctx, client, batch)
-	return results, err
-}
-
-func mutationBatch(ctx context.Context, client pb.StoreServiceClient, store string, commands []*Command) ([]*MutationResult, error) {
-	results := make([]*MutationResult, len(commands))
-	batch := batchOptions(store, commands)
-	batch.Consume = func(_ context.Context, id uint64, event *Event) error {
-		results[id-1] = event.Result.Mutation
-		return nil
-	}
-	err := Execute(ctx, client, batch)
-	return results, err
-}
-
-func batchOptions(store string, commands []*Command) ExecuteOptions {
-	next := 0
-	batch := ExecuteOptions{StoreName: store}
-	batch.Produce = func(context.Context) (*Command, error) {
-		if next == len(commands) {
-			return nil, io.EOF
-		}
-		command := commands[next]
-		next++
-		return command, nil
-	}
-	return batch
+	return response.Results, nil
 }

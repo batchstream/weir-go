@@ -2,7 +2,6 @@ package weir
 
 import (
 	"context"
-	"errors"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
@@ -114,7 +113,8 @@ type MutateRequest struct {
 }
 
 // MutateOptions describes independent mutations addressed to one Store. It is
-// not a transaction; use separate calls for operations that depend on each other.
+// not a transaction. Same-resource requests execute in input order; different
+// resources may execute concurrently. Cross-RPC ordering follows the database.
 // Do not mutate requests or their document bytes until the call returns.
 type MutateOptions struct {
 	StoreName string
@@ -172,35 +172,9 @@ func (r *ReadResult) GetFailure() *Failure {
 	return r.Failure
 }
 
-type Result struct {
-	Index    uint64
-	Read     *ReadResult
-	Mutation *MutationResult
-}
-
-func (r *Result) GetIndex() uint64 {
-	if r == nil {
-		return 0
-	}
-	return r.Index
-}
-func (r *Result) GetRead() *ReadResult {
-	if r == nil {
-		return nil
-	}
-	return r.Read
-}
-func (r *Result) GetMutation() *MutationResult {
-	if r == nil {
-		return nil
-	}
-	return r.Mutation
-}
-
 // Event contains exactly one validated business value. Native chunks are
 // nonempty; a nil Chunk means a different event.
 type Event struct {
-	Result    *Result
 	Document  *Document
 	Head      *NativeHead
 	Chunk     []byte
@@ -208,12 +182,6 @@ type Event struct {
 	NativeEnd *NativeEnd
 }
 
-func (e *Event) GetResult() *Result {
-	if e == nil {
-		return nil
-	}
-	return e.Result
-}
 func (e *Event) GetDocument() *Document {
 	if e == nil {
 		return nil
@@ -248,12 +216,6 @@ func (e *Event) GetNativeEnd() *NativeEnd {
 func businessEvent(wire *pb.Event) *Event {
 	event := &Event{}
 	switch value := wire.Value.(type) {
-	case *pb.Event_Result:
-		result := &Result{Index: value.Result.Index, Mutation: value.Result.GetMutation()}
-		if read := value.Result.GetRead(); read != nil {
-			result.Read = &ReadResult{Document: read.GetDocument(), Missing: read.GetMissing() != nil, Failure: read.GetFailure()}
-		}
-		event.Result = result
 	case *pb.Event_Document:
 		event.Document = value.Document
 	case *pb.Event_Head:
@@ -266,104 +228,4 @@ func businessEvent(wire *pb.Event) *Event {
 		event.NativeEnd = value.NativeEnd
 	}
 	return event
-}
-
-// Command is one business request in a finite Execute batch. Construct it with
-// NewReadCommand, NewPutCommand, or another operation-specific constructor.
-// Execute validates each command before sending it. Do not mutate its request
-// or document bytes while execution runs.
-type Command struct {
-	wire    *pb.Command
-	err     error
-	payload []byte
-	kind    string
-}
-
-func NewReadCommand(request *ReadRequest) *Command {
-	variant := &pb.Command_Read{Read: request}
-	wire := &pb.Command{Version: 1, Operation: variant}
-	command := &Command{wire: wire}
-	return command
-}
-
-func NewCreateCommand(request *WriteRequest) *Command {
-	mutation := &pb.MutateRequest{}
-	if request != nil {
-		variant := &pb.MutateRequest_Create{Create: request.Document}
-		mutation.Resource, mutation.AdapterOptions, mutation.Action = request.Resource, request.AdapterOptions, variant
-	}
-	return mutationCommand(mutation)
-}
-
-func NewPutCommand(request *WriteRequest) *Command {
-	mutation := &pb.MutateRequest{}
-	if request != nil {
-		variant := &pb.MutateRequest_Put{Put: request.Document}
-		mutation.Resource, mutation.AdapterOptions, mutation.Action = request.Resource, request.AdapterOptions, variant
-	}
-	return mutationCommand(mutation)
-}
-
-func NewReplaceCommand(request *WriteRequest) *Command {
-	mutation := &pb.MutateRequest{}
-	if request != nil {
-		variant := &pb.MutateRequest_Replace{Replace: request.Document}
-		mutation.Resource, mutation.AdapterOptions, mutation.Action = request.Resource, request.AdapterOptions, variant
-	}
-	return mutationCommand(mutation)
-}
-
-func NewDeleteCommand(request *DeleteRequest) *Command {
-	mutation := &pb.MutateRequest{}
-	if request != nil {
-		empty := &pb.Empty{}
-		variant := &pb.MutateRequest_Delete{Delete: empty}
-		mutation.Resource, mutation.AdapterOptions, mutation.Action = request.Resource, request.AdapterOptions, variant
-	}
-	return mutationCommand(mutation)
-}
-
-func NewAtomicTransformCommand(request *AtomicTransformRequest) *Command {
-	if request == nil || (request.Program == nil) == (request.BackendExpression == nil) {
-		command := &Command{err: errors.New("AtomicTransform requires exactly one program or backend expression")}
-		return command
-	}
-	mutation := &pb.MutateRequest{}
-	if request != nil {
-		transform := &pb.Transform{}
-		if request.Program != nil && request.BackendExpression == nil {
-			transform.Form = &pb.Transform_Program{Program: request.Program}
-		} else if request.BackendExpression != nil && request.Program == nil {
-			transform.Form = &pb.Transform_BackendExpression{BackendExpression: request.BackendExpression}
-		}
-		variant := &pb.MutateRequest_AtomicTransform{AtomicTransform: transform}
-		mutation.Resource, mutation.AdapterOptions, mutation.Action = request.Resource, request.AdapterOptions, variant
-	}
-	return mutationCommand(mutation)
-}
-
-func mutationCommand(mutation *pb.MutateRequest) *Command {
-	variant := &pb.Command_Mutate{Mutate: mutation}
-	wire := &pb.Command{Version: 1, Operation: variant}
-	command := &Command{wire: wire}
-	return command
-}
-
-func NewScanCommand(request *ScanRequest) *Command {
-	variant := &pb.Command_Scan{Scan: request}
-	wire := &pb.Command{Version: 1, Operation: variant}
-	command := &Command{wire: wire}
-	return command
-}
-
-func NewNativeCommand(request *NativeRequest) *Command {
-	var native *pb.NativeRequest
-	if request != nil {
-		open := &pb.NativeOpen{Resource: request.Resource, Descriptor_: request.Descriptor, BodyMediaType: request.BodyMediaType}
-		native = &pb.NativeRequest{Open: open, Body: request.Body}
-	}
-	variant := &pb.Command_Native{Native: native}
-	wire := &pb.Command{Version: 1, Operation: variant}
-	command := &Command{wire: wire}
-	return command
 }

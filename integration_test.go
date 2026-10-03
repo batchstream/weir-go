@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"testing"
@@ -85,47 +84,18 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	if err != nil || readResult.GetDocument() == nil || number(t, backend, readResult.GetDocument().GetData()) != 4 {
 		t.Fatalf("persisted read: %v %v", readResult, err)
 	}
-	readCommand := weir.NewReadCommand(read)
-	// Execute can have several requests in flight. This application explicitly
-	// waits for Complete before sending dependent reads and mutations.
-	calls := []*weir.Command{readCommand, builder.command("replace", 5), readCommand}
-	results := make([]*weir.Result, len(calls))
-	completed := make(chan uint64, 1)
-	produced := 0
-	batch := weir.ExecuteOptions{StoreName: store}
-	batch.Produce = func(ctx context.Context) (*weir.Command, error) {
-		if produced > 0 {
-			select {
-			case <-completed:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+	write.Request = builder.write(5)
+	result, err = client.Replace(ctx, write)
+	applied(t, result, err)
+	reads := weir.ReadOptions{StoreName: store, Requests: []*weir.ReadRequest{read, read}}
+	batchResults, err := client.Read(ctx, reads)
+	if err != nil || len(batchResults) != 2 {
+		t.Fatal("batch read failed", batchResults, err)
+	}
+	for _, item := range batchResults {
+		if number(t, backend, item.GetDocument().GetData()) != 5 {
+			t.Fatal("read-after-write batch failed")
 		}
-		if produced == len(calls) {
-			return nil, io.EOF
-		}
-		call := calls[produced]
-		produced++
-		return call, nil
-	}
-	batch.Consume = func(_ context.Context, id uint64, event *weir.Event) error {
-		results[id-1] = event.GetResult()
-		return nil
-	}
-	batch.Complete = func(ctx context.Context, id uint64) error {
-		select {
-		case completed <- id:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	if err := client.Execute(ctx, batch); err != nil {
-		t.Fatal("finite mixed Execute:", err)
-	}
-	applied(t, results[1].Mutation, nil)
-	if number(t, backend, results[2].GetRead().GetDocument().GetData()) != 5 {
-		t.Fatal("Complete-gated read-after-write failed")
 	}
 	selector := &weir.Document{MediaType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
 	if backend == "mongo" {
@@ -193,7 +163,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	if err != nil || !readResult.GetMissing() {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
-	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, Complete-gated mixed Execute, Scan, native Execute and Delete verified", backend)
+	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered unary batch read-after-write, Scan, native Execute and Delete verified", backend)
 }
 
 func applied(t *testing.T, result *weir.MutationResult, err error) {
@@ -238,25 +208,6 @@ func (b mutationBuilder) transform(n int) *weir.AtomicTransformRequest {
 	}
 	request := &weir.AtomicTransformRequest{Resource: b.resource, BackendExpression: expression}
 	return request
-}
-func (b mutationBuilder) command(action string, n int) *weir.Command {
-	b.t.Helper()
-	request := b.write(n)
-	switch action {
-	case "create":
-		return weir.NewCreateCommand(request)
-	case "replace":
-		return weir.NewReplaceCommand(request)
-	case "put":
-		return weir.NewPutCommand(request)
-	case "delete":
-		request := &weir.DeleteRequest{Resource: b.resource}
-		return weir.NewDeleteCommand(request)
-	case "transform":
-		return weir.NewAtomicTransformCommand(b.transform(n))
-	}
-	b.t.Fatal("unknown mutation action", action)
-	return nil
 }
 func number(t *testing.T, backend string, data []byte) int64 {
 	t.Helper()

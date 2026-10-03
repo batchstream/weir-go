@@ -400,7 +400,7 @@ func unknownWrite(err error) bool {
 	return errors.As(err, &audited) && audited.Outcome == weir.MutationUnknown
 }
 
-func (w worker) mutation(action string, n int64) (*weir.Command, error) {
+func (w worker) mutation(action string, n int64) (*weir.MutateRequest, error) {
 	document := &weir.Document{MediaType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
 	if w.backend == "mongo" {
 		value := bson.D{{Key: "_id", Value: w.id}, {Key: "n", Value: n}}
@@ -410,38 +410,30 @@ func (w worker) mutation(action string, n int64) (*weir.Command, error) {
 		}
 		document.MediaType, document.Data = "application/bson", raw
 	}
-	request := &weir.WriteRequest{Resource: w.resource, Document: document}
+	request := &weir.MutateRequest{Resource: w.resource, Document: document}
 	switch action {
 	case "create":
-		return weir.NewCreateCommand(request), nil
+		request.Action = weir.MutationCreate
 	case "put":
-		return weir.NewPutCommand(request), nil
+		request.Action = weir.MutationPut
 	case "replace":
-		return weir.NewReplaceCommand(request), nil
+		request.Action = weir.MutationReplace
 	case "delete":
-		request := &weir.DeleteRequest{Resource: w.resource}
-		return weir.NewDeleteCommand(request), nil
+		request.Action, request.Document = weir.MutationDelete, nil
+	default:
+		return nil, errors.New("invalid workload action")
 	}
-	return nil, errors.New("invalid workload action")
+	return request, nil
 }
-func (w worker) mutate(ctx context.Context, command *weir.Command) error {
+func (w worker) mutate(ctx context.Context, request *weir.MutateRequest) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	produced := false
+	options := weir.MutateOptions{StoreName: w.store, Requests: []*weir.MutateRequest{request}}
+	results, err := weir.Mutate(ctx, w.client, options)
 	var mutation *weir.MutationResult
-	options := weir.ExecuteOptions{StoreName: w.store}
-	options.Produce = func(context.Context) (*weir.Command, error) {
-		if produced {
-			return nil, io.EOF
-		}
-		produced = true
-		return command, nil
+	if len(results) != 0 {
+		mutation = results[0]
 	}
-	options.Consume = func(_ context.Context, _ uint64, event *weir.Event) error {
-		mutation = event.GetResult().GetMutation()
-		return nil
-	}
-	err := weir.Execute(ctx, w.client, options)
 	if err != nil || mutation.GetOutcome() != weir.MutationApplied || mutation.GetFailure() != nil {
 		outcome := weir.MutationUnknown
 		if mutation != nil {
