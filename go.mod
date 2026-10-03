@@ -3,7 +3,7 @@ module github.com/batchstream/weir-go
 go 1.27.1
 
 require (
-	github.com/batchstream/weir-protocol v0.2.0
+	github.com/batchstream/weir-protocol v0.2.1
 	go.mongodb.org/mongo-driver/v2 v2.9.1
 	golang.org/x/net v0.58.0
 	google.golang.org/grpc v1.83.2
