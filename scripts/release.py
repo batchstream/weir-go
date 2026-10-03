@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization and direct finite Execute requests, with bounded streaming, completion evidence, and no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, direct unary Read/Mutate batches and incremental Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -54,7 +54,6 @@ def main():
 import (
     "context"
     "fmt"
-    "io"
     weir "github.com/batchstream/weir-go"
 )
 // Compile the ordinary API using only SDK-owned request/result/event names.
@@ -76,7 +75,7 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     remove := &weir.DeleteRequest{Resource: read.Resource}
     deleteOptions := weir.DeleteOptions{StoreName: "records", Request: remove}
     _, _ = client.Delete(ctx, deleteOptions)
-    program := &weir.ProgramTransform{Runtime: "lua", Source: []byte("return doc")}
+    program := &weir.ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
     transform := &weir.AtomicTransformRequest{Resource: read.Resource, Program: program}
     transformOptions := weir.AtomicTransformOptions{StoreName: "records", Request: transform}
     _, _ = client.AtomicTransform(ctx, transformOptions)
@@ -90,17 +89,7 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     nativeOptions := weir.NativeOptions{StoreName: "records", Request: native}
     nativeOptions.Consume = func(context.Context, *weir.Event) error { return nil }
     _, _ = client.Native(ctx, nativeOptions)
-    commands := []*weir.Command{weir.NewReadCommand(read), weir.NewCreateCommand(write), weir.NewPutCommand(write), weir.NewReplaceCommand(write), weir.NewDeleteCommand(remove), weir.NewAtomicTransformCommand(transform), weir.NewScanCommand(scan), weir.NewNativeCommand(native)}
-    produced := 0
-    batch := weir.ExecuteOptions{StoreName: "records"}
-    batch.Produce = func(context.Context) (*weir.Command, error) {
-        if produced == len(commands) { return nil, io.EOF }
-        command := commands[produced]
-        produced++
-        return command, nil
-    }
-    batch.Consume = func(context.Context, uint64, *weir.Event) error { return nil }
-    _ = client.Execute(ctx, batch)
+
 }
 func main() {
     connection, err := weir.Dial("127.0.0.1:7447")

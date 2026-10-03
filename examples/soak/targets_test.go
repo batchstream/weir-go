@@ -157,9 +157,9 @@ type nonOwnerServer struct {
 	business atomic.Int32
 }
 
-func (s *nonOwnerServer) Execute(grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+func (s *nonOwnerServer) Mutate(context.Context, *pb.MutateBatchRequest) (*pb.MutateBatchResponse, error) {
 	s.business.Add(1)
-	return errors.New("nonowner received business request")
+	return nil, errors.New("nonowner received business request")
 }
 func TestFixedTargetRejectsNonownerBeforeBusiness(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

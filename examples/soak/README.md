@@ -48,7 +48,7 @@ and a fresh `-run-id`. Freeze all values and artifact identities before the 24-h
 ```
 
 Collection flags use `weir://STORE/...` only as operator input and audit metadata.
-The runner separates StoreName and sends canonical relative Command targets.
+The runner separates StoreName and sends canonical relative resource paths.
 Each worker owns a distinct string key, with half the workers assigned to each
 backend. It Creates that record once, then schedules Put → Read → Replace → Read cycles, each using typed SDK commands over a finite Execute
 RPC. Every acknowledged value is checked before the next dependent operation.
