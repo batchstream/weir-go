@@ -6,7 +6,7 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments; URI affinity is not implemented.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.4.0
+go get github.com/batchstream/weir-go@v0.4.1
 ```
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.2.0`
@@ -76,6 +76,9 @@ input order, including repeated resources. Individual backend failures stay in
 their result positions. A failed RPC returns a result slice of the submitted
 length with nil entries: the whole response is unacknowledged and any mutation
 may have applied. The SDK never automatically replays business requests.
+Before protobuf decoding, each batch reply is checked against the submitted
+request count and the encoded byte budget. Malformed or excess results leave the
+entire batch unacknowledged. The request count adds no separate batch-size cap.
 
 ```go
 firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}

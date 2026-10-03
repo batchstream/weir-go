@@ -137,7 +137,8 @@ func readBatch(ctx context.Context, client pb.StoreServiceClient, request *pb.Re
 		return nil, errors.New("Read requires a client")
 	}
 	results := make([]*ReadResult, len(request.Requests))
-	response, err := client.Read(ctx, request, grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
+	codec := batchResponseCodec{results: len(request.Requests)}
+	response, err := client.Read(ctx, request, grpc.ForceCodecV2(codec), grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
 		return results, err
 	}
@@ -156,7 +157,8 @@ func mutationBatch(ctx context.Context, client pb.StoreServiceClient, request *p
 		return nil, errors.New("Mutate requires a client")
 	}
 	results := make([]*MutationResult, len(request.Requests))
-	response, err := client.Mutate(ctx, request, grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
+	codec := batchResponseCodec{results: len(request.Requests)}
+	response, err := client.Mutate(ctx, request, grpc.ForceCodecV2(codec), grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
 		return results, fmt.Errorf("Mutate RPC failed; every submitted mutation is unacknowledged: %w", err)
 	}
