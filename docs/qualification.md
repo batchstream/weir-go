@@ -14,7 +14,7 @@ package closures and the complete module graph,
 including test and unused requirements. It rejects every Weir server dependency,
 protocol paths leading back to the SDK/server, module replacements and locally
 generated protobuf source. The protocol module owns public schemas and shared
-helpers; neither it nor the SDK depends on the server. The SDK release target is v0.2.0; publication requires a stable, unreplaced protocol tag and verifies a clean consumer using the typed SDK without protobuf imports.
+helpers; neither it nor the SDK depends on the server. The SDK release target is v0.3.0; publication requires a stable, unreplaced protocol tag and verifies a clean consumer using the typed SDK without protobuf imports.
 
 The typed API hides operation and result oneofs, preserves Read/Mutation/Native evidence alongside transport failures, and keeps Scan checkpoints gated on final RPC success. Default tests include actual typed operation dispatch and reject ambiguous transforms before business traffic.
 

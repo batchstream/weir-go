@@ -248,18 +248,25 @@ func produce(ctx context.Context, stream grpc.BidiStreamingClient[pb.ExecuteRequ
 		if wireCommand == nil || wireCommand.Version != 1 || wireCommand.Operation == nil || proto.Size(wireCommand) > protocol.MaxPayload {
 			return errors.New("invalid Command")
 		}
-		data, err := proto.Marshal(wireCommand)
-		if err != nil {
-			return err
-		}
-		if _, err := protocol.DecodeCommand(data); err != nil {
-			return err
+		data := command.payload
+		if data == nil {
+			data, err = proto.Marshal(wireCommand)
+			if err != nil {
+				return err
+			}
+			if _, err := protocol.DecodeCommand(data); err != nil {
+				return err
+			}
 		}
 		request := &pb.ExecuteRequest{RequestId: id, StoreName: opts.StoreName, CommandPayload: data}
 		if err := protocol.ValidateExecuteRequest(request, opts.StoreName, id-1); err != nil {
 			return err
 		}
-		entry := &pending{bytes: len(data), kind: commandKind(wireCommand)}
+		kind := command.kind
+		if kind == "" {
+			kind = commandKind(wireCommand)
+		}
+		entry := &pending{bytes: len(data), kind: kind}
 		if request := wireCommand.GetScan(); request != nil {
 			if request.PageSize > protocol.MaxScanPageSize || len(request.ContinuationToken) > protocol.MaxScanToken {
 				return errors.New("Scan page size or continuation exceeds bound")

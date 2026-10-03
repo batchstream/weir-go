@@ -60,9 +60,14 @@ import (
 // Compile the ordinary API using only SDK-owned request/result/event names.
 func typedAPI(ctx context.Context, client *weir.Client) {
     read := &weir.ReadRequest{Resource: "records/s:key"}
-    readOptions := weir.ReadOptions{StoreName: "records", Request: read}
-    _, _ = client.Read(ctx, readOptions)
+    readOptions := weir.ReadOneOptions{StoreName: "records", Request: read}
+    _, _ = client.ReadOne(ctx, readOptions)
+    reads := weir.ReadOptions{StoreName: "records", Requests: []*weir.ReadRequest{read, read}}
+    _, _ = client.Read(ctx, reads)
     document := &weir.Document{MediaType: "application/json", Data: []byte(`{}`)}
+    mutation := &weir.MutateRequest{Resource: read.Resource, Action: weir.MutationPut, Document: document}
+    mutations := weir.MutateOptions{StoreName: "records", Requests: []*weir.MutateRequest{mutation}}
+    _, _ = client.Mutate(ctx, mutations)
     write := &weir.WriteRequest{Resource: read.Resource, Document: document}
     writeOptions := weir.WriteOptions{StoreName: "records", Request: write}
     _, _ = client.Create(ctx, writeOptions)

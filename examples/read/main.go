@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	weir "github.com/batchstream/weir-go"
@@ -12,7 +13,7 @@ import (
 func main() {
 	address := flag.String("address", "127.0.0.1:7447", "Weir initialization listener")
 	store := flag.String("store", "mongo", "logical Store")
-	resource := flag.String("resource", "weir_acceptance/records/s:example", "relative record resource")
+	resources := flag.String("resources", "weir_acceptance/records/s:example,weir_acceptance/records/s:another", "comma-separated relative record resources in one Store")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -22,19 +23,24 @@ func main() {
 		panic(err)
 	}
 	defer client.Close()
-	request := &weir.ReadRequest{Resource: *resource}
-	readOptions := weir.ReadOptions{StoreName: *store, Request: request}
-	read, err := client.Read(ctx, readOptions)
+	readOptions := weir.ReadOptions{StoreName: *store}
+	for _, resource := range strings.Split(*resources, ",") {
+		request := &weir.ReadRequest{Resource: resource}
+		readOptions.Requests = append(readOptions.Requests, request)
+	}
+	reads, err := client.Read(ctx, readOptions)
 	if err != nil {
 		panic(err)
 	}
-	if read.GetFailure() != nil {
-		panic(read.GetFailure())
+	for index, read := range reads {
+		if read.GetFailure() != nil {
+			panic(read.GetFailure())
+		}
+		if read.GetMissing() {
+			fmt.Println(index, "missing")
+			continue
+		}
+		document := read.GetDocument()
+		fmt.Printf("%d %s: %d bytes\n", index, document.MediaType, len(document.Data))
 	}
-	if read.GetMissing() {
-		fmt.Println("missing")
-		return
-	}
-	document := read.GetDocument()
-	fmt.Printf("%s: %d bytes\n", document.MediaType, len(document.Data))
 }

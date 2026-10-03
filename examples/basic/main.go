@@ -1,11 +1,10 @@
-// Basic demonstrates one finite Execute batch with incremental input and consumption.
+// Basic demonstrates typed finite read and mutation batches addressed to one Store.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"time"
 
 	weir "github.com/batchstream/weir-go"
@@ -46,39 +45,32 @@ func run() error {
 		target = weir.EncodeSegment(*index) + "/s:example"
 		document = &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
 	}
-	request := &weir.WriteRequest{Resource: target, Document: document}
-	opts := weir.WriteOptions{StoreName: *storeName, Request: request}
-	result, err := client.Put(ctx, opts)
+	request := &weir.MutateRequest{Resource: target, Action: weir.MutationPut, Document: document}
+	opts := weir.MutateOptions{StoreName: *storeName, Requests: []*weir.MutateRequest{request}}
+	results, err := client.Mutate(ctx, opts)
 	if err != nil {
-		if result != nil {
-			return fmt.Errorf("write RPC incomplete; backend evidence=%v: %w", result, err)
+		if len(results) != 0 && results[0] != nil {
+			return fmt.Errorf("write RPC incomplete; backend evidence=%v: %w", results[0], err)
 		}
 		return fmt.Errorf("write result unavailable; effects indeterminate: %w", err)
 	}
-	if result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
-		return fmt.Errorf("write: %v", result)
+	if results[0].GetOutcome() != weir.MutationApplied || results[0].GetFailure() != nil {
+		return fmt.Errorf("write: %v", results[0])
 	}
-	produced := 0
-	batch := weir.ExecuteOptions{StoreName: *storeName}
-	batch.Produce = func(context.Context) (*weir.Command, error) {
-		if produced == *count {
-			return nil, io.EOF
-		}
-		produced++
+	batch := weir.ReadOptions{StoreName: *storeName}
+	for range *count {
 		read := &weir.ReadRequest{Resource: target}
-		return weir.NewReadCommand(read), nil
+		batch.Requests = append(batch.Requests, read)
 	}
-	batch.Consume = func(_ context.Context, id uint64, event *weir.Event) error {
-		read := event.GetResult().GetRead()
+	reads, err := client.Read(ctx, batch)
+	if err != nil {
+		return fmt.Errorf("read RPC incomplete: %w", err)
+	}
+	for index, read := range reads {
 		if read.GetFailure() != nil {
-			return fmt.Errorf("read %d: %v", id, read.GetFailure())
+			return fmt.Errorf("read %d: %v", index, read.GetFailure())
 		}
-		fmt.Printf("id=%d record=%d bytes missing=%t\n", id, len(read.GetDocument().GetData()), read.GetMissing())
-		// Consume and discard here: retaining Events would require the full batch memory.
-		return nil
-	}
-	if err := client.Execute(ctx, batch); err != nil {
-		return err
+		fmt.Printf("index=%d record=%d bytes missing=%t\n", index, len(read.GetDocument().GetData()), read.GetMissing())
 	}
 	fmt.Printf("completed %d reads with all request ends and final gRPC OK\n", *count)
 	return nil

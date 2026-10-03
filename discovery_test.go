@@ -124,8 +124,8 @@ func discoveryRead(t *testing.T, client *Client, store string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	options := ReadOptions{StoreName: store, Request: clientTestReadRequest()}
-	result, err := client.Read(ctx, options)
+	options := ReadOneOptions{StoreName: store, Request: clientTestReadRequest()}
+	result, err := client.ReadOne(ctx, options)
 	if err != nil || result == nil || result.GetDocument() == nil {
 		t.Fatalf("direct Store read: result=%v error=%v", result, err)
 	}
@@ -174,8 +174,8 @@ func TestOpenResolvesMultipleStoresAndBalancesDirectStreams(t *testing.T) {
 	if first.resolves.Load() != 0 || second.resolves.Load() != 0 {
 		t.Fatal("business replicas received initialization traffic")
 	}
-	unknown := ReadOptions{StoreName: "uninitialized", Request: clientTestReadRequest()}
-	if _, err := client.Read(t.Context(), unknown); err == nil {
+	unknown := ReadOneOptions{StoreName: "uninitialized", Request: clientTestReadRequest()}
+	if _, err := client.ReadOne(t.Context(), unknown); err == nil {
 		t.Fatal("uninitialized Store accepted")
 	}
 }
@@ -245,8 +245,8 @@ func TestClientRefreshChangesEndpointsWithoutReplayingActiveStream(t *testing.T)
 	defer cancel()
 	finished := make(chan error, 1)
 	go func() {
-		options := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
-		_, err := client.Read(ctx, options)
+		options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
+		_, err := client.ReadOne(ctx, options)
 		finished <- err
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -307,8 +307,8 @@ func TestClientLeaseExpiresAndConflictInvalidates(t *testing.T) {
 			}
 			time.Sleep(wait)
 			before := target.executions.Load()
-			optionsRecord := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
-			if _, err := client.Read(t.Context(), optionsRecord); err == nil {
+			optionsRecord := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
+			if _, err := client.ReadOne(t.Context(), optionsRecord); err == nil {
 				t.Fatal("expired or conflicting mapping accepted business request")
 			}
 			if target.executions.Load() != before {
@@ -416,8 +416,8 @@ func TestOpenCancellationAndCloseJoinDiscovery(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	record := ReadOptions{StoreName: "records", Request: clientTestReadRequest()}
-	if _, err := client.Read(t.Context(), record); !errors.Is(err, ErrClosed) {
+	record := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
+	if _, err := client.ReadOne(t.Context(), record); !errors.Is(err, ErrClosed) {
 		t.Fatal("closed client admitted request", err)
 	}
 	queries = dns.Queries.Load()

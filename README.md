@@ -6,7 +6,7 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments; URI affinity is not implemented.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.2.0
+go get github.com/batchstream/weir-go@v0.3.0
 ```
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.1.0`
@@ -27,12 +27,15 @@ client, err := weir.Open(ctx, options)
 if err != nil { return err }
 defer client.Close()
 
-request := &weir.ReadRequest{Resource: "records/s:example"}
-readOptions := weir.ReadOptions{StoreName: "search", Request: request}
-result, err := client.Read(ctx, readOptions)
-if err != nil { return err }
-if result.Failure != nil { return fmt.Errorf("read failed: %v", result.Failure) }
-fmt.Println("missing:", result.Missing)
+first := &weir.ReadRequest{Resource: "records/s:example"}
+second := &weir.ReadRequest{Resource: "records/s:another"}
+readOptions := weir.ReadOptions{StoreName: "search", Requests: []*weir.ReadRequest{first, second}}
+results, err := client.Read(ctx, readOptions)
+if err != nil { return fmt.Errorf("read RPC incomplete; preserve results %v: %w", results, err) }
+for index, result := range results {
+    if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
+    fmt.Println(index, "missing:", result.Missing)
+}
 ```
 
 `Open` resolves ownership and establishes a ready direct connection for every
@@ -50,16 +53,52 @@ use `application/json`. The caller owns its document codec; the SDK preserves by
 
 ## Business operations
 
-Each method takes named options with `StoreName` and `Request`:
+Each method takes named options with `StoreName`. `Read` and `Mutate` accept
+`Requests`; single-operation helpers accept `Request`:
 
 | Method | Options / request | Result |
 | --- | --- | --- |
-| `Read` | `ReadOptions` / `ReadRequest` | `ReadResult`: Document, Missing, Failure |
+| `Read` | `ReadOptions` / multiple `ReadRequest` | `[]*ReadResult`: Document, Missing, Failure |
+| `Mutate` | `MutateOptions` / multiple `MutateRequest` | `[]*MutationResult` |
+| `ReadOne` | `ReadOneOptions` / `ReadRequest` | `ReadResult` |
 | `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
 | `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
 | `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
 | `Scan` | `ScanOptions` / `ScanRequest`, document consumer | `ScanEnd` |
 | `Native` | `NativeOptions` / `NativeRequest`, event consumer | `NativeEnd` |
+
+`Read` and `Mutate` validate the complete input before selecting the Store
+connection or opening their single Execute RPC. An empty batch, nil request,
+malformed resource, unsupported action or invalid document envelope rejects the
+entire call without sending earlier valid items. Every resource is relative to
+one outer `StoreName`; full `weir://STORE/` URIs are rejected. Both methods preserve
+input order even when responses arrive out of order or resources are repeated.
+Individual backend failures stay in their result positions. With a transport
+error, validated results remain evidence and nil positions are unacknowledged;
+mutations at those positions may have been applied. The SDK never retries them.
+
+```go
+firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+secondDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":2}`)}
+first := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationPut, Document: firstDoc}
+second := &weir.MutateRequest{Resource: "records/s:second", Action: weir.MutationPut, Document: secondDoc}
+options := weir.MutateOptions{StoreName: "search", Requests: []*weir.MutateRequest{first, second}}
+results, err := client.Mutate(ctx, options)
+// Inspect every result's Outcome/Failure, even when err is nonnil. Never replay
+// an unacknowledged mutation automatically.
+```
+
+`MutateRequest.Action` selects `MutationCreate`, `MutationPut`, `MutationReplace`,
+`MutationDelete` or `MutationAtomicTransform`. Writes require Document, Delete
+accepts no payload, and AtomicTransform requires exactly one Program or
+BackendExpression. A batch is not a transaction and its items are independent;
+use separate completed calls for dependent operations. Convenience batch methods
+accept 1–128 requests (`MaxBatchRequests`) and at most 32 MiB of encoded input
+(`MaxBatchInputBytes`). Preflight retains that bounded encoding and Execute reuses
+it. Pending transport input still has the independent eight-request / 16 MiB
+limit. A read batch retains its results, potentially 256 MiB of document bytes at
+the maximum size, so choose smaller batches when documents are large. Use Execute
+consumers for incremental processing of larger workloads.
 
 `WriteRequest` contains Resource, Document and optional AdapterOptions. Create
 requires absence; Replace requires an existing resource; Put creates or replaces.
@@ -119,7 +158,7 @@ applications use Open and the typed Client methods shown above.
 ## Examples and validation
 
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
-puts a document then executes a finite read batch, [scan](examples/scan/main.go)
+mutates a document then reads multiple resources in a single typed batch, [scan](examples/scan/main.go)
 commits finite-page checkpoints, and [native](examples/native/main.go) consumes
 native responses. These examples use SDK request/result/event types. The explicit
 [soak workload](examples/soak/README.md) audits fixed owners and write uncertainty;
