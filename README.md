@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.6.0
+go get github.com/batchstream/weir-go@v0.7.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.4.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.5.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -73,15 +73,15 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 connection or opening one bidirectional Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one `StoreName`. Inputs are sent incrementally in frames, and results preserve
+one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
 input order, including repeated resources. Individual backend failures stay in
 their result positions. A later RPC failure preserves every validated result
 already received; unconfirmed positions remain nil and any such mutation may
 have applied. Never automatically replay those mutations.
 
 ```go
-firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
-secondDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":2}`)}
+firstDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
+secondDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":2}`)}
 first := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationPut, Document: firstDoc}
 second := &weir.MutateRequest{Resource: "records/s:second", Action: weir.MutationPut, Document: secondDoc}
 options := weir.MutateOptions{StoreName: "search", Requests: []*weir.MutateRequest{first, second}}
@@ -97,17 +97,20 @@ BackendExpression. A batch is not a transaction. Mutations to the same resource
 execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
 
-A logical call has no total byte or item limit. Each read/mutation frame contains
-at most 1024 items and a 5 MiB encoded command. Documents are bounded at 2 MiB;
-responses contain one indexed item. The SDK allows two frames in flight and
-returns a frame's credit only after consuming its last response. It sends and
-receives concurrently so HTTP/2 flow control can advance in both directions.
+A logical call has no total byte or item limit. Each ExecuteRequest carries one
+read or mutation and each response carries its indexed result. Documents are
+bounded at 2 MiB. The SDK permits at most 32 unconsumed results and 8 MiB of
+unacknowledged encoded input; a larger legal request uses the window alone.
+Credit returns after each Consume callback finishes. A size-dependent wait can
+hold one produced item that has not yet been sent. Sending and receiving run
+concurrently so HTTP/2 flow control advances in both directions. The SDK never
+waits for another input or EOF before sending the current item.
 `Read` and `Mutate` intentionally accumulate results for their caller; use the
 streaming interfaces to avoid retaining the full input and result sequence.
 
-`WriteRequest` contains Resource, Document and optional AdapterOptions. Create
-requires absence; Replace requires an existing resource; Put creates or replaces.
-AtomicTransform requires exactly one Program or BackendExpression.
+`WriteRequest` contains Resource and Document. Create requires absence; Replace
+requires an existing resource; Put creates or replaces. AtomicTransform requires
+exactly one Program or BackendExpression.
 
 On a successful RPC, `weir.MutationApplied` may also carry a subsequent
 acknowledgement failure. Inspect both Outcome and Failure. Other outcomes always
@@ -121,7 +124,7 @@ Retrying that page may repeat documents, so the caller owns deduplication and
 committing output together with its checkpoint. A completed RPC can still carry
 `ScanEnd.Failure`, which has no continuation token.
 
-`NativeRequest` contains Resource, Descriptor, BodyMediaType and a bounded Body.
+`NativeRequest` contains Resource, Descriptor, BodyContentType and a bounded Body.
 Its consumer sees flat SDK Events containing Head, Chunk or NativeEnd. Chunks are
 nonempty and consumed incrementally; the SDK does not collect a whole response.
 A validated NativeEnd is returned with a later transport or consumer error.
@@ -129,7 +132,7 @@ Completion describes response transport evidence, not a normalized mutation
 outcome. Interpret backend response status/body separately. For Search HTTP,
 use `SearchHTTPRequest`, `SearchHTTPDescriptor` and `DecodeSearchHTTPResponse`
 without importing generated protobuf packages. Mongo command bodies use BSON and
-`MongoCommandMediaType` for the descriptor.
+`MongoCommandContentType` for the descriptor.
 
 ## Streaming and deadlines
 
@@ -178,7 +181,7 @@ methods. The caller owns target validation and connection lifetime for Dial.
 ## Examples and validation
 
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
-mutates a document then reads multiple resources in one framed stream, [scan](examples/scan/main.go)
+mutates a document then reads multiple resources in one stream, [scan](examples/scan/main.go)
 commits finite-page checkpoints, and [native](examples/native/main.go) consumes
 native responses. These examples use SDK request/result/event types.
 

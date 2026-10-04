@@ -30,8 +30,8 @@ func run() error {
 	switch *store {
 	case "mongo":
 		request.Resource = weir.EncodeSegment(*database) + "/records"
-		request.Descriptor = &weir.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		request.BodyMediaType = "application/bson"
+		request.Descriptor = &weir.Document{ContentType: "application/vnd.weir.mongodb-command.v1+protobuf"}
+		request.BodyContentType = "application/bson"
 		command := bson.D{{Key: "count", Value: "records"}}
 		var err error
 		body, err = bson.Marshal(command)
@@ -63,7 +63,7 @@ func run() error {
 	opts := weir.NativeOptions{StoreName: *store, Request: request}
 	opts.Consume = func(_ context.Context, event *weir.Event) error {
 		if head := event.Head; head != nil {
-			fmt.Printf("metadata=%v media=%s\n", head.Metadata, head.BodyMediaType)
+			fmt.Printf("metadata=%v media=%s\n", head.Metadata, head.BodyContentType)
 		}
 		total += len(event.Chunk)
 		// Consume native bytes here without collecting the entire response.

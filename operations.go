@@ -7,7 +7,7 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
-// ReadOne sends a one-item Read batch without replay.
+// ReadOne sends one read without replay.
 func ReadOne(ctx context.Context, client pb.StoreServiceClient, options ReadOneOptions) (*ReadResult, error) {
 	batch := ReadOptions{StoreName: options.StoreName, Requests: []*ReadRequest{options.Request}}
 	results, err := Read(ctx, client, batch)
@@ -30,7 +30,7 @@ func Replace(ctx context.Context, client pb.StoreServiceClient, options WriteOpt
 func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOptions, action MutationAction) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document, AdapterOptions: options.Request.AdapterOptions}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -39,7 +39,7 @@ func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOp
 func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOptions) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete, AdapterOptions: options.Request.AdapterOptions}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -48,7 +48,7 @@ func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOpt
 func AtomicTransform(ctx context.Context, client pb.StoreServiceClient, options AtomicTransformOptions) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Program: options.Request.Program, BackendExpression: options.Request.BackendExpression, AdapterOptions: options.Request.AdapterOptions}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Program: options.Request.Program, BackendExpression: options.Request.BackendExpression}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -93,7 +93,7 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	if options.Request == nil || options.Consume == nil {
 		return nil, errors.New("Native requires a request and event consumer")
 	}
-	open := &pb.NativeOpen{Resource: options.Request.Resource, Descriptor_: options.Request.Descriptor, BodyMediaType: options.Request.BodyMediaType}
+	open := &pb.NativeOpen{Resource: options.Request.Resource, Descriptor_: options.Request.Descriptor, BodyContentType: options.Request.BodyContentType}
 	native := &pb.NativeRequest{Open: open, Body: options.Request.Body}
 	variant := &pb.Command_Native{Native: native}
 	command := &pb.Command{Operation: variant}

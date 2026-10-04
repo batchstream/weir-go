@@ -11,17 +11,27 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
-// ReadStream produces and consumes a finite read sequence using bounded frames.
+// ReadStream sends each produced read immediately and consumes indexed results.
 // Confirmed callbacks remain valid when a later transport or producer fails.
 func ReadStream(ctx context.Context, client pb.StoreServiceClient, options ReadStreamOptions) error {
 	if options.Next == nil || options.Consume == nil {
 		return errors.New("ReadStream requires a producer and consumer")
 	}
-	source := recordSource{store: options.StoreName, nextRead: options.Next}
+	next := func(ctx context.Context) (*pb.Command, error) {
+		request, err := options.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := protocol.ValidateReadRequest(request); err != nil {
+			return nil, err
+		}
+		operation := &pb.Command_Read{Read: request}
+		command := &pb.Command{Operation: operation}
+		return command, nil
+	}
 	consume := func(ctx context.Context, response *pb.ExecuteResponse) error {
 		wire := response.Event.GetReadResult()
 		if wire == nil {
@@ -30,7 +40,7 @@ func ReadStream(ctx context.Context, client pb.StoreServiceClient, options ReadS
 		result := &ReadResult{Document: wire.GetDocument(), Missing: wire.GetMissing() != nil, Failure: wire.GetFailure()}
 		return options.Consume(ctx, response.Index, result)
 	}
-	optionsInternal := recordStreamOptions{source: &source, consume: consume}
+	optionsInternal := recordStreamOptions{store: options.StoreName, next: next, consume: consume}
 	return recordStream(ctx, client, optionsInternal)
 }
 
@@ -40,7 +50,22 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 	if options.Next == nil || options.Consume == nil {
 		return errors.New("MutateStream requires a producer and consumer")
 	}
-	source := recordSource{store: options.StoreName, nextMutation: options.Next}
+	next := func(ctx context.Context) (*pb.Command, error) {
+		input, err := options.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		request, err := wireMutation(input)
+		if err != nil {
+			return nil, err
+		}
+		if err := protocol.ValidateMutationRequest(request); err != nil {
+			return nil, err
+		}
+		operation := &pb.Command_Mutate{Mutate: request}
+		command := &pb.Command{Operation: operation}
+		return command, nil
+	}
 	consume := func(ctx context.Context, response *pb.ExecuteResponse) error {
 		result := response.Event.GetMutationResult()
 		if result == nil {
@@ -48,7 +73,7 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 		}
 		return options.Consume(ctx, response.Index, result)
 	}
-	optionsInternal := recordStreamOptions{source: &source, consume: consume}
+	optionsInternal := recordStreamOptions{store: options.StoreName, next: next, consume: consume}
 	return recordStream(ctx, client, optionsInternal)
 }
 
@@ -68,109 +93,15 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 	return MutateStream(ctx, client, options)
 }
 
-type recordSource struct {
-	store           string
-	nextRead        func(context.Context) (*ReadRequest, error)
-	nextMutation    func(context.Context) (*MutateRequest, error)
-	pendingRead     *pb.ReadRequest
-	pendingMutation *pb.MutateRequest
-	index           uint64
-	eof             bool
-}
-
-func (source *recordSource) next(ctx context.Context) (*pb.ReadRequest, *pb.MutateRequest, error) {
-	if source.pendingRead != nil || source.pendingMutation != nil {
-		read, mutation := source.pendingRead, source.pendingMutation
-		source.pendingRead, source.pendingMutation = nil, nil
-		return read, mutation, nil
-	}
-	if source.nextRead != nil {
-		read, err := source.nextRead(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := protocol.ValidateReadRequest(read); err != nil {
-			return nil, nil, err
-		}
-		return read, nil, nil
-	}
-	input, err := source.nextMutation(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	mutation, err := wireMutation(input)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := protocol.ValidateMutationRequest(mutation); err != nil {
-		return nil, nil, err
-	}
-	return nil, mutation, nil
-}
-
-func (source *recordSource) frame(ctx context.Context) (*pb.ExecuteRequest, error) {
-	if source.eof {
-		return nil, io.EOF
-	}
-	command := &pb.Command{}
-	readBatch := &pb.ReadBatch{}
-	mutationBatch := &pb.MutationBatch{}
-	if source.nextRead != nil {
-		command.Operation = &pb.Command_Read{Read: readBatch}
-	} else {
-		command.Operation = &pb.Command_Mutate{Mutate: mutationBatch}
-	}
-	count, batchBytes := 0, 0
-	for count < protocol.MaxRecordFrameItems {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		read, mutation, err := source.next(ctx)
-		if errors.Is(err, io.EOF) {
-			source.eof = true
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("request %d: %w", source.index+uint64(count)+1, err)
-		}
-		itemBytes := 0
-		if read != nil {
-			itemBytes = proto.Size(read)
-		} else {
-			itemBytes = proto.Size(mutation)
-		}
-		nextBytes := batchBytes + protowire.SizeTag(1) + protowire.SizeBytes(itemBytes)
-		commandBytes := protowire.SizeTag(1) + protowire.SizeBytes(nextBytes)
-		if commandBytes > protocol.MaxRecordFrameBytes {
-			if count == 0 {
-				return nil, errors.New("record exceeds frame byte budget")
-			}
-			source.pendingRead, source.pendingMutation = read, mutation
-			break
-		}
-		if source.index >= math.MaxUint64-uint64(count)-1 {
-			return nil, errors.New("record ordinal exhausted")
-		}
-		if read != nil {
-			readBatch.Requests = append(readBatch.Requests, read)
-		} else {
-			mutationBatch.Requests = append(mutationBatch.Requests, mutation)
-		}
-		count++
-		batchBytes = nextBytes
-	}
-	if count == 0 {
-		return nil, io.EOF
-	}
-	frame := &pb.ExecuteRequest{StoreName: source.store, Index: source.index + 1, Command: command}
-	source.index += uint64(count)
-	return frame, nil
-}
-
 type recordStreamOptions struct {
-	source  *recordSource
+	store   string
+	next    func(context.Context) (*pb.Command, error)
 	consume func(context.Context, *pb.ExecuteResponse) error
 }
+
+// These SDK backpressure bounds are independent of the public wire contract.
+const recordWindowItems = 32
+const recordWindowBytes = 8 << 20
 
 type recordSendResult struct {
 	count uint64
@@ -178,7 +109,7 @@ type recordSendResult struct {
 }
 
 func recordStream(ctx context.Context, client pb.StoreServiceClient, options recordStreamOptions) error {
-	if client == nil || !protocol.ValidStoreName(options.source.store) {
+	if client == nil || !protocol.ValidStoreName(options.store) {
 		return errors.New("Execute requires a client and valid Store")
 	}
 	if err := ctx.Err(); err != nil {
@@ -192,8 +123,8 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 	}
 	// Calling Context commits this attempt, disabling transparent write replay.
 	_ = stream.Context()
-	credits := make(chan struct{}, 2)
-	ends := make(chan uint64, cap(credits))
+	sizes := make(chan int, recordWindowItems)
+	released := make(chan int, recordWindowItems)
 	done := make(chan recordSendResult, 1)
 	var submitted atomic.Uint64
 	var finishedInput atomic.Bool
@@ -207,16 +138,26 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			}
 			done <- result
 		}()
+		inflight, bytes := 0, 0
 		for {
-			select {
-			case credits <- struct{}{}:
-			case <-ctx.Done():
-				result.err = ctx.Err()
+			// Stop producing when the item window fills. A size-dependent wait
+			// below can retain only the current unsent item.
+			for inflight == recordWindowItems {
+				select {
+				case size := <-released:
+					inflight--
+					bytes -= size
+				case <-ctx.Done():
+					result.err = ctx.Err()
+					return
+				}
+			}
+			if err := ctx.Err(); err != nil {
+				result.err = err
 				return
 			}
-			frame, err := options.source.frame(ctx)
+			command, err := options.next(ctx)
 			if errors.Is(err, io.EOF) {
-				<-credits
 				if result.count == 0 {
 					result.err = errors.New("Execute requires at least one record")
 					return
@@ -226,19 +167,49 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 				return
 			}
 			if err != nil {
+				result.err = fmt.Errorf("request %d: %w", result.count+1, err)
+				return
+			}
+			if result.count == math.MaxUint64-1 {
+				result.err = errors.New("record ordinal exhausted")
+				return
+			}
+			request := &pb.ExecuteRequest{StoreName: options.store, Index: result.count + 1, Command: command}
+			size := proto.Size(request)
+			if size > protocol.MaxExecuteRequestBytes {
+				result.err = errors.New("record exceeds request byte bound")
+				return
+			}
+			// A legal item larger than the byte window proceeds alone. Ordinary
+			// items wait for individual acknowledgements to return byte credit.
+			for inflight > 0 && size > recordWindowBytes-bytes {
+				select {
+				case credit := <-released:
+					inflight--
+					bytes -= credit
+				case <-ctx.Done():
+					result.err = ctx.Err()
+					return
+				}
+			}
+			if err := ctx.Err(); err != nil {
 				result.err = err
 				return
 			}
-			result.count = options.source.index
-			ends <- result.count
+			// Register before Send: Recv can observe the response before Send
+			// returns. Only the receiver publishes acknowledged byte credit.
+			sizes <- size
+			inflight++
+			bytes += size
+			result.count = request.Index
 			submitted.Store(result.count)
-			if err := stream.Send(frame); err != nil {
+			if err := stream.Send(request); err != nil {
 				result.err = err
 				return
 			}
 		}
 	}()
-	var received, frameEnd uint64
+	var received uint64
 	var receiveErr error
 	for {
 		response, err := stream.Recv()
@@ -260,18 +231,12 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			receiveErr = errors.New("Execute response ordinal is missing, duplicated or unexpected")
 			break
 		}
-		if frameEnd == 0 {
-			frameEnd = <-ends
-		}
 		if err := options.consume(ctx, response); err != nil {
 			receiveErr = err
 			break
 		}
 		received++
-		if received == frameEnd {
-			<-credits
-			frameEnd = 0
-		}
+		released <- <-sizes
 	}
 	if receiveErr != nil {
 		cancel()

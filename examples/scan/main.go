@@ -36,7 +36,7 @@ func run() error {
 	request := &weir.ScanRequest{Resource: *resource, PageSize: uint32(*pageSize)}
 	options := weir.ScanOptions{StoreName: *storeName, Request: request}
 	options.Consume = func(ctx context.Context, document *weir.Document) error {
-		fmt.Printf("document: media=%s bytes=%d\n", document.MediaType, len(document.Data))
+		fmt.Printf("document: media=%s bytes=%d\n", document.ContentType, len(document.Data))
 		// Process and discard each document. Retrying a page can repeat documents,
 		// so a persistent consumer should commit output and its checkpoint together.
 		return ctx.Err()

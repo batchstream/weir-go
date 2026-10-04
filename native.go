@@ -12,8 +12,8 @@ type SearchHTTPRequest = spb.Request
 type SearchHTTPHeader = spb.Header
 type SearchHTTPResponse = spb.Response
 
-const SearchHTTPMediaType = "application/vnd.weir.search-http.v1+protobuf"
-const MongoCommandMediaType = "application/vnd.weir.mongodb-command.v1+protobuf"
+const SearchHTTPContentType = "application/vnd.weir.search-http.v1+protobuf"
+const MongoCommandContentType = "application/vnd.weir.mongodb-command.v1+protobuf"
 
 // SearchHTTPDescriptor encodes the bounded HTTP metadata for a Native request.
 // The request body remains NativeRequest.Body and is not buffered here.
@@ -25,14 +25,14 @@ func SearchHTTPDescriptor(request *SearchHTTPRequest) (*Document, error) {
 	if err != nil {
 		return nil, err
 	}
-	document := &Document{MediaType: SearchHTTPMediaType, Data: data}
+	document := &Document{ContentType: SearchHTTPContentType, Data: data}
 	return document, nil
 }
 
 // DecodeSearchHTTPResponse reads NativeHead.Metadata. HTTP status describes the
 // backend response; it does not establish mutation success or RPC completion.
 func DecodeSearchHTTPResponse(metadata *Document) (*SearchHTTPResponse, error) {
-	if metadata == nil || metadata.MediaType != SearchHTTPMediaType || len(metadata.Data) > protocol.NativeDescriptor {
+	if metadata == nil || metadata.ContentType != SearchHTTPContentType || len(metadata.Data) > protocol.NativeDescriptor {
 		return nil, errors.New("invalid Search HTTP response metadata")
 	}
 	response := &SearchHTTPResponse{}

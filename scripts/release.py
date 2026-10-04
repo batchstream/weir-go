@@ -64,7 +64,7 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     _, _ = client.ReadOne(ctx, readOptions)
     reads := weir.ReadOptions{StoreName: "records", Requests: []*weir.ReadRequest{read, read}}
     _, _ = client.Read(ctx, reads)
-    document := &weir.Document{MediaType: "application/json", Data: []byte(`{}`)}
+    document := &weir.Document{ContentType: "application/json", Data: []byte(`{}`)}
     mutation := &weir.MutateRequest{Resource: read.Resource, Action: weir.MutationPut, Document: document}
     mutations := weir.MutateOptions{StoreName: "records", Requests: []*weir.MutateRequest{mutation}}
     _, _ = client.Mutate(ctx, mutations)

@@ -24,7 +24,6 @@ type clientTestPeer struct {
 	pb.UnimplementedStoreServiceServer
 	mode      string
 	streams   atomic.Int64
-	frames    atomic.Int64
 	maxBytes  atomic.Int64
 	received  atomic.Int64
 	mutations chan *pb.MutateRequest
@@ -47,10 +46,9 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 		if err := protocol.ValidateExecuteRequest(request); err != nil {
 			return status.Error(codes.InvalidArgument, err.Error())
 		}
-		p.frames.Add(1)
-		frameBytes := int64(proto.Size(request.Command))
-		for previous := p.maxBytes.Load(); frameBytes > previous; previous = p.maxBytes.Load() {
-			if p.maxBytes.CompareAndSwap(previous, frameBytes) {
+		requestBytes := int64(proto.Size(request))
+		for previous := p.maxBytes.Load(); requestBytes > previous; previous = p.maxBytes.Load() {
+			if p.maxBytes.CompareAndSwap(previous, requestBytes) {
 				break
 			}
 		}
@@ -62,11 +60,11 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 		}
 		switch {
 		case request.Command.GetRead() != nil:
-			if err := p.readFrame(request, stream); err != nil {
+			if err := p.readRecord(request, stream); err != nil {
 				return err
 			}
 		case request.Command.GetMutate() != nil:
-			if err := p.mutationFrame(request, stream); err != nil {
+			if err := p.mutationRecord(request, stream); err != nil {
 				return err
 			}
 		default:
@@ -82,100 +80,91 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 	}
 }
 
-func (p *clientTestPeer) readFrame(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
-	items := request.Command.GetRead().Requests
-	p.received.Add(int64(len(items)))
+func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+	p.received.Add(1)
 	if p.mode == "blocked_receive" {
 		<-stream.Context().Done()
 		close(p.canceled)
 		return stream.Context().Err()
 	}
-	for offset := range items {
-		index := request.Index + uint64(offset)
-		document := &Document{MediaType: "application/octet-stream", Data: bytes.Repeat([]byte{37}, 257<<10)}
-		if p.mode == "large_duplex" {
-			document.Data = bytes.Repeat([]byte{37}, 1<<20)
-		}
-		if strings.HasPrefix(p.mode, "batch_") {
-			document.MediaType, document.Data = "application/json", []byte(fmt.Sprintf(`{"id":%d}`, index))
-		}
-		read := protocol.ReadDocument(document)
-		if p.mode == "read_missing" || strings.HasPrefix(p.mode, "batch_") && index == 2 {
-			read = protocol.Missing()
-		}
-		if p.mode == "read_failure" || strings.HasPrefix(p.mode, "batch_") && index == 3 {
-			read = protocol.ReadFailure(protocol.Fail(FailurePermissionDenied, "denied"))
-		}
-		switch p.mode {
-		case "invalid_result":
-			read = &pb.ReadResult{}
-		case "unknown_fields":
-			read.ProtoReflect().SetUnknown([]byte{0x20, 1})
-		case "missing_result":
-			continue
-		}
-		value := &pb.Event_ReadResult{ReadResult: read}
-		event := &pb.Event{Value: value}
-		response := &pb.ExecuteResponse{Index: index, Event: event}
-		switch p.mode {
-		case "zero_index":
-			response.Index = 0
-		case "skipped_index":
-			response.Index++
-		case "wrong_kind":
-			response.Event.Value = &pb.Event_MutationResult{MutationResult: protocol.Mutation(MutationApplied, nil)}
-		}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-		if p.mode == "duplicate_index" {
-			return stream.Send(response)
-		}
+	index := request.Index
+	document := &Document{ContentType: "application/octet-stream", Data: bytes.Repeat([]byte{37}, 257<<10)}
+	if p.mode == "large_duplex" {
+		document.Data = bytes.Repeat([]byte{37}, 1<<20)
 	}
-	if p.mode == "extra_result" {
-		value := &pb.Event_ReadResult{ReadResult: protocol.Missing()}
-		event := &pb.Event{Value: value}
-		response := &pb.ExecuteResponse{Index: request.Index + uint64(len(items)), Event: event}
+	if strings.HasPrefix(p.mode, "batch_") {
+		document.ContentType, document.Data = "application/json", []byte(fmt.Sprintf(`{"id":%d}`, index))
+	}
+	read := protocol.ReadDocument(document)
+	if p.mode == "read_missing" || strings.HasPrefix(p.mode, "batch_") && index == 2 {
+		read = protocol.Missing()
+	}
+	if p.mode == "read_failure" || strings.HasPrefix(p.mode, "batch_") && index == 3 {
+		read = protocol.ReadFailure(protocol.Fail(FailurePermissionDenied, "denied"))
+	}
+	switch p.mode {
+	case "invalid_result":
+		read = &pb.ReadResult{}
+	case "unknown_fields":
+		read.ProtoReflect().SetUnknown([]byte{0x20, 1})
+	case "missing_result":
+		return nil
+	}
+	value := &pb.Event_ReadResult{ReadResult: read}
+	event := &pb.Event{Value: value}
+	response := &pb.ExecuteResponse{Index: index, Event: event}
+	switch p.mode {
+	case "zero_index":
+		response.Index = 0
+	case "skipped_index":
+		response.Index++
+	case "wrong_kind":
+		response.Event.Value = &pb.Event_MutationResult{MutationResult: protocol.Mutation(MutationApplied, nil)}
+	}
+	if err := stream.Send(response); err != nil {
+		return err
+	}
+	if p.mode == "duplicate_index" {
+		return stream.Send(response)
+	}
+	if p.mode == "extra_result" && index == 2 {
+		response.Index++
 		return stream.Send(response)
 	}
 	return nil
 }
 
-func (p *clientTestPeer) mutationFrame(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
-	items := request.Command.GetMutate().Requests
-	p.received.Add(int64(len(items)))
+func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+	p.received.Add(1)
 	if p.mode == "blocked_mutation" {
 		<-stream.Context().Done()
 		close(p.canceled)
 		return stream.Context().Err()
 	}
-	for offset, item := range items {
-		if p.mutations != nil {
-			p.mutations <- item
-		}
-		if p.mode == "write_reply_loss" || p.mode == "write_end_failure" {
-			return status.Error(codes.Unavailable, "applied but response lost")
-		}
-		index := request.Index + uint64(offset)
-		result := protocol.Mutation(MutationApplied, nil)
-		if strings.HasPrefix(p.mode, "batch_") && index == 2 {
-			result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailureConflict, "conflict"))
-		}
-		switch p.mode {
-		case "invalid_outcome":
-			result.Outcome = MutationUnknown
-		case "applied_failure":
-			result.Failure = protocol.Fail(FailureUnavailable, "replica acknowledgement failed")
-		}
-		value := &pb.Event_MutationResult{MutationResult: result}
-		event := &pb.Event{Value: value}
-		response := &pb.ExecuteResponse{Index: index, Event: event}
-		if err := stream.Send(response); err != nil {
-			return err
-		}
-		if p.mode == "batch_partial" {
-			return status.Error(codes.Unavailable, "later mutation response lost")
-		}
+	if p.mutations != nil {
+		p.mutations <- request.Command.GetMutate()
+	}
+	if p.mode == "write_reply_loss" || p.mode == "write_end_failure" {
+		return status.Error(codes.Unavailable, "applied but response lost")
+	}
+	result := protocol.Mutation(MutationApplied, nil)
+	if strings.HasPrefix(p.mode, "batch_") && request.Index == 2 {
+		result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailureConflict, "conflict"))
+	}
+	switch p.mode {
+	case "invalid_outcome":
+		result.Outcome = MutationUnknown
+	case "applied_failure":
+		result.Failure = protocol.Fail(FailureUnavailable, "replica acknowledgement failed")
+	}
+	value := &pb.Event_MutationResult{MutationResult: result}
+	event := &pb.Event{Value: value}
+	response := &pb.ExecuteResponse{Index: request.Index, Event: event}
+	if err := stream.Send(response); err != nil {
+		return err
+	}
+	if p.mode == "batch_partial" {
+		return status.Error(codes.Unavailable, "later mutation response lost")
 	}
 	return nil
 }
@@ -221,7 +210,7 @@ func TestReadRejectsMalformedStreamWithoutEvidence(t *testing.T) {
 func TestPutLostResponseHasNoAcknowledgementOrReplay(t *testing.T) {
 	peer := &clientTestPeer{mode: "write_reply_loss"}
 	client := clientTestConnection(t, peer)
-	document := &Document{MediaType: "application/json", Data: []byte(`{}`)}
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
 	request := &WriteRequest{Resource: "records/s:key", Document: document}
 	options := WriteOptions{StoreName: "records", Request: request}
 	result, err := Put(t.Context(), client, options)
@@ -276,7 +265,7 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error
 		count = 2
 	}
 	for range count {
-		document := &Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+		document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
 		value := &pb.Event_Document{Document: document}
 		event := &pb.Event{Value: value}
 		frame := &pb.ExecuteResponse{Index: 1, Event: event}
