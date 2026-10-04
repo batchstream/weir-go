@@ -12,7 +12,7 @@ import (
 )
 
 func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
-	for _, mode := range []string{"read_missing", "read_failure"} {
+	for _, mode := range []string{"read_missing", "read_failure", "read_target_missing"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
@@ -26,6 +26,9 @@ func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
 			}
 			if mode == "read_failure" && (result.Missing || result.Failure.GetCode() != FailurePermissionDenied) {
 				t.Fatal("Read lost failure evidence", result)
+			}
+			if mode == "read_target_missing" && (result.Missing || result.Failure.GetCode() != FailureTargetNotFound) {
+				t.Fatal("missing backend target became successful document absence", result)
 			}
 		})
 	}
@@ -66,8 +69,8 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 			options := DeleteOptions{StoreName: "records", Request: request}
 			result, err = Delete(ctx, client, options)
 		case "transform":
-			program := &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
-			request := &AtomicTransformRequest{Resource: "records/s:key", Program: program}
+			program := &LuaTransform{Source: []byte("return doc")}
+			request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
 			result, err = AtomicTransform(ctx, client, options)
 		}
@@ -89,7 +92,7 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 		case "delete":
 			selected = mutation.GetDelete() != nil
 		case "transform":
-			selected = mutation.GetAtomicTransform().GetProgram() != nil
+			selected = mutation.GetAtomicTransform().GetLua() != nil
 		}
 		if !selected {
 			t.Fatal("SDK executed a different mutation", action, mutation)
@@ -107,7 +110,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 			client := clientTestConnection(t, peer)
 			request := &AtomicTransformRequest{Resource: "records/s:key"}
 			if both {
-				request.Program = &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
+				request.Lua = &LuaTransform{Source: []byte("return doc")}
 				request.BackendExpression = &Document{ContentType: "application/json", Data: []byte(`{}`)}
 			}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
@@ -123,24 +126,57 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 	}
 }
 
-func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) nativeExecute(request *pb.NativeRequest, stream pb.StoreService_ExecuteServer) error {
 	head := &pb.NativeHead{BodyContentType: "application/octet-stream"}
+	if request.GetSearchHttp() != nil {
+		head.Http = &SearchHTTPResponse{StatusCode: 200}
+	}
+	if p.mode == "native_wrong_metadata" {
+		if head.Http != nil {
+			head.Http = nil
+		} else {
+			head.Http = &SearchHTTPResponse{StatusCode: 200}
+		}
+	}
+	if p.mode == "native_http_error" {
+		head.Http.StatusCode = 404
+	}
+	if p.mode == "native_invalid_http_status" {
+		head.Http.StatusCode = 0
+	}
 	headValue := &pb.Event_Head{Head: head}
 	headEvent := &pb.Event{Value: headValue}
-	emptyValue := &pb.Event_Chunk{}
-	emptyEvent := &pb.Event{Value: emptyValue}
 	chunkValue := &pb.Event_Chunk{Chunk: []byte("bounded native bytes")}
 	chunkEvent := &pb.Event{Value: chunkValue}
 	end := &pb.NativeEnd{Completion: pb.NativeCompletion_RESPONSE_COMPLETE}
+	if p.mode == "native_not_started" || p.mode == "native_not_started_after_head" || p.mode == "native_not_started_after_chunk" {
+		end.Completion = NativeNotStarted
+		end.Failure = &Failure{Code: FailureUnavailable, Message: "not started"}
+	}
+	if p.mode == "native_incomplete" || p.mode == "native_incomplete_without_head" {
+		end.Completion = NativeResponseIncomplete
+		end.Failure = &Failure{Code: FailureUnavailable, Message: "response incomplete"}
+	}
 	endValue := &pb.Event_NativeEnd{NativeEnd: end}
 	endEvent := &pb.Event{Value: endValue}
 	events := []*pb.Event{headEvent, chunkEvent, endEvent}
-	if p.mode == "native_empty_chunk" {
+	switch p.mode {
+	case "native_empty_chunk":
+		emptyValue := &pb.Event_Chunk{}
+		emptyEvent := &pb.Event{Value: emptyValue}
 		events = []*pb.Event{headEvent, emptyEvent, endEvent}
+	case "native_empty_response", "native_not_started_after_head":
+		events = []*pb.Event{headEvent, endEvent}
+	case "native_not_started", "native_incomplete_without_head", "native_complete_without_head":
+		events = []*pb.Event{endEvent}
+	case "native_duplicate_head":
+		events = []*pb.Event{headEvent, headEvent, chunkEvent, endEvent}
+	case "native_chunk_before_head":
+		events = []*pb.Event{chunkEvent, headEvent, endEvent}
 	}
 	for _, event := range events {
-		frame := &pb.ExecuteResponse{Index: 1, Event: event}
-		if err := stream.Send(frame); err != nil {
+		response := &pb.ExecuteResponse{Index: 1, Event: event}
+		if err := stream.Send(response); err != nil {
 			return err
 		}
 	}
@@ -150,68 +186,104 @@ func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) err
 	return nil
 }
 
-func TestNativeIncrementalEventsPreserveTerminalEvidence(t *testing.T) {
-	for _, mode := range []string{"native_normal", "native_final_status_error", "native_consumer_terminal_error"} {
-		t.Run(mode, func(t *testing.T) {
-			peer := &clientTestPeer{mode: mode}
+func clientTestNativeRequest() *NativeRequest {
+	http := &SearchHTTPRequest{Method: "GET", Path: "/_doc/id"}
+	request := &NativeRequest{Resource: "records", SearchHTTP: http}
+	return request
+}
+
+func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
+	cases := []struct {
+		mode       string
+		completion NativeCompletion
+		chunks     int
+		response   bool
+		failure    bool
+		rpcError   bool
+	}{
+		{mode: "native_normal", completion: NativeResponseComplete, chunks: 1, response: true},
+		{mode: "native_empty_response", completion: NativeResponseComplete, response: true},
+		{mode: "native_http_error", completion: NativeResponseComplete, chunks: 1, response: true},
+		{mode: "native_not_started", completion: NativeNotStarted, failure: true},
+		{mode: "native_incomplete", completion: NativeResponseIncomplete, chunks: 1, response: true, failure: true},
+		{mode: "native_incomplete_without_head", completion: NativeResponseIncomplete, failure: true},
+		{mode: "native_final_status_error", completion: NativeResponseComplete, chunks: 1, response: true, rpcError: true},
+		{mode: "native_consumer_chunk_error", completion: NativeCompletionUnconfirmed, chunks: 1, response: true, rpcError: true},
+	}
+	for _, test := range cases {
+		t.Run(test.mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: test.mode}
 			client := clientTestConnection(t, peer)
-			descriptor := &Document{ContentType: "application/vnd.weir.search-http.v1+protobuf"}
-			request := &NativeRequest{Resource: "records", Descriptor: descriptor}
-			chunks, heads, terminals, bytes := 0, 0, 0, 0
-			failure := errors.New("terminal consumer rejected output")
-			options := NativeOptions{StoreName: "records", Request: request}
-			options.Consume = func(_ context.Context, event *Event) error {
-				if event.Head != nil {
-					heads++
+			options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+			chunks := 0
+			failure := errors.New("consumer rejected body")
+			options.Consume = func(_ context.Context, response *NativeResponse, data []byte) error {
+				chunks++
+				expectedStatus := uint32(200)
+				if test.mode == "native_http_error" {
+					expectedStatus = 404
 				}
-				if event.Chunk != nil {
-					chunks++
-					bytes += len(event.Chunk)
+				if response.GetHttp().GetStatusCode() != expectedStatus || string(data) != "bounded native bytes" {
+					t.Fatal("body did not carry its typed response metadata", response, data)
 				}
-				if event.NativeEnd != nil {
-					terminals++
-					if mode == "native_consumer_terminal_error" {
-						return failure
-					}
+				if test.mode == "native_consumer_chunk_error" {
+					return failure
 				}
 				return nil
 			}
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			end, err := Native(ctx, client, options)
-			if end.GetCompletion() != NativeResponseComplete || heads != 1 || chunks != 1 || terminals != 1 || bytes != len("bounded native bytes") {
-				t.Fatal("Native incremental evidence was lost", end, err, heads, chunks, terminals, bytes)
+			result, err := Native(t.Context(), client, options)
+			if result == nil || result.Completion != test.completion || (result.Response != nil) != test.response || (result.Failure != nil) != test.failure || chunks != test.chunks || (err != nil) != test.rpcError {
+				t.Fatal("Native conflated body, completion and RPC evidence", result, err, chunks)
 			}
-			if mode == "native_normal" && err != nil || mode != "native_normal" && err == nil {
-				t.Fatal("Native conflated evidence and RPC success", err)
-			}
-			if mode == "native_consumer_terminal_error" && !errors.Is(err, failure) {
-				t.Fatal("Native lost callback error", err)
+			if test.mode == "native_consumer_chunk_error" && !errors.Is(err, failure) {
+				t.Fatal("consumer cause lost", err)
 			}
 			if peer.received.Load() != 1 {
-				t.Fatal("Native request was replayed", peer.received.Load())
+				t.Fatal("Native request replayed", peer.received.Load())
 			}
 		})
 	}
 }
 
-func TestNativeRejectsEmptyWireChunk(t *testing.T) {
-	peer := &clientTestPeer{mode: "native_empty_chunk"}
-	client := clientTestConnection(t, peer)
-	descriptor := &Document{ContentType: "application/vnd.weir.search-http.v1+protobuf"}
-	request := &NativeRequest{Resource: "records", Descriptor: descriptor}
-	chunks := 0
-	options := NativeOptions{StoreName: "records", Request: request}
-	options.Consume = func(_ context.Context, event *Event) error {
-		if event.Chunk != nil {
-			chunks++
-		}
-		return nil
+func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
+	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_wrong_metadata", "native_invalid_http_status"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+			chunks := 0
+			options.Consume = func(context.Context, *NativeResponse, []byte) error { chunks++; return nil }
+			result, err := Native(t.Context(), client, options)
+			if err == nil || result != nil && result.Completion != NativeCompletionUnconfirmed {
+				t.Fatal("invalid completion evidence exposed", result, err)
+			}
+			expectedChunks := 0
+			if mode == "native_not_started_after_chunk" {
+				expectedChunks = 1
+			}
+			if chunks != expectedChunks {
+				t.Fatal("malformed body exposed", chunks)
+			}
+		})
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	end, err := Native(ctx, client, options)
-	if err == nil || end != nil || chunks != 0 {
-		t.Fatal("invalid empty wire chunk was exposed", end, err, chunks)
+}
+
+func TestNativeRejectsRequestSelectionBeforeRPC(t *testing.T) {
+	http := &SearchHTTPRequest{Method: "GET", Path: "/_doc/id"}
+	for _, request := range []*NativeRequest{
+		{Resource: "records"},
+		{Resource: "records", MongoDBCommand: []byte{}},
+		{Resource: "records", MongoDBCommand: []byte{1}, SearchHTTP: http},
+	} {
+		peer := &clientTestPeer{}
+		client := clientTestConnection(t, peer)
+		options := NativeOptions{StoreName: "records", Request: request}
+		options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
+		if result, err := Native(t.Context(), client, options); err == nil || result != nil {
+			t.Fatal("invalid backend request selection accepted", result, err)
+		}
+		if peer.streams.Load() != 0 {
+			t.Fatal("invalid request opened an RPC")
+		}
 	}
 }

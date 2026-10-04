@@ -519,7 +519,10 @@ func (c *Client) storeClient(store string) (pb.StoreServiceClient, error) {
 	entry.mu.RLock()
 	defer entry.mu.RUnlock()
 	if !time.Now().Before(entry.expires) {
-		return nil, fmt.Errorf("Store %s discovery is unavailable or expired: %v", store, entry.err)
+		if entry.err != nil {
+			return nil, fmt.Errorf("Store %s discovery is unavailable or expired: %w", store, entry.err)
+		}
+		return nil, status.Errorf(codes.Unavailable, "Store %s discovery lease expired", store)
 	}
 	return pb.NewStoreServiceClient(entry.channel.connection), nil
 }
@@ -580,7 +583,7 @@ func (c *Client) Scan(ctx context.Context, options ScanOptions) (*ScanEnd, error
 	return Scan(ctx, client, options)
 }
 
-func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeEnd, error) {
+func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err

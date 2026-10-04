@@ -26,26 +26,18 @@ func run() error {
 	flag.Parse()
 
 	request := &weir.NativeRequest{}
-	var body []byte
 	switch *store {
 	case "mongo":
 		request.Resource = weir.EncodeSegment(*database) + "/records"
-		request.Descriptor = &weir.Document{ContentType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		request.BodyContentType = "application/bson"
 		command := bson.D{{Key: "count", Value: "records"}}
 		var err error
-		body, err = bson.Marshal(command)
+		request.MongoDBCommand, err = bson.Marshal(command)
 		if err != nil {
 			return err
 		}
 	case "search":
 		request.Resource = weir.EncodeSegment(*index)
-		descriptor := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
-		encoded, err := weir.SearchHTTPDescriptor(descriptor)
-		if err != nil {
-			return err
-		}
-		request.Descriptor = encoded
+		request.SearchHTTP = &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
 	default:
 		return fmt.Errorf("unsupported store")
 	}
@@ -58,24 +50,26 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	request.Body = body
 	total := 0
 	opts := weir.NativeOptions{StoreName: *store, Request: request}
-	opts.Consume = func(_ context.Context, event *weir.Event) error {
-		if head := event.Head; head != nil {
-			fmt.Printf("metadata=%v media=%s\n", head.Metadata, head.BodyContentType)
-		}
-		total += len(event.Chunk)
-		// Consume native bytes here without collecting the entire response.
+	opts.Consume = func(_ context.Context, response *weir.NativeResponse, data []byte) error {
+		fmt.Printf("HTTP=%v content-type=%s chunk=%d bytes\n", response.Http, response.BodyContentType, len(data))
+		total += len(data)
+		// Consume and discard each chunk instead of retaining the whole response.
 		return nil
 	}
-	terminal, err := client.Native(ctx, opts)
+	result, err := client.Native(ctx, opts)
+	if result != nil && result.Completion == weir.NativeNotStarted {
+		return fmt.Errorf("native request was not started: %v; RPC error=%v", result.Failure, err)
+	}
 	if err != nil {
-		return fmt.Errorf("native response incomplete; effects indeterminate: %w", err)
+		return fmt.Errorf("native response failed; retained evidence=%v: %w", result, err)
 	}
-	if terminal == nil || terminal.Completion != weir.NativeResponseComplete {
-		return fmt.Errorf("native exchange: %v; effects indeterminate", terminal)
+	if result == nil || result.Completion != weir.NativeResponseComplete {
+		return fmt.Errorf("native response incomplete: %v; reconcile any possible writes before retrying", result)
 	}
-	fmt.Printf("complete native response: %d bytes\n", total)
+	fmt.Printf("complete native response: HTTP=%v content-type=%s %d bytes\n", result.Response.Http, result.Response.BodyContentType, total)
+	// A complete HTTP/BSON response can describe a backend error. Inspect that
+	// response separately before deciding whether the business operation succeeded.
 	return nil
 }

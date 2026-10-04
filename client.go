@@ -62,6 +62,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 		state.pageSize = protocol.ScanPageSize(scan)
 	} else {
 		state.kind = "native"
+		state.nativeHTTP = request.Command.GetNative().GetSearchHttp() != nil
 	}
 	for {
 		response, err := stream.Recv()
@@ -96,11 +97,12 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 }
 
 type streamState struct {
-	kind      string
-	terminal  bool
-	head      bool
-	documents uint64
-	pageSize  uint64
+	kind       string
+	terminal   bool
+	head       bool
+	documents  uint64
+	pageSize   uint64
+	nativeHTTP bool
 }
 
 func (s *streamState) validate(event *pb.Event) error {
@@ -119,7 +121,7 @@ func (s *streamState) validate(event *pb.Event) error {
 		}
 		s.terminal = true
 	case *pb.Event_Head:
-		if s.kind != "native" || s.head {
+		if s.kind != "native" || s.head || s.nativeHTTP != (value.Head.Http != nil) {
 			return errors.New("invalid Native response head")
 		}
 		s.head = true
@@ -128,7 +130,7 @@ func (s *streamState) validate(event *pb.Event) error {
 			return errors.New("Native chunk before head")
 		}
 	case *pb.Event_NativeEnd:
-		if s.kind != "native" || value.NativeEnd.Completion == NativeResponseComplete && !s.head {
+		if s.kind != "native" || value.NativeEnd.Completion == NativeResponseComplete && !s.head || value.NativeEnd.Completion == NativeNotStarted && s.head {
 			return errors.New("invalid Native completion")
 		}
 		s.terminal = true

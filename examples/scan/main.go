@@ -5,9 +5,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	weir "github.com/batchstream/weir-go"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func main() {
@@ -21,9 +23,36 @@ func run() error {
 	storeName := flag.String("store", "mongo", "logical Store")
 	resource := flag.String("resource", "weir_m1/records", "relative collection or index")
 	pageSize := flag.Uint("page-size", 128, "documents per page, 1 to 256")
+	filterText := flag.String("filter", "", "native filter object as JSON (Mongo Extended JSON or Search query)")
+	include := flag.String("include", "", "comma-separated field paths to include")
+	exclude := flag.String("exclude", "", "comma-separated field paths to exclude")
 	flag.Parse()
 	if *pageSize < 1 || *pageSize > 256 {
 		return fmt.Errorf("page-size must be between 1 and 256")
+	}
+	if *include != "" && *exclude != "" {
+		return fmt.Errorf("select include or exclude projection")
+	}
+	request := &weir.ScanRequest{Resource: *resource, PageSize: uint32(*pageSize)}
+	if *filterText != "" {
+		filter := &weir.Document{ContentType: "application/json", Data: []byte(*filterText)}
+		if *storeName == "mongo" {
+			var object bson.D
+			if err := bson.UnmarshalExtJSON(filter.Data, false, &object); err != nil {
+				return err
+			}
+			data, err := bson.Marshal(object)
+			if err != nil {
+				return err
+			}
+			filter.ContentType, filter.Data = "application/bson", data
+		}
+		request.Filter = filter
+	}
+	if *include != "" {
+		request.Projection = &weir.Projection{Mode: weir.ProjectionInclude, Fields: strings.Split(*include, ",")}
+	} else if *exclude != "" {
+		request.Projection = &weir.Projection{Mode: weir.ProjectionExclude, Fields: strings.Split(*exclude, ",")}
 	}
 	initialize, initializeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer initializeCancel()
@@ -33,7 +62,6 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	request := &weir.ScanRequest{Resource: *resource, PageSize: uint32(*pageSize)}
 	options := weir.ScanOptions{StoreName: *storeName, Request: request}
 	options.Consume = func(ctx context.Context, document *weir.Document) error {
 		fmt.Printf("document: media=%s bytes=%d\n", document.ContentType, len(document.Data))

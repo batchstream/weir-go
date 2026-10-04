@@ -134,7 +134,7 @@ func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
 	mutation := &pb.MutateRequest{Resource: request.Resource}
 	switch request.Action {
 	case MutationCreate, MutationPut, MutationReplace:
-		if request.Document == nil || request.Program != nil || request.BackendExpression != nil {
+		if request.Document == nil || request.Lua != nil || request.BackendExpression != nil {
 			return nil, errors.New("write requires only a document")
 		}
 		switch request.Action {
@@ -146,18 +146,18 @@ func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
 			mutation.Action = &pb.MutateRequest_Replace{Replace: request.Document}
 		}
 	case MutationDelete:
-		if request.Document != nil || request.Program != nil || request.BackendExpression != nil {
+		if request.Document != nil || request.Lua != nil || request.BackendExpression != nil {
 			return nil, errors.New("delete accepts no document or transform")
 		}
 		empty := &pb.Empty{}
 		mutation.Action = &pb.MutateRequest_Delete{Delete: empty}
 	case MutationAtomicTransform:
-		if request.Document != nil || (request.Program == nil) == (request.BackendExpression == nil) {
-			return nil, errors.New("AtomicTransform requires exactly one program or backend expression")
+		if request.Document != nil || (request.Lua == nil) == (request.BackendExpression == nil) {
+			return nil, errors.New("AtomicTransform requires exactly one Lua or backend expression")
 		}
 		transform := &pb.Transform{}
-		if request.Program != nil {
-			transform.Form = &pb.Transform_Program{Program: request.Program}
+		if request.Lua != nil {
+			transform.Form = &pb.Transform_Lua{Lua: request.Lua}
 		} else {
 			transform.Form = &pb.Transform_BackendExpression{BackendExpression: request.BackendExpression}
 		}

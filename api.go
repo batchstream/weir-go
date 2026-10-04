@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
+	searchpb "github.com/batchstream/weir-protocol/api/weir/search/v1"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
@@ -14,13 +15,17 @@ type Failure = pb.Failure
 type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome
-type ProgramTransform = pb.ProgramTransform
+type LuaTransform = pb.LuaTransform
 type ReadRequest = pb.ReadRequest
 type ScanRequest = pb.ScanRequest
 type ScanEnd = pb.ScanEnd
-type NativeHead = pb.NativeHead
-type NativeEnd = pb.NativeEnd
+type Projection = pb.Projection
+type ProjectionMode = pb.ProjectionMode
+type NativeResponse = pb.NativeHead
 type NativeCompletion = pb.NativeCompletion
+type SearchHTTPRequest = searchpb.HttpRequest
+type SearchHTTPHeader = searchpb.Header
+type SearchHTTPResponse = searchpb.HttpResponse
 
 const (
 	MutationNotStarted = pb.MutationOutcome_NOT_STARTED
@@ -28,14 +33,18 @@ const (
 	MutationApplied    = pb.MutationOutcome_APPLIED
 	MutationUnknown    = pb.MutationOutcome_UNKNOWN
 
-	NativeNotStarted         = pb.NativeCompletion_NATIVE_NOT_STARTED
-	NativeResponseComplete   = pb.NativeCompletion_RESPONSE_COMPLETE
-	NativeResponseIncomplete = pb.NativeCompletion_RESPONSE_INCOMPLETE
+	ProjectionInclude = pb.ProjectionMode_INCLUDE
+	ProjectionExclude = pb.ProjectionMode_EXCLUDE
+
+	NativeCompletionUnconfirmed = pb.NativeCompletion_NATIVE_COMPLETION_UNSPECIFIED
+	NativeNotStarted            = pb.NativeCompletion_NATIVE_NOT_STARTED
+	NativeResponseComplete      = pb.NativeCompletion_RESPONSE_COMPLETE
+	NativeResponseIncomplete    = pb.NativeCompletion_RESPONSE_INCOMPLETE
 
 	FailureInvalidArgument    = pb.FailureCode_INVALID_ARGUMENT
 	FailureUnauthenticated    = pb.FailureCode_UNAUTHENTICATED
 	FailurePermissionDenied   = pb.FailureCode_PERMISSION_DENIED
-	FailureNotFound           = pb.FailureCode_NOT_FOUND
+	FailureTargetNotFound     = pb.FailureCode_TARGET_NOT_FOUND
 	FailurePreconditionFailed = pb.FailureCode_PRECONDITION_FAILED
 	FailureConflict           = pb.FailureCode_CONFLICT
 	FailureUnsupported        = pb.FailureCode_UNSUPPORTED
@@ -58,18 +67,30 @@ type DeleteRequest struct {
 	Resource string
 }
 
-// AtomicTransformRequest requires exactly one of Program and BackendExpression.
+// AtomicTransformRequest requires exactly one of Lua and BackendExpression.
 type AtomicTransformRequest struct {
 	Resource          string
-	Program           *ProgramTransform
+	Lua               *LuaTransform
 	BackendExpression *Document
 }
 
+// NativeRequest requires exactly one backend request. MongoDBCommand contains a
+// BSON command document; SearchHTTP carries typed HTTP metadata and body bytes.
+// Keep all request data immutable until Native returns.
 type NativeRequest struct {
-	Resource        string
-	Descriptor      *Document
-	BodyContentType string
-	Body            []byte
+	Resource       string
+	MongoDBCommand []byte
+	SearchHTTP     *SearchHTTPRequest
+}
+
+// NativeResult retains validated response and completion evidence. Completion is
+// NativeCompletionUnconfirmed until a terminal acknowledgement arrives; Response
+// may already be available. An RPC error never revokes a confirmed terminal.
+// Completion describes response transport, not whether backend writes applied.
+type NativeResult struct {
+	Response   *NativeResponse
+	Completion NativeCompletion
+	Failure    *Failure
 }
 
 // ReadOneOptions describes a single read. Use ReadOptions to share one RPC across
@@ -99,12 +120,12 @@ const (
 )
 
 // MutateRequest describes one mutation. Create, Put and Replace require Document;
-// Delete accepts no payload; AtomicTransform requires Program or BackendExpression.
+// Delete accepts no payload; AtomicTransform requires Lua or BackendExpression.
 type MutateRequest struct {
 	Resource          string
 	Action            MutationAction
 	Document          *Document
-	Program           *ProgramTransform
+	Lua               *LuaTransform
 	BackendExpression *Document
 }
 
@@ -166,24 +187,21 @@ type ScanOptions struct {
 	Consume   func(context.Context, *Document) error
 }
 
-// Native consumes bounded response events incrementally. A terminal NativeEnd
-// remains evidence when a later transport failure is returned alongside it.
+// Native consumes only nonempty response chunks with their validated metadata.
+// Consume completes before the next chunk and must honor its context. An empty
+// response invokes no callback; its metadata is available in NativeResult. Do
+// not mutate response metadata, which remains attached to the final result.
 type NativeOptions struct {
 	StoreName string
 	Request   *NativeRequest
-	Consume   func(context.Context, *Event) error
+	Consume   func(context.Context, *NativeResponse, []byte) error
 }
 
+// ReadResult contains exactly one of Document, Missing, or Failure. Missing
+// confirms document absence after a successful read. FailureTargetNotFound
+// reports a missing backend collection/index, never a missing document.
 type ReadResult struct {
 	Document *Document
 	Missing  bool
 	Failure  *Failure
-}
-
-// Event contains exactly one validated Native response value. Chunks are
-// nonempty; a nil Chunk means a different event.
-type Event struct {
-	Head      *NativeHead
-	Chunk     []byte
-	NativeEnd *NativeEnd
 }
