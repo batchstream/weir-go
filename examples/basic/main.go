@@ -67,11 +67,11 @@ func run() error {
 		return fmt.Errorf("read RPC incomplete: %w", err)
 	}
 	for index, read := range reads {
-		if read.GetFailure() != nil {
-			return fmt.Errorf("read %d: %v", index, read.GetFailure())
+		if read.Failure != nil {
+			return fmt.Errorf("read %d: %v", index, read.Failure)
 		}
-		fmt.Printf("index=%d record=%d bytes missing=%t\n", index, len(read.GetDocument().GetData()), read.GetMissing())
+		fmt.Printf("index=%d record=%d bytes missing=%t\n", index, len(read.Document.GetData()), read.Missing)
 	}
-	fmt.Printf("completed %d reads with all request ends and final gRPC OK\n", *count)
+	fmt.Printf("completed %d reads with a validated unary response\n", *count)
 	return nil
 }

@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, direct unary Read/Mutate batches and incremental Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for deployment isolation and integration qualification.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, direct unary Read/Mutate batches and incremental Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -111,7 +111,7 @@ func main() {
         resolved = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir-go'], cwd=root, env=env))
         if resolved['Version'] != version or resolved.get('Replace'):
             raise ValueError('external consumer did not use the published module')
-        for example in ('read', 'basic', 'scan', 'native', 'soak'):
+        for example in ('read', 'basic', 'scan', 'native'):
             run(['go', 'install', f'github.com/batchstream/weir-go/examples/{example}@{version}'], cwd=root, env=env)
         print('Verified external module and example installation:', version, sha)
 

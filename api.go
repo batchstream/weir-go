@@ -8,7 +8,7 @@ import (
 )
 
 // Leaf DTOs preserve document bytes and backend evidence without exposing any
-// transport framing, version field, or protobuf operation selection.
+// transport framing or protobuf operation selection.
 type Document = pb.Document
 type Failure = pb.Failure
 type FailureCode = pb.FailureCode
@@ -158,74 +158,10 @@ type ReadResult struct {
 	Failure  *Failure
 }
 
-func (r *ReadResult) GetDocument() *Document {
-	if r == nil {
-		return nil
-	}
-	return r.Document
-}
-func (r *ReadResult) GetMissing() bool { return r != nil && r.Missing }
-func (r *ReadResult) GetFailure() *Failure {
-	if r == nil {
-		return nil
-	}
-	return r.Failure
-}
-
-// Event contains exactly one validated business value. Native chunks are
+// Event contains exactly one validated Native response value. Chunks are
 // nonempty; a nil Chunk means a different event.
 type Event struct {
-	Document  *Document
 	Head      *NativeHead
 	Chunk     []byte
-	ScanEnd   *ScanEnd
 	NativeEnd *NativeEnd
-}
-
-func (e *Event) GetDocument() *Document {
-	if e == nil {
-		return nil
-	}
-	return e.Document
-}
-func (e *Event) GetHead() *NativeHead {
-	if e == nil {
-		return nil
-	}
-	return e.Head
-}
-func (e *Event) GetChunk() []byte {
-	if e == nil {
-		return nil
-	}
-	return e.Chunk
-}
-func (e *Event) GetScanEnd() *ScanEnd {
-	if e == nil {
-		return nil
-	}
-	return e.ScanEnd
-}
-func (e *Event) GetNativeEnd() *NativeEnd {
-	if e == nil {
-		return nil
-	}
-	return e.NativeEnd
-}
-
-func businessEvent(wire *pb.Event) *Event {
-	event := &Event{}
-	switch value := wire.Value.(type) {
-	case *pb.Event_Document:
-		event.Document = value.Document
-	case *pb.Event_Head:
-		event.Head = value.Head
-	case *pb.Event_Chunk:
-		event.Chunk = value.Chunk
-	case *pb.Event_ScanEnd:
-		event.ScanEnd = value.ScanEnd
-	case *pb.Event_NativeEnd:
-		event.NativeEnd = value.NativeEnd
-	}
-	return event
 }

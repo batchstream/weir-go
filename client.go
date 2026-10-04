@@ -14,7 +14,7 @@ import (
 
 // execute consumes one finite Scan or Native request incrementally. Scan callers
 // expose a checkpoint only after the terminal event and final gRPC OK.
-func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.ExecuteRequest, consume func(context.Context, *Event) error) error {
+func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.ExecuteRequest, consume func(context.Context, *pb.Event) error) error {
 	if client == nil || consume == nil {
 		return errors.New("Execute requires a client and consumer")
 	}
@@ -26,7 +26,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := client.Execute(ctx, request, grpc.MaxCallSendMsgSize(protocol.MaxFrame), grpc.MaxCallRecvMsgSize(protocol.MaxResponse), grpc.MaxRetryRPCBufferSize(0))
+	stream, err := client.Execute(ctx, request, grpc.MaxCallSendMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxExecuteResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
 		return err
 	}
@@ -60,7 +60,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 		if err := state.validate(response.Event); err != nil {
 			return err
 		}
-		if err := consume(ctx, businessEvent(response.Event)); err != nil {
+		if err := consume(ctx, response.Event); err != nil {
 			return err
 		}
 	}
