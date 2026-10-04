@@ -73,7 +73,7 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 				return status.Error(codes.InvalidArgument, "single request did not close its input")
 			}
 			if request.Command.GetNative() != nil {
-				return p.nativeExecute(stream)
+				return p.nativeExecute(request.Command.GetNative(), stream)
 			}
 			return p.scanExecute(stream)
 		}
@@ -101,6 +101,9 @@ func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreS
 	}
 	if p.mode == "read_failure" || strings.HasPrefix(p.mode, "batch_") && index == 3 {
 		read = protocol.ReadFailure(protocol.Fail(FailurePermissionDenied, "denied"))
+	}
+	if p.mode == "read_target_missing" {
+		read = protocol.ReadFailure(protocol.Fail(FailureTargetNotFound, "backend target missing"))
 	}
 	switch p.mode {
 	case "invalid_result":

@@ -57,7 +57,7 @@ import (
     "io"
     weir "github.com/batchstream/weir-go"
 )
-// Compile the ordinary API using only SDK-owned request/result/event names.
+// Compile the ordinary API using only SDK-owned request and result names.
 func typedAPI(ctx context.Context, client *weir.Client) {
     read := &weir.ReadRequest{Resource: "records/s:key"}
     readOptions := weir.ReadOneOptions{StoreName: "records", Request: read}
@@ -84,20 +84,26 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     remove := &weir.DeleteRequest{Resource: read.Resource}
     deleteOptions := weir.DeleteOptions{StoreName: "records", Request: remove}
     _, _ = client.Delete(ctx, deleteOptions)
-    program := &weir.ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
-    transform := &weir.AtomicTransformRequest{Resource: read.Resource, Program: program}
+    lua := &weir.LuaTransform{Source: []byte("return weir.keep()"), Input: document}
+    transform := &weir.AtomicTransformRequest{Resource: read.Resource, Lua: lua}
     transformOptions := weir.AtomicTransformOptions{StoreName: "records", Request: transform}
     _, _ = client.AtomicTransform(ctx, transformOptions)
-    scan := &weir.ScanRequest{Resource: "records", PageSize: 1}
+    filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"match_all":{}}`)}
+    projection := &weir.Projection{Mode: weir.ProjectionInclude, Fields: []string{"n"}}
+    scan := &weir.ScanRequest{Resource: "records", Filter: filter, Projection: projection, PageSize: 1}
     scanOptions := weir.ScanOptions{StoreName: "records", Request: scan}
     scanOptions.Consume = func(context.Context, *weir.Document) error { return nil }
     _, _ = client.Scan(ctx, scanOptions)
     http := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/key"}
-    descriptor, _ := weir.SearchHTTPDescriptor(http)
-    native := &weir.NativeRequest{Resource: "records", Descriptor: descriptor}
+    native := &weir.NativeRequest{Resource: "records", SearchHTTP: http}
     nativeOptions := weir.NativeOptions{StoreName: "records", Request: native}
-    nativeOptions.Consume = func(context.Context, *weir.Event) error { return nil }
-    _, _ = client.Native(ctx, nativeOptions)
+    nativeOptions.Consume = func(context.Context, *weir.NativeResponse, []byte) error { return nil }
+    result, _ := client.Native(ctx, nativeOptions)
+    if result != nil {
+        _ = result.Response.GetHttp()
+        _ = result.Completion == weir.NativeCompletionUnconfirmed
+        _ = result.Failure.GetCode() == weir.FailureTargetNotFound
+    }
 
 }
 func main() {

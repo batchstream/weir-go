@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.7.0
+go get github.com/batchstream/weir-go@v0.8.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.5.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.6.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -43,7 +43,9 @@ requested Store. Reuse the client across goroutines and close it after callers
 finish. Its worker refreshes directory metadata and DNS replicas. The opening
 context bounds initialization; it does not own the returned client. Open accepts
 1–16 Stores. Discovery may retry read-only initialization; business requests are
-never replayed. A stale directory cache fails closed when its lease expires.
+never replayed. A stale directory cache fails closed when its lease expires. Refresh failures
+preserve their error cause and gRPC classification; no live ownership announcement
+means Unavailable, while conflicting owners mean FailedPrecondition.
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
@@ -67,7 +69,7 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
 | `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
 | `Scan` | `ScanOptions` / `ScanRequest`, document consumer | `ScanEnd` |
-| `Native` | `NativeOptions` / `NativeRequest`, event consumer | `NativeEnd` |
+| `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
 connection or opening one bidirectional Execute RPC. An empty input, nil request,
@@ -92,7 +94,7 @@ results, err := client.Mutate(ctx, options)
 
 `MutateRequest.Action` selects `MutationCreate`, `MutationPut`, `MutationReplace`,
 `MutationDelete` or `MutationAtomicTransform`. Writes require Document, Delete
-accepts no payload, and AtomicTransform requires exactly one Program or
+accepts no payload, and AtomicTransform requires exactly one Lua or
 BackendExpression. A batch is not a transaction. Mutations to the same resource
 execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
@@ -110,36 +112,119 @@ streaming interfaces to avoid retaining the full input and result sequence.
 
 `WriteRequest` contains Resource and Document. Create requires absence; Replace
 requires an existing resource; Put creates or replaces. AtomicTransform requires
-exactly one Program or BackendExpression.
+exactly one Lua or BackendExpression.
 
-On a successful RPC, `weir.MutationApplied` may also carry a subsequent
-acknowledgement failure. Inspect both Outcome and Failure. Other outcomes always
-carry a Failure. A later RPC failure does not revoke a confirmed individual result. Reconcile
-unconfirmed items through application knowledge and never automatically replay a write.
+`ReadResult` contains exactly one of Document, Missing, or Failure. Missing is a
+successful read that confirmed document absence. `FailureTargetNotFound` means a
+required backend collection or index is missing. A failure does not establish
+that the requested document is absent. Individual Read/Mutate failures are result
+data, even when the Go error is nil; inspect every result as well as the error.
 
-`Scan` executes one finite page and consumes documents incrementally. It returns
-a checkpoint only after the matching document count, terminal ScanEnd
-and final gRPC OK. A failed page returns no ScanEnd; keep the previous token.
-Retrying that page may repeat documents, so the caller owns deduplication and
-committing output together with its checkpoint. A completed RPC can still carry
-`ScanEnd.Failure`, which has no continuation token.
+`MutationApplied` means the requested semantics were satisfied. It includes a
+successful Lua keep and deleting an already absent document without a database
+write. APPLIED may carry a subsequent acknowledgement Failure. Other outcomes
+always carry a Failure: NOT_STARTED means no backend mutation began, NOT_APPLIED
+means absence of application was established, and UNKNOWN means available evidence
+cannot establish whether it applied. A later RPC failure does not revoke any
+confirmed item. Unconfirmed nil positions may have applied; reconcile them through
+application knowledge and never automatically replay writes.
 
-`NativeRequest` contains Resource, Descriptor, BodyContentType and a bounded Body.
-Its consumer sees flat SDK Events containing Head, Chunk or NativeEnd. Chunks are
-nonempty and consumed incrementally; the SDK does not collect a whole response.
-A validated NativeEnd is returned with a later transport or consumer error.
-Completion describes response transport evidence, not a normalized mutation
-outcome. Interpret backend response status/body separately. For Search HTTP,
-use `SearchHTTPRequest`, `SearchHTTPDescriptor` and `DecodeSearchHTTPResponse`
-without importing generated protobuf packages. Mongo command bodies use BSON and
-`MongoCommandContentType` for the descriptor.
+### Lua transforms
+
+`LuaTransform` accepts UTF-8 Source and optional Input. `current` is a typed
+missing value when the record does not exist, distinct from Lua nil, null, or an
+empty object. `weir.merge(current, input)` treats a missing base as an empty object,
+so the standard merge can create a record on its first call:
+
+```go
+input := &weir.Document{ContentType: "application/json", Data: []byte(`{"state":"ready"}`)}
+lua := &weir.LuaTransform{Source: []byte("return weir.replace(weir.merge(current, input))"), Input: input}
+request := &weir.AtomicTransformRequest{Resource: "records/s:first", Lua: lua}
+options := weir.AtomicTransformOptions{StoreName: "search", Request: request}
+result, err := client.AtomicTransform(ctx, options)
+```
+
+Mongo Input uses BSON. Lua source is bounded at 16 KiB and typed current/input/result
+trees at 256 KiB. `weir.replace(object)` creates or replaces; `weir.keep()` preserves
+the current value; `weir.delete()` succeeds when already missing; `weir.reject(message)`
+returns NOT_APPLIED with PRECONDITION_FAILED. Returning a typed object directly is
+Replace; returning nil or no value is Keep. Concurrent first creation can trigger
+a bounded fresh read/evaluation after a confirmed conflict. An ambiguous write or
+commit acknowledgement never triggers automatic replay.
+
+### Scan filters and projection
+
+`ScanRequest.Filter` contains only the backend's native condition: a Mongo BSON
+filter object or a Search JSON query object. There is no outer filter/query/selector
+wrapper. An absent filter matches all documents. Projection is optional; absent
+means full documents. An explicit `Projection` requires Include or Exclude mode
+and nonempty dot-separated field paths. Duplicate, overlapping ancestor paths,
+operators and wildcards are rejected before the RPC. Projection permits 128 fields,
+512 bytes per path and 8 KiB encoded metadata. Mongo `_id` may be selected or excluded
+as a whole; `_id` subpaths return Unsupported. Search returns the projected
+`_source` object, without backend hit metadata.
+
+```go
+filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"term":{"state":"ready"}}`)}
+projection := &weir.Projection{Mode: weir.ProjectionInclude, Fields: []string{"name", "profile.age"}}
+request := &weir.ScanRequest{Resource: "records", Filter: filter, Projection: projection, PageSize: 128}
+options := weir.ScanOptions{StoreName: "search", Request: request, Consume: processDocument}
+end, err := client.Scan(ctx, options)
+```
+
+For Mongo, marshal the native object directly, for example `bson.D{{Key: "state",
+Value: "ready"}}`, into an `application/bson` Filter. Traversal ordering belongs to
+the adapter. Continuations bind Store, resource, filter and projection; repeat those
+settings with the returned token, while page size may change.
+
+`Scan` consumes a finite page incrementally. A transport, protocol or consumer
+failure returns a Go error and no ScanEnd; keep the previous checkpoint. A completed
+RPC can instead return `ScanEnd.Failure` with a nil Go error. That business failure
+has no continuation token and is not exhausted. A successful empty traversal returns
+Exhausted, not a document-missing result. Accept a checkpoint only after the matching
+document count, terminal ScanEnd and final gRPC OK. Retrying an interrupted page can
+repeat documents; the caller owns deduplication and commits output with its checkpoint.
+
+### Native requests and responses
+
+`NativeRequest` requires Resource and exactly one of MongoDBCommand or SearchHTTP.
+MongoDBCommand is a complete BSON command targeting `db/collection`; SearchHTTP is
+an explicit `SearchHTTPRequest` containing Method, Path, Query, Headers,
+BodyContentType and Body, targeting one index. Both are bounded; Mongo's adapter
+accepts commands up to 4 MiB and Search bodies up to 8 MiB. There are no descriptor
+profiles or protobuf encoding helpers to supply.
+
+```go
+http := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
+request := &weir.NativeRequest{Resource: "records", SearchHTTP: http}
+options := weir.NativeOptions{StoreName: "search", Request: request}
+options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
+    return consumeNativeBytes(ctx, response, data)
+}
+result, err := client.Native(ctx, options)
+```
+
+Consume receives nonempty response chunks with validated metadata and finishes
+before the next chunk. Metadata is also retained in `NativeResult.Response`, including
+for an empty body when no callback runs. Search metadata is typed `Response.Http`;
+Mongo responses have no HTTP metadata and contain BSON bytes. The SDK hides wire
+Head/Chunk/End phases. Do not mutate response metadata in a callback.
+
+NativeResult distinguishes response evidence from the Go error. A confirmed
+NativeNotStarted means the backend operation did not start. NativeResponseIncomplete
+means it started without a complete response and establishes no write outcome.
+NativeCompletionUnconfirmed means no terminal was received; Response may still be
+available. NativeResponseComplete means all response bytes arrived. Its status/body
+can report a backend error such as HTTP 404 with no Go error; interpret that data
+separately. A validated terminal is retained alongside a later RPC error. No Native
+request is automatically replayed.
 
 ## Streaming and deadlines
 
 All business operations use bidirectional Execute streams. Each stream addresses
 one Store and one operation kind. Scan and Native send one request, close their
 input and incrementally consume typed Events. Native chunks are bounded at
-64 KiB, Scan pages at 256 documents and selectors/transform expressions at 16 KiB.
+64 KiB, Scan pages at 256 documents and native filters/Lua source/backend expressions at 16 KiB.
 
 `ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
 returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
@@ -183,7 +268,7 @@ methods. The caller owns target validation and connection lifetime for Dial.
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
 mutates a document then reads multiple resources in one stream, [scan](examples/scan/main.go)
 commits finite-page checkpoints, and [native](examples/native/main.go) consumes
-native responses. These examples use SDK request/result/event types.
+native responses. These examples use SDK request and result types.
 
 ```sh
 python3 scripts/download_modules.py

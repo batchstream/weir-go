@@ -101,13 +101,12 @@ func testLifecycle(t *testing.T, backend string) {
 			t.Fatal("read-after-write batch failed")
 		}
 	}
-	selector := &weir.Document{ContentType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
+	filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"ids":{"values":["` + id + `"]}}`)}
 	if backend == "mongo" {
-		filter := bson.D{{Key: "_id", Value: id}}
-		query := bson.D{{Key: "filter", Value: filter}}
-		selector = bsonDocument(t, query)
+		query := bson.D{{Key: "_id", Value: id}}
+		filter = bsonDocument(t, query)
 	}
-	scan := &weir.ScanRequest{Resource: collection, Selector: selector, PageSize: 1}
+	scan := &weir.ScanRequest{Resource: collection, Filter: filter, PageSize: 1}
 	count := 0
 	scanOptions := weir.ScanOptions{StoreName: store, Request: scan}
 	scanOptions.Consume = func(context.Context, *weir.Document) error { count++; return nil }
@@ -128,35 +127,25 @@ func testLifecycle(t *testing.T, backend string) {
 	}
 	native := nativeRequest(t, backend, collection, id)
 	var body []byte
-	var head *weir.NativeHead
 	nativeOptions := weir.NativeOptions{StoreName: store, Request: native}
-	nativeOptions.Consume = func(_ context.Context, event *weir.Event) error {
-		if event.Head != nil {
-			head = event.Head
-		}
-		if len(body)+len(event.Chunk) > 1<<20 {
+	nativeOptions.Consume = func(_ context.Context, _ *weir.NativeResponse, data []byte) error {
+		if len(body)+len(data) > 1<<20 {
 			return errors.New("fixture response too large")
 		}
-		body = append(body, event.Chunk...)
+		body = append(body, data...)
 		return nil
 	}
-	end, err := client.Native(ctx, nativeOptions)
-	if err != nil || end.GetCompletion() != weir.NativeResponseComplete {
-		t.Fatalf("Native: %v %v", end, err)
+	resultNative, err := client.Native(ctx, nativeOptions)
+	if err != nil || resultNative == nil || resultNative.Completion != weir.NativeResponseComplete {
+		t.Fatalf("Native: %v %v", resultNative, err)
 	}
 	if backend == "mongo" {
 		raw := bson.Raw(body)
 		if raw.Lookup("n").AsInt64() != 1 || raw.Lookup("ok").AsFloat64() != 1 {
 			t.Fatal("native count mismatch")
 		}
-	} else {
-		metadata, err := weir.DecodeSearchHTTPResponse(head.GetMetadata())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if metadata.StatusCode != 200 {
-			t.Fatalf("native HTTP status %d", metadata.StatusCode)
-		}
+	} else if resultNative.Response.GetHttp().GetStatusCode() != 200 {
+		t.Fatalf("native HTTP status %d", resultNative.Response.GetHttp().GetStatusCode())
 	}
 	deleteRequest := &weir.DeleteRequest{Resource: builder.resource}
 	deleteOptions := weir.DeleteOptions{StoreName: store, Request: deleteRequest}
@@ -233,16 +222,9 @@ func nativeRequest(t *testing.T, backend, collection, id string) *weir.NativeReq
 		parts := strings.Split(collection, "/")
 		query := bson.D{{Key: "_id", Value: id}}
 		command := bson.D{{Key: "count", Value: parts[len(parts)-1]}, {Key: "query", Value: query}}
-		request.Body = bsonDocument(t, command).Data
-		request.Descriptor = &weir.Document{ContentType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		request.BodyContentType = "application/bson"
+		request.MongoDBCommand = bsonDocument(t, command).Data
 	} else {
-		descriptor := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/" + id}
-		encoded, err := weir.SearchHTTPDescriptor(descriptor)
-		if err != nil {
-			t.Fatal(err)
-		}
-		request.Descriptor = encoded
+		request.SearchHTTP = &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/" + id}
 	}
 	return request
 }

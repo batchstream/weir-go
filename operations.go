@@ -48,7 +48,7 @@ func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOpt
 func AtomicTransform(ctx context.Context, client pb.StoreServiceClient, options AtomicTransformOptions) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Program: options.Request.Program, BackendExpression: options.Request.BackendExpression}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Lua: options.Request.Lua, BackendExpression: options.Request.BackendExpression}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -87,28 +87,40 @@ func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions
 	return end, nil
 }
 
-// Native consumes sequential head/chunk/end events without collecting a whole
-// response. A backend error is native response data, not a mutation outcome.
-func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOptions) (*NativeEnd, error) {
+// Native consumes response bytes incrementally. Backend errors remain native
+// response data. A validated result remains evidence alongside later RPC errors.
+func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOptions) (*NativeResult, error) {
 	if options.Request == nil || options.Consume == nil {
-		return nil, errors.New("Native requires a request and event consumer")
+		return nil, errors.New("Native requires a request and byte consumer")
 	}
-	open := &pb.NativeOpen{Resource: options.Request.Resource, Descriptor_: options.Request.Descriptor, BodyContentType: options.Request.BodyContentType}
-	native := &pb.NativeRequest{Open: open, Body: options.Request.Body}
+	native := &pb.NativeRequest{Resource: options.Request.Resource}
+	if (options.Request.MongoDBCommand != nil) == (options.Request.SearchHTTP != nil) {
+		return nil, errors.New("Native requires exactly one MongoDB or Search HTTP request")
+	}
+	if options.Request.MongoDBCommand != nil {
+		native.Request = &pb.NativeRequest_MongodbCommand{MongodbCommand: options.Request.MongoDBCommand}
+	} else {
+		native.Request = &pb.NativeRequest_SearchHttp{SearchHttp: options.Request.SearchHTTP}
+	}
 	variant := &pb.Command_Native{Native: native}
 	command := &pb.Command{Operation: variant}
 	request := &pb.ExecuteRequest{StoreName: options.StoreName, Index: 1, Command: command}
-	var end *NativeEnd
+	var result *NativeResult
 	consume := func(ctx context.Context, wire *pb.Event) error {
-		event := &Event{Head: wire.GetHead(), Chunk: wire.GetChunk(), NativeEnd: wire.GetNativeEnd()}
-		if event.NativeEnd != nil {
-			end = event.NativeEnd
+		switch value := wire.Value.(type) {
+		case *pb.Event_Head:
+			result = &NativeResult{Response: value.Head}
+		case *pb.Event_Chunk:
+			return options.Consume(ctx, result.Response, value.Chunk)
+		case *pb.Event_NativeEnd:
+			if result == nil {
+				result = &NativeResult{}
+			}
+			result.Completion = value.NativeEnd.Completion
+			result.Failure = value.NativeEnd.Failure
 		}
-		return options.Consume(ctx, event)
+		return nil
 	}
 	err := execute(ctx, client, request, consume)
-	if err != nil {
-		return end, err
-	}
-	return end, nil
+	return result, err
 }

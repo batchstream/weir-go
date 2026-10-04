@@ -53,12 +53,12 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_mutate_order", mutations: make(chan *pb.MutateRequest, 5)}
 	client := clientTestConnection(t, peer)
 	document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-	program := &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
+	program := &LuaTransform{Source: []byte("return doc")}
 	options := MutateOptions{StoreName: "records"}
 	for _, action := range []MutationAction{MutationCreate, MutationPut, MutationReplace, MutationDelete, MutationAtomicTransform} {
 		request := &MutateRequest{Resource: "records/s:key", Action: action}
 		if action == MutationAtomicTransform {
-			request.Program = program
+			request.Lua = program
 		} else if action != MutationDelete {
 			request.Document = document
 		}
@@ -74,7 +74,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 			request.Action == MutationPut && mutation.GetPut() != nil ||
 			request.Action == MutationReplace && mutation.GetReplace() != nil ||
 			request.Action == MutationDelete && mutation.GetDelete() != nil ||
-			request.Action == MutationAtomicTransform && mutation.GetAtomicTransform().GetProgram() != nil
+			request.Action == MutationAtomicTransform && mutation.GetAtomicTransform().GetLua() != nil
 		if !selected {
 			t.Fatal("wrong business operation", index, mutation)
 		}

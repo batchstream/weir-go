@@ -105,10 +105,9 @@ func TestSingleExecuteWaitsForSendAfterTerminalEOF(t *testing.T) {
 					_, err := Scan(ctx, client, options)
 					done <- err
 				} else {
-					descriptor := &Document{ContentType: "application/octet-stream"}
-					request := &NativeRequest{Resource: "records", Descriptor: descriptor}
+					request := &NativeRequest{Resource: "records", MongoDBCommand: []byte{1}}
 					options := NativeOptions{StoreName: "records", Request: request}
-					options.Consume = func(context.Context, *Event) error { return nil }
+					options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
 					_, err := Native(ctx, client, options)
 					done <- err
 				}
@@ -171,10 +170,10 @@ func TestLocalSendFailureCancelsReceiveAndJoins(t *testing.T) {
 func TestNativeRejectsInvalidBodyContentTypeBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{}
 	client := clientTestConnection(t, peer)
-	descriptor := &Document{ContentType: "application/octet-stream"}
-	request := &NativeRequest{Resource: "records", Descriptor: descriptor, BodyContentType: string([]byte{0xff})}
+	http := &SearchHTTPRequest{Method: "POST", Path: "/_search", BodyContentType: string([]byte{0xff})}
+	request := &NativeRequest{Resource: "records", SearchHTTP: http}
 	options := NativeOptions{StoreName: "records", Request: request}
-	options.Consume = func(context.Context, *Event) error { return nil }
+	options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	end, err := Native(ctx, client, options)
