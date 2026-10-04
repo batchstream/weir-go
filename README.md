@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.5.0
+go get github.com/batchstream/weir-go@v0.6.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.3.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.4.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -60,6 +60,8 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | --- | --- | --- |
 | `Read` | `ReadOptions` / multiple `ReadRequest` | `[]*ReadResult`: Document, Missing, Failure |
 | `Mutate` | `MutateOptions` / multiple `MutateRequest` | `[]*MutationResult` |
+| `ReadStream` | `ReadStreamOptions` / producer and consumer | per-item `ReadResult` callbacks |
+| `MutateStream` | `MutateStreamOptions` / producer and consumer | per-item `MutationResult` callbacks |
 | `ReadOne` | `ReadOneOptions` / `ReadRequest` | `ReadResult` |
 | `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
 | `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
@@ -68,17 +70,14 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Native` | `NativeOptions` / `NativeRequest`, event consumer | `NativeEnd` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
-connection or opening their single typed unary RPC. An empty batch, nil request,
+connection or opening one bidirectional Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one outer `StoreName`. Results preserve
+one `StoreName`. Inputs are sent incrementally in frames, and results preserve
 input order, including repeated resources. Individual backend failures stay in
-their result positions. A failed RPC returns a result slice of the submitted
-length with nil entries: the whole response is unacknowledged and any mutation
-may have applied. The SDK never automatically replays business requests.
-Before protobuf decoding, each batch reply is checked against the submitted
-request count and the encoded byte budget. Malformed or excess results leave the
-entire batch unacknowledged.
+their result positions. A later RPC failure preserves every validated result
+already received; unconfirmed positions remain nil and any such mutation may
+have applied. Never automatically replay those mutations.
 
 ```go
 firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
@@ -98,10 +97,13 @@ BackendExpression. A batch is not a transaction. Mutations to the same resource
 execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
 
-Complete protobuf request and response envelopes are each bounded at 32 MiB
-(`MaxBatchRequestBytes`, `MaxBatchResponseBytes`). Documents are bounded at 2 MiB.
-Use smaller batches when documents are large. The SDK validates every result and
-requires exactly one result per input before exposing any unary batch evidence.
+A logical call has no total byte or item limit. Each read/mutation frame contains
+at most 1024 items and a 5 MiB encoded command. Documents are bounded at 2 MiB;
+responses contain one indexed item. The SDK allows two frames in flight and
+returns a frame's credit only after consuming its last response. It sends and
+receives concurrently so HTTP/2 flow control can advance in both directions.
+`Read` and `Mutate` intentionally accumulate results for their caller; use the
+streaming interfaces to avoid retaining the full input and result sequence.
 
 `WriteRequest` contains Resource, Document and optional AdapterOptions. Create
 requires absence; Replace requires an existing resource; Put creates or replaces.
@@ -109,8 +111,8 @@ AtomicTransform requires exactly one Program or BackendExpression.
 
 On a successful RPC, `weir.MutationApplied` may also carry a subsequent
 acknowledgement failure. Inspect both Outcome and Failure. Other outcomes always
-carry a Failure. A failed unary RPC provides no confirmed individual results;
-reconcile through application knowledge and never automatically replay a write.
+carry a Failure. A later RPC failure does not revoke a confirmed individual result. Reconcile
+unconfirmed items through application knowledge and never automatically replay a write.
 
 `Scan` executes one finite page and consumes documents incrementally. It returns
 a checkpoint only after the matching document count, terminal ScanEnd
@@ -131,11 +133,41 @@ without importing generated protobuf packages. Mongo command bodies use BSON and
 
 ## Streaming and deadlines
 
-Scan and Native each issue one server-streaming RPC with one typed request and
-incrementally consume typed Events. Native chunks are bounded at 64 KiB, Scan
-pages at 256 documents and selectors/transform expressions at 16 KiB. Consumers
-must honor their context and return promptly.
-Do not retain unbounded events or mutate requests/documents while a call runs.
+All business operations use bidirectional Execute streams. Each stream addresses
+one Store and one operation kind. Scan and Native send one request, close their
+input and incrementally consume typed Events. Native chunks are bounded at
+64 KiB, Scan pages at 256 documents and selectors/transform expressions at 16 KiB.
+
+`ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
+returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
+result)` receives confirmed results in input order, with indexes starting at 1.
+Inputs are validated as they are produced; an invalid later item does not undo
+earlier requests. Stream success requires one result per submitted input and
+final gRPC OK. Results delivered before a later producer, consumer or transport
+error remain evidence. Next and Consume run concurrently; synchronize shared
+application state. Callbacks must honor their context and return promptly;
+the SDK cancels and joins its sender before returning. Keep yielded requests and
+document bytes immutable until the corresponding Consume callback begins.
+
+```go
+position := 0
+options := weir.ReadStreamOptions{StoreName: "search"}
+options.Next = func(ctx context.Context) (*weir.ReadRequest, error) {
+    if position == len(resourceNames) { return nil, io.EOF }
+    request := &weir.ReadRequest{Resource: resourceNames[position]}
+    position++
+    return request, nil
+}
+options.Consume = func(ctx context.Context, index uint64, result *weir.ReadResult) error {
+    if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
+    if result.Missing { return nil }
+    return processDocument(ctx, result.Document)
+}
+err := client.ReadStream(ctx, options)
+```
+
+Use streams for finite producer sequences. Consumers should commit or release
+each result promptly and avoid retaining unbounded events.
 
 Use caller deadlines. Business operations have no implicit retry or failover.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
@@ -146,7 +178,7 @@ methods. The caller owns target validation and connection lifetime for Dial.
 ## Examples and validation
 
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
-mutates a document then reads multiple resources in a single typed batch, [scan](examples/scan/main.go)
+mutates a document then reads multiple resources in one framed stream, [scan](examples/scan/main.go)
 commits finite-page checkpoints, and [native](examples/native/main.go) consumes
 native responses. These examples use SDK request/result/event types.
 
@@ -178,7 +210,7 @@ go test -race -tags integration -run 'Test(Mongo|Search)Lifecycle' -v .
 ```
 
 Pre-create disposable collections/indexes. Each backend owns one generated record
-and checks unary reads/mutations, Scan and Native. System integration tests,
+and checks streamed reads/mutations, Scan and Native. System integration tests,
 backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 

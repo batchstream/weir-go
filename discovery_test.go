@@ -62,26 +62,12 @@ func (p *discoveryPeer) ResolveStore(ctx context.Context, request *pb.ResolveSto
 	return response, nil
 }
 
-func (p *discoveryPeer) Read(ctx context.Context, request *pb.ReadBatchRequest) (*pb.ReadBatchResponse, error) {
-	p.executions.Add(1)
-	if p.business == nil {
-		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
-	}
-	return p.business.Read(ctx, request)
-}
-func (p *discoveryPeer) Mutate(ctx context.Context, request *pb.MutateBatchRequest) (*pb.MutateBatchResponse, error) {
-	p.executions.Add(1)
-	if p.business == nil {
-		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
-	}
-	return p.business.Mutate(ctx, request)
-}
-func (p *discoveryPeer) Execute(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+func (p *discoveryPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 	p.executions.Add(1)
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(request, stream)
+	return p.business.Execute(stream)
 }
 
 func (p *discoveryPeer) set(store string, response *pb.ResolveStoreResponse) {

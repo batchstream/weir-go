@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, direct unary Read/Mutate batches and incremental Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, bounded bidirectional Execute streams, incremental ReadStream/MutateStream producers and consumers, indexed acknowledgements and Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -54,6 +54,7 @@ def main():
 import (
     "context"
     "fmt"
+    "io"
     weir "github.com/batchstream/weir-go"
 )
 // Compile the ordinary API using only SDK-owned request/result/event names.
@@ -67,6 +68,14 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     mutation := &weir.MutateRequest{Resource: read.Resource, Action: weir.MutationPut, Document: document}
     mutations := weir.MutateOptions{StoreName: "records", Requests: []*weir.MutateRequest{mutation}}
     _, _ = client.Mutate(ctx, mutations)
+    streamedReads := weir.ReadStreamOptions{StoreName: "records"}
+    streamedReads.Next = func(context.Context) (*weir.ReadRequest, error) { return nil, io.EOF }
+    streamedReads.Consume = func(context.Context, uint64, *weir.ReadResult) error { return nil }
+    _ = client.ReadStream(ctx, streamedReads)
+    streamedMutations := weir.MutateStreamOptions{StoreName: "records"}
+    streamedMutations.Next = func(context.Context) (*weir.MutateRequest, error) { return nil, io.EOF }
+    streamedMutations.Consume = func(context.Context, uint64, *weir.MutationResult) error { return nil }
+    _ = client.MutateStream(ctx, streamedMutations)
     write := &weir.WriteRequest{Resource: read.Resource, Document: document}
     writeOptions := weir.WriteOptions{StoreName: "records", Request: write}
     _, _ = client.Create(ctx, writeOptions)

@@ -33,23 +33,11 @@ type refreshControlPeer struct {
 	started   chan *refreshControlCall
 }
 
-func (p *refreshControlPeer) Read(ctx context.Context, request *pb.ReadBatchRequest) (*pb.ReadBatchResponse, error) {
-	if p.business == nil {
-		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
-	}
-	return p.business.Read(ctx, request)
-}
-func (p *refreshControlPeer) Mutate(ctx context.Context, request *pb.MutateBatchRequest) (*pb.MutateBatchResponse, error) {
-	if p.business == nil {
-		return nil, status.Error(codes.FailedPrecondition, "initialization node received business traffic")
-	}
-	return p.business.Mutate(ctx, request)
-}
-func (p *refreshControlPeer) Execute(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+func (p *refreshControlPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(request, stream)
+	return p.business.Execute(stream)
 }
 
 func (p *refreshControlPeer) ResolveStore(ctx context.Context, request *pb.ResolveStoreRequest) (*pb.ResolveStoreResponse, error) {

@@ -71,7 +71,7 @@ func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions
 	}
 	variant := &pb.Command_Scan{Scan: options.Request}
 	command := &pb.Command{Operation: variant}
-	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
+	request := &pb.ExecuteRequest{StoreName: options.StoreName, Index: 1, Command: command}
 	var end *ScanEnd
 	consume := func(ctx context.Context, event *pb.Event) error {
 		if document := event.GetDocument(); document != nil {
@@ -83,9 +83,6 @@ func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions
 	err := execute(ctx, client, request, consume)
 	if err != nil {
 		return nil, err
-	}
-	if end == nil {
-		return nil, errors.New("missing Scan completion")
 	}
 	return end, nil
 }
@@ -100,7 +97,7 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	native := &pb.NativeRequest{Open: open, Body: options.Request.Body}
 	variant := &pb.Command_Native{Native: native}
 	command := &pb.Command{Operation: variant}
-	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
+	request := &pb.ExecuteRequest{StoreName: options.StoreName, Index: 1, Command: command}
 	var end *NativeEnd
 	consume := func(ctx context.Context, wire *pb.Event) error {
 		event := &Event{Head: wire.GetHead(), Chunk: wire.GetChunk(), NativeEnd: wire.GetNativeEnd()}
@@ -112,9 +109,6 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	err := execute(ctx, client, request, consume)
 	if err != nil {
 		return end, err
-	}
-	if end == nil {
-		return nil, errors.New("missing Native completion")
 	}
 	return end, nil
 }
