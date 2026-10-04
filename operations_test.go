@@ -126,23 +126,18 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 	}
 }
 
-func (p *clientTestPeer) nativeExecute(request *pb.NativeRequest, stream pb.StoreService_ExecuteServer) error {
-	head := &pb.NativeHead{BodyContentType: "application/octet-stream"}
-	if request.GetSearchHttp() != nil {
-		head.Http = &SearchHTTPResponse{StatusCode: 200}
+func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
+	metadata := &Document{ContentType: "application/vnd.example.response", Data: []byte{0xff, 0}}
+	head := &pb.NativeHead{Metadata: metadata, BodyContentType: "application/octet-stream"}
+	if p.mode == "native_invalid_metadata" {
+		head.Metadata.ContentType = "invalid"
 	}
-	if p.mode == "native_wrong_metadata" {
-		if head.Http != nil {
-			head.Http = nil
-		} else {
-			head.Http = &SearchHTTPResponse{StatusCode: 200}
-		}
+	if p.mode == "native_no_metadata" {
+		head.Metadata = nil
 	}
 	if p.mode == "native_http_error" {
-		head.Http.StatusCode = 404
-	}
-	if p.mode == "native_invalid_http_status" {
-		head.Http.StatusCode = 0
+		head.Metadata.ContentType = "application/http"
+		head.Metadata.Data = []byte("HTTP/1.1 404 Not Found\r\nX-Example: value\r\n\r\n")
 	}
 	headValue := &pb.Event_Head{Head: head}
 	headEvent := &pb.Event{Value: headValue}
@@ -187,8 +182,8 @@ func (p *clientTestPeer) nativeExecute(request *pb.NativeRequest, stream pb.Stor
 }
 
 func clientTestNativeRequest() *NativeRequest {
-	http := &SearchHTTPRequest{Method: "GET", Path: "/_doc/id"}
-	request := &NativeRequest{Resource: "records", SearchHTTP: http}
+	document := &Document{ContentType: "application/vnd.example.request", Data: []byte{1}}
+	request := &NativeRequest{Resource: "records", Request: document}
 	return request
 }
 
@@ -202,6 +197,7 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 		rpcError   bool
 	}{
 		{mode: "native_normal", completion: NativeResponseComplete, chunks: 1, response: true},
+		{mode: "native_no_metadata", completion: NativeResponseComplete, chunks: 1, response: true},
 		{mode: "native_empty_response", completion: NativeResponseComplete, response: true},
 		{mode: "native_http_error", completion: NativeResponseComplete, chunks: 1, response: true},
 		{mode: "native_not_started", completion: NativeNotStarted, failure: true},
@@ -219,12 +215,20 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 			failure := errors.New("consumer rejected body")
 			options.Consume = func(_ context.Context, response *NativeResponse, data []byte) error {
 				chunks++
-				expectedStatus := uint32(200)
-				if test.mode == "native_http_error" {
-					expectedStatus = 404
+				if string(data) != "bounded native bytes" {
+					t.Fatal("body bytes changed", response, data)
 				}
-				if response.GetHttp().GetStatusCode() != expectedStatus || string(data) != "bounded native bytes" {
-					t.Fatal("body did not carry its typed response metadata", response, data)
+				if test.mode == "native_http_error" {
+					httpResponse, err := ParseHTTPNativeResponse(response)
+					if err != nil || httpResponse.StatusCode != 404 {
+						t.Fatal("complete native HTTP failure lost metadata", response, err)
+					}
+				} else if test.mode == "native_no_metadata" {
+					if response.Metadata != nil {
+						t.Fatal("absent metadata changed", response)
+					}
+				} else if response.Metadata.ContentType != "application/vnd.example.response" {
+					t.Fatal("opaque metadata changed", response)
 				}
 				if test.mode == "native_consumer_chunk_error" {
 					return failure
@@ -246,7 +250,7 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 }
 
 func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
-	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_wrong_metadata", "native_invalid_http_status"} {
+	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_invalid_metadata"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
@@ -268,19 +272,18 @@ func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
 	}
 }
 
-func TestNativeRejectsRequestSelectionBeforeRPC(t *testing.T) {
-	http := &SearchHTTPRequest{Method: "GET", Path: "/_doc/id"}
+func TestNativeRejectsInvalidRequestEnvelopeBeforeRPC(t *testing.T) {
+	invalid := &Document{ContentType: "invalid"}
 	for _, request := range []*NativeRequest{
 		{Resource: "records"},
-		{Resource: "records", MongoDBCommand: []byte{}},
-		{Resource: "records", MongoDBCommand: []byte{1}, SearchHTTP: http},
+		{Resource: "records", Request: invalid},
 	} {
 		peer := &clientTestPeer{}
 		client := clientTestConnection(t, peer)
 		options := NativeOptions{StoreName: "records", Request: request}
 		options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
 		if result, err := Native(t.Context(), client, options); err == nil || result != nil {
-			t.Fatal("invalid backend request selection accepted", result, err)
+			t.Fatal("invalid native request envelope accepted", result, err)
 		}
 		if peer.streams.Load() != 0 {
 			t.Fatal("invalid request opened an RPC")

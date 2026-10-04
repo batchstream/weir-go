@@ -12,7 +12,7 @@ class DependencyTests(unittest.TestCase):
     def test_public_helpers_and_protobuf_are_allowed(self):
         names = ['context', 'google.golang.org/grpc', 'github.com/batchstream/weir-go',
                  'github.com/batchstream/weir-protocol/api/protocol', 'github.com/batchstream/weir-protocol/api/netlimit',
-                 'github.com/batchstream/weir-protocol/api/weir/v1', 'github.com/batchstream/weir-protocol/api/weir/search/v1']
+                 'github.com/batchstream/weir-protocol/api/weir/v1', 'github.com/batchstream/weir-protocol/api/netlimit']
         items = [{'ImportPath': name} for name in names]
         check_dependencies.check_dependencies(items)
 

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
-	searchpb "github.com/batchstream/weir-protocol/api/weir/search/v1"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
@@ -21,11 +20,12 @@ type ScanRequest = pb.ScanRequest
 type ScanEnd = pb.ScanEnd
 type Projection = pb.Projection
 type ProjectionMode = pb.ProjectionMode
+
+// NativeRequest carries an opaque adapter-owned document. Keep its bytes
+// immutable until Native returns. Empty request data is permitted.
+type NativeRequest = pb.NativeRequest
 type NativeResponse = pb.NativeHead
 type NativeCompletion = pb.NativeCompletion
-type SearchHTTPRequest = searchpb.HttpRequest
-type SearchHTTPHeader = searchpb.Header
-type SearchHTTPResponse = searchpb.HttpResponse
 
 const (
 	MutationNotStarted = pb.MutationOutcome_NOT_STARTED
@@ -72,15 +72,6 @@ type AtomicTransformRequest struct {
 	Resource          string
 	Lua               *LuaTransform
 	BackendExpression *Document
-}
-
-// NativeRequest requires exactly one backend request. MongoDBCommand contains a
-// BSON command document; SearchHTTP carries typed HTTP metadata and body bytes.
-// Keep all request data immutable until Native returns.
-type NativeRequest struct {
-	Resource       string
-	MongoDBCommand []byte
-	SearchHTTP     *SearchHTTPRequest
 }
 
 // NativeResult retains validated response and completion evidence. Completion is
@@ -199,7 +190,7 @@ type NativeOptions struct {
 
 // ReadResult contains exactly one of Document, Missing, or Failure. Missing
 // confirms document absence after a successful read. FailureTargetNotFound
-// reports a missing backend collection/index, never a missing document.
+// reports a missing adapter-owned target, never a missing document.
 type ReadResult struct {
 	Document *Document
 	Missing  bool

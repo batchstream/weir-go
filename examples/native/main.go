@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"time"
 
 	weir "github.com/batchstream/weir-go"
@@ -30,14 +31,22 @@ func run() error {
 	case "mongo":
 		request.Resource = weir.EncodeSegment(*database) + "/records"
 		command := bson.D{{Key: "count", Value: "records"}}
-		var err error
-		request.MongoDBCommand, err = bson.Marshal(command)
+		data, err := bson.Marshal(command)
 		if err != nil {
 			return err
 		}
+		document := &weir.Document{ContentType: "application/bson", Data: data}
+		request.Request = document
 	case "search":
 		request.Resource = weir.EncodeSegment(*index)
-		request.SearchHTTP = &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
+		httpRequest, err := http.NewRequest(http.MethodGet, "/_doc/example", nil)
+		if err != nil {
+			return err
+		}
+		request, err = weir.NewHTTPNativeRequest(request.Resource, httpRequest)
+		if err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported store")
 	}
@@ -53,7 +62,7 @@ func run() error {
 	total := 0
 	opts := weir.NativeOptions{StoreName: *store, Request: request}
 	opts.Consume = func(_ context.Context, response *weir.NativeResponse, data []byte) error {
-		fmt.Printf("HTTP=%v content-type=%s chunk=%d bytes\n", response.Http, response.BodyContentType, len(data))
+		fmt.Printf("metadata=%v content-type=%s chunk=%d bytes\n", response.Metadata, response.BodyContentType, len(data))
 		total += len(data)
 		// Consume and discard each chunk instead of retaining the whole response.
 		return nil
@@ -68,7 +77,7 @@ func run() error {
 	if result == nil || result.Completion != weir.NativeResponseComplete {
 		return fmt.Errorf("native response incomplete: %v; reconcile any possible writes before retrying", result)
 	}
-	fmt.Printf("complete native response: HTTP=%v content-type=%s %d bytes\n", result.Response.Http, result.Response.BodyContentType, total)
+	fmt.Printf("complete native response: metadata=%v content-type=%s %d bytes\n", result.Response.Metadata, result.Response.BodyContentType, total)
 	// A complete HTTP/BSON response can describe a backend error. Inspect that
 	// response separately before deciding whether the business operation succeeded.
 	return nil

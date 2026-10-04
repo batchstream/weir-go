@@ -55,6 +55,7 @@ import (
     "context"
     "fmt"
     "io"
+    "net/http"
     weir "github.com/batchstream/weir-go"
 )
 // Compile the ordinary API using only SDK-owned request and result names.
@@ -94,13 +95,14 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     scanOptions := weir.ScanOptions{StoreName: "records", Request: scan}
     scanOptions.Consume = func(context.Context, *weir.Document) error { return nil }
     _, _ = client.Scan(ctx, scanOptions)
-    http := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/key"}
-    native := &weir.NativeRequest{Resource: "records", SearchHTTP: http}
+    httpRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/key", nil)
+    native, _ := weir.NewHTTPNativeRequest("records", httpRequest)
     nativeOptions := weir.NativeOptions{StoreName: "records", Request: native}
     nativeOptions.Consume = func(context.Context, *weir.NativeResponse, []byte) error { return nil }
     result, _ := client.Native(ctx, nativeOptions)
     if result != nil {
-        _ = result.Response.GetHttp()
+        _, _ = weir.ParseHTTPNativeResponse(result.Response)
+        _ = result.Response.GetMetadata()
         _ = result.Completion == weir.NativeCompletionUnconfirmed
         _ = result.Failure.GetCode() == weir.FailureTargetNotFound
     }

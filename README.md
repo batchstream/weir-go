@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.8.0
+go get github.com/batchstream/weir-go@v0.9.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.6.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.7.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -159,8 +159,10 @@ filter object or a Search JSON query object. There is no outer filter/query/sele
 wrapper. An absent filter matches all documents. Projection is optional; absent
 means full documents. An explicit `Projection` requires Include or Exclude mode
 and nonempty dot-separated field paths. Duplicate, overlapping ancestor paths,
-operators and wildcards are rejected before the RPC. Projection permits 128 fields,
-512 bytes per path and 8 KiB encoded metadata. Mongo `_id` may be selected or excluded
+wildcards and control characters are rejected before the RPC. Projection permits 128 fields,
+512 bytes per path and 8 KiB encoded metadata. Literal `$field` paths are allowed
+by the shared protocol; Mongo rejects them in its adapter and Search permits them.
+Mongo `_id` may be selected or excluded
 as a whole; `_id` subpaths return Unsupported. Search returns the projected
 `_source` object, without backend hit metadata.
 
@@ -187,16 +189,43 @@ repeat documents; the caller owns deduplication and commits output with its chec
 
 ### Native requests and responses
 
-`NativeRequest` requires Resource and exactly one of MongoDBCommand or SearchHTTP.
-MongoDBCommand is a complete BSON command targeting `db/collection`; SearchHTTP is
-an explicit `SearchHTTPRequest` containing Method, Path, Query, Headers,
-BodyContentType and Body, targeting one index. Both are bounded; Mongo's adapter
-accepts commands up to 4 MiB and Search bodies up to 8 MiB. There are no descriptor
-profiles or protobuf encoding helpers to supply.
+`NativeRequest` has Resource and a required Request Document. Its ContentType
+identifies an adapter-owned format; Data carries up to 8 MiB of opaque bytes and
+may be empty. The public protocol and SDK do not select or interpret backends.
+A new Store can use its own content type without changing the schema or SDK.
+Adapters decide which formats and operations they support. For example, MongoDB
+accepts an `application/bson` command document, bounded at 4 MiB by its adapter.
 
 ```go
-http := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/example"}
-request := &weir.NativeRequest{Resource: "records", SearchHTTP: http}
+document := &weir.Document{ContentType: "application/vnd.example.command", Data: commandBytes}
+request := &weir.NativeRequest{Resource: "records", Request: document}
+options := weir.NativeOptions{StoreName: "example", Request: request}
+options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
+    return consumeNativeBytes(ctx, response, data)
+}
+result, err := client.Native(ctx, options)
+```
+
+Consume receives nonempty response chunks and finishes before the next chunk.
+`NativeResult.Response` also retains metadata for an empty body when no callback
+runs. Response.Metadata is an optional opaque Document bounded at 64 KiB of data;
+Response.BodyContentType describes the separately streamed body. Metadata may
+use a different content type from the request. Do not mutate response metadata
+in a callback. The SDK hides the wire Head/Chunk/End phases.
+
+For HTTP-backed adapters, `NewHTTPNativeRequest(resource, request)` consumes and
+closes a standard `net/http.Request` body and serializes an `application/http`
+Document. It emits an HTTP/1.1 origin-form target, exact Content-Length and no
+default User-Agent. Explicit application headers are preserved for the adapter
+to validate. The complete encoded request is bounded at 8 MiB, including its
+header block bounded at 64 KiB. Trailers are rejected. The Host header never
+chooses the owning Store or backend destination.
+
+```go
+httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/example", nil)
+if err != nil { return err }
+request, err := weir.NewHTTPNativeRequest("records", httpRequest)
+if err != nil { return err }
 options := weir.NativeOptions{StoreName: "search", Request: request}
 options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
     return consumeNativeBytes(ctx, response, data)
@@ -204,11 +233,11 @@ options.Consume = func(ctx context.Context, response *weir.NativeResponse, data 
 result, err := client.Native(ctx, options)
 ```
 
-Consume receives nonempty response chunks with validated metadata and finishes
-before the next chunk. Metadata is also retained in `NativeResult.Response`, including
-for an empty body when no callback runs. Search metadata is typed `Response.Http`;
-Mongo responses have no HTTP metadata and contain BSON bytes. The SDK hides wire
-Head/Chunk/End phases. Do not mutate response metadata in a callback.
+`ParseHTTPNativeResponse(response)` optionally parses application/http metadata
+containing a complete status line and CRLF header block, with no body bytes or
+transfer framing. It returns HTTPNativeResponse with StatusCode and Headers;
+response body bytes continue through Native's chunk consumer. These helpers are
+ordinary HTTP codecs, independent of any Store type or protobuf backend fields.
 
 NativeResult distinguishes response evidence from the Go error. A confirmed
 NativeNotStarted means the backend operation did not start. NativeResponseIncomplete

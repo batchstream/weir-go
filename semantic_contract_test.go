@@ -55,27 +55,24 @@ func TestScanRejectsInvalidProjectionBeforeRPC(t *testing.T) {
 	}
 }
 
-func TestNativeMongoResponseMatchesRequestedBackend(t *testing.T) {
-	for _, mode := range []string{"native_normal", "native_wrong_metadata"} {
+func TestNativeAcceptsNewStoreFormatsWithoutSchemaSelection(t *testing.T) {
+	for _, mode := range []string{"native_normal", "native_no_metadata"} {
 		peer := &clientTestPeer{mode: mode}
 		client := clientTestConnection(t, peer)
-		request := &NativeRequest{Resource: "database", MongoDBCommand: []byte{1}}
-		options := NativeOptions{StoreName: "records", Request: request}
+		document := &Document{ContentType: "application/vnd.future-store.command"}
+		request := &NativeRequest{Resource: "anything", Request: document}
+		options := NativeOptions{StoreName: "future-store", Request: request}
 		consumed := false
 		options.Consume = func(_ context.Context, response *NativeResponse, _ []byte) error {
-			if response.Http != nil {
-				t.Fatal("HTTP metadata exposed as a MongoDB response")
+			if mode == "native_normal" && response.Metadata.ContentType != "application/vnd.example.response" {
+				t.Fatal("unknown metadata format rejected", response)
 			}
 			consumed = true
 			return nil
 		}
 		result, err := Native(t.Context(), client, options)
-		if mode == "native_normal" {
-			if err != nil || result == nil || result.Completion != NativeResponseComplete || !consumed || result.Response.Http != nil {
-				t.Fatal("valid MongoDB response rejected", result, err)
-			}
-		} else if err == nil || result != nil || consumed {
-			t.Fatal("mismatched backend metadata accepted", result, err)
+		if err != nil || result == nil || result.Completion != NativeResponseComplete || !consumed || peer.received.Load() != 1 {
+			t.Fatal("new Store format needs no SDK or protocol backend selection", result, err)
 		}
 	}
 }

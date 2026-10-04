@@ -73,7 +73,7 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 				return status.Error(codes.InvalidArgument, "single request did not close its input")
 			}
 			if request.Command.GetNative() != nil {
-				return p.nativeExecute(request.Command.GetNative(), stream)
+				return p.nativeExecute(stream)
 			}
 			return p.scanExecute(stream)
 		}
