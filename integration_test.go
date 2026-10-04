@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -144,8 +145,11 @@ func testLifecycle(t *testing.T, backend string) {
 		if raw.Lookup("n").AsInt64() != 1 || raw.Lookup("ok").AsFloat64() != 1 {
 			t.Fatal("native count mismatch")
 		}
-	} else if resultNative.Response.GetHttp().GetStatusCode() != 200 {
-		t.Fatalf("native HTTP status %d", resultNative.Response.GetHttp().GetStatusCode())
+	} else {
+		metadata, err := weir.ParseHTTPNativeResponse(resultNative.Response)
+		if err != nil || metadata.StatusCode != http.StatusOK {
+			t.Fatalf("native HTTP metadata: %v %v", metadata, err)
+		}
 	}
 	deleteRequest := &weir.DeleteRequest{Resource: builder.resource}
 	deleteOptions := weir.DeleteOptions{StoreName: store, Request: deleteRequest}
@@ -217,14 +221,21 @@ func number(t *testing.T, backend string, data []byte) int64 {
 }
 func nativeRequest(t *testing.T, backend, collection, id string) *weir.NativeRequest {
 	t.Helper()
-	request := &weir.NativeRequest{Resource: collection}
 	if backend == "mongo" {
 		parts := strings.Split(collection, "/")
 		query := bson.D{{Key: "_id", Value: id}}
 		command := bson.D{{Key: "count", Value: parts[len(parts)-1]}, {Key: "query", Value: query}}
-		request.MongoDBCommand = bsonDocument(t, command).Data
-	} else {
-		request.SearchHTTP = &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/" + id}
+		document := bsonDocument(t, command)
+		request := &weir.NativeRequest{Resource: collection, Request: document}
+		return request
+	}
+	httpRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/_doc/"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := weir.NewHTTPNativeRequest(collection, httpRequest)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return request
 }

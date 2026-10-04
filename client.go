@@ -62,7 +62,6 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 		state.pageSize = protocol.ScanPageSize(scan)
 	} else {
 		state.kind = "native"
-		state.nativeHTTP = request.Command.GetNative().GetSearchHttp() != nil
 	}
 	for {
 		response, err := stream.Recv()
@@ -97,12 +96,11 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 }
 
 type streamState struct {
-	kind       string
-	terminal   bool
-	head       bool
-	documents  uint64
-	pageSize   uint64
-	nativeHTTP bool
+	kind      string
+	terminal  bool
+	head      bool
+	documents uint64
+	pageSize  uint64
 }
 
 func (s *streamState) validate(event *pb.Event) error {
@@ -121,7 +119,7 @@ func (s *streamState) validate(event *pb.Event) error {
 		}
 		s.terminal = true
 	case *pb.Event_Head:
-		if s.kind != "native" || s.head || s.nativeHTTP != (value.Head.Http != nil) {
+		if s.kind != "native" || s.head {
 			return errors.New("invalid Native response head")
 		}
 		s.head = true

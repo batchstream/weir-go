@@ -93,16 +93,7 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	if options.Request == nil || options.Consume == nil {
 		return nil, errors.New("Native requires a request and byte consumer")
 	}
-	native := &pb.NativeRequest{Resource: options.Request.Resource}
-	if (options.Request.MongoDBCommand != nil) == (options.Request.SearchHTTP != nil) {
-		return nil, errors.New("Native requires exactly one MongoDB or Search HTTP request")
-	}
-	if options.Request.MongoDBCommand != nil {
-		native.Request = &pb.NativeRequest_MongodbCommand{MongodbCommand: options.Request.MongoDBCommand}
-	} else {
-		native.Request = &pb.NativeRequest_SearchHttp{SearchHttp: options.Request.SearchHTTP}
-	}
-	variant := &pb.Command_Native{Native: native}
+	variant := &pb.Command_Native{Native: options.Request}
 	command := &pb.Command{Operation: variant}
 	request := &pb.ExecuteRequest{StoreName: options.StoreName, Index: 1, Command: command}
 	var result *NativeResult
