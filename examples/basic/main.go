@@ -72,6 +72,6 @@ func run() error {
 		}
 		fmt.Printf("index=%d record=%d bytes missing=%t\n", index, len(read.Document.GetData()), read.Missing)
 	}
-	fmt.Printf("completed %d reads with a validated unary response\n", *count)
+	fmt.Printf("completed %d reads with indexed stream responses\n", *count)
 	return nil
 }

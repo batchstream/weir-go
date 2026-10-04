@@ -147,15 +147,7 @@ func TestBatchPreflightRejectsEntireInputBeforeRPC(t *testing.T) {
 func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
-	document := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
 	mutations := MutateOptions{StoreName: "records"}
-	for range MaxBatchRequestBytes/protocol.MaxDocument + 1 {
-		request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: document}
-		mutations.Requests = append(mutations.Requests, request)
-	}
-	if results, err := Mutate(t.Context(), client, mutations); err == nil || results != nil {
-		t.Fatal("oversized encoded input accepted", len(results), err)
-	}
 	oversized := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxCommandBytes+1)}
 	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: oversized}
 	mutations.Requests = []*MutateRequest{request}
@@ -167,7 +159,7 @@ func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
 	}
 }
 
-func TestMutateBatchLostResponseLeavesEveryResultUnacknowledged(t *testing.T) {
+func TestMutateStreamFailurePreservesConfirmedPrefix(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_partial"}
 	client := clientTestConnection(t, peer)
 	document := &Document{MediaType: "application/json", Data: []byte(`{}`)}
@@ -175,21 +167,21 @@ func TestMutateBatchLostResponseLeavesEveryResultUnacknowledged(t *testing.T) {
 	second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete}
 	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
 	results, err := Mutate(t.Context(), client, options)
-	if err == nil || len(results) != 2 || results[0] != nil || results[1] != nil {
-		t.Fatal("lost batch response exposed acknowledgement", results, err)
+	if err == nil || len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1] != nil {
+		t.Fatal("stream failure lost confirmed prefix or acknowledged missing result", results, err)
 	}
 	if peer.streams.Load() != 1 || peer.received.Load() != 2 {
 		t.Fatal("uncertain mutation replayed", peer.streams.Load(), peer.received.Load())
 	}
 }
 
-func TestReadBatchLostResponseDoesNotExposeEvidence(t *testing.T) {
+func TestReadStreamFinalFailurePreservesConfirmedResults(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_final_error"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records", Requests: []*ReadRequest{clientTestReadRequest(), clientTestReadRequest(), clientTestReadRequest()}}
 	results, err := Read(t.Context(), client, options)
-	if err == nil || len(results) != 3 || results[0] != nil || results[1] != nil || results[2] != nil {
-		t.Fatal("final transport error or validated results lost", results, err)
+	if err == nil || len(results) != 3 || results[0] == nil || results[1] == nil || results[2] == nil {
+		t.Fatal("final transport error or confirmed results lost", results, err)
 	}
 	if peer.streams.Load() != 1 || peer.received.Load() != 3 {
 		t.Fatal("read batch replayed", peer.streams.Load(), peer.received.Load())
@@ -248,14 +240,14 @@ func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 	client := clientTestConnection(t, peer)
 	document := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
 	options := MutateOptions{StoreName: "records"}
-	for range 12 {
+	for range 20 {
 		request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: document}
 		options.Requests = append(options.Requests, request)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	results, err := Mutate(ctx, client, options)
-	if err != nil || len(results) != 12 {
+	if err != nil || len(results) != 20 {
 		t.Fatal("large typed batch failed", len(results), err)
 	}
 	for _, result := range results {
@@ -263,7 +255,7 @@ func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 			t.Fatal("large mutation lost acknowledgement", result)
 		}
 	}
-	if peer.streams.Load() != 1 || peer.received.Load() != 12 {
+	if peer.streams.Load() != 1 || peer.received.Load() != 20 || peer.frames.Load() < 2 || peer.maxBytes.Load() > protocol.MaxRecordFrameBytes {
 		t.Fatal("large batch opened multiple RPCs", peer.streams.Load(), peer.received.Load())
 	}
 }
@@ -272,11 +264,11 @@ func TestReadBatchAcceptsLargeRequestCountWithinByteBudget(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_order"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}
-	for range 513 {
+	for range 3073 {
 		options.Requests = append(options.Requests, clientTestReadRequest())
 	}
 	results, err := Read(t.Context(), client, options)
-	if err != nil || len(results) != 513 || peer.streams.Load() != 1 || peer.received.Load() != 513 {
+	if err != nil || len(results) != 3073 || peer.streams.Load() != 1 || peer.received.Load() != 3073 {
 		t.Fatal("bounded large batch was split or limited by count", len(results), err, peer.streams.Load(), peer.received.Load())
 	}
 }

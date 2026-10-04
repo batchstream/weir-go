@@ -121,6 +121,32 @@ type MutateOptions struct {
 	Requests  []*MutateRequest
 }
 
+// ReadStreamOptions produces a finite sequence without retaining every input or
+// result. Next returns io.EOF after its final item. Items are validated before
+// their frame is sent; an invalid later item does not undo earlier requests.
+// Consume receives each confirmed result in ordinal order, starting at 1.
+// Next and Consume run concurrently; synchronize any shared application state.
+// Both callbacks must honor their context and return promptly. Keep yielded
+// requests and document bytes immutable until the corresponding Consume call.
+type ReadStreamOptions struct {
+	StoreName string
+	Next      func(context.Context) (*ReadRequest, error)
+	Consume   func(context.Context, uint64, *ReadResult) error
+}
+
+// MutateStreamOptions incrementally produces mutations to one Store. Next
+// returns io.EOF after the final item. Consume receives confirmed results in
+// ordinal order; a later error does not revoke those acknowledgements. Items
+// not consumed remain unacknowledged and must never be automatically replayed.
+// Next and Consume run concurrently; synchronize any shared application state.
+// Both callbacks must honor their context and return promptly. Keep yielded
+// requests and document bytes immutable until the corresponding Consume call.
+type MutateStreamOptions struct {
+	StoreName string
+	Next      func(context.Context) (*MutateRequest, error)
+	Consume   func(context.Context, uint64, *MutationResult) error
+}
+
 type WriteOptions struct {
 	StoreName string
 	Request   *WriteRequest

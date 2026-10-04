@@ -4,91 +4,127 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
-	"google.golang.org/grpc"
 )
 
-const MaxBatchRequestBytes = protocol.MaxBatchRequestBytes
-const MaxBatchResponseBytes = protocol.MaxBatchResponseBytes
-
-// Read validates the entire input and sends one typed unary batch. Results have
-// input order. A failed RPC yields no confirmed results and is never replayed.
+// Read validates every input before opening one bounded Execute stream. Results
+// retain input order. A later stream error preserves already confirmed items;
+// unconfirmed positions remain nil. Requests are never automatically replayed.
 func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) ([]*ReadResult, error) {
-	request, err := prepareReads(ctx, options)
-	if err != nil {
+	if err := validateReads(ctx, options); err != nil {
 		return nil, err
 	}
-	return readBatch(ctx, client, request)
+	return readRecords(ctx, client, options)
 }
 
-// Mutate executes one unary batch without retry. Same-resource mutations run in
-// input order, including after item failures; different resources may run in
-// parallel. The batch is not a transaction. A failed RPC leaves every submitted
-// mutation unacknowledged, so any may have applied.
+// Mutate validates every input before opening one bounded Execute stream.
+// Same-resource mutations execute in input order, including after item failures.
+// A later stream error preserves confirmed results; nil positions remain
+// unacknowledged and may have applied. The call is not a transaction or replayed.
 func Mutate(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) ([]*MutationResult, error) {
-	request, err := prepareMutations(ctx, options)
-	if err != nil {
+	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
 	}
-	return mutationBatch(ctx, client, request)
+	return mutateRecords(ctx, client, options)
 }
 
 func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, error) {
-	request, err := prepareReads(ctx, options)
-	if err != nil {
+	if err := validateReads(ctx, options); err != nil {
 		return nil, err
 	}
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err
 	}
-	return readBatch(ctx, client, request)
+	return readRecords(ctx, client, options)
 }
 
 func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*MutationResult, error) {
-	request, err := prepareMutations(ctx, options)
-	if err != nil {
+	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
 	}
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {
 		return nil, err
 	}
-	return mutationBatch(ctx, client, request)
+	return mutateRecords(ctx, client, options)
 }
 
-func prepareReads(ctx context.Context, options ReadOptions) (*pb.ReadBatchRequest, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+func validateReads(ctx context.Context, options ReadOptions) error {
+	if !protocol.ValidStoreName(options.StoreName) || len(options.Requests) == 0 {
+		return errors.New("Read requires a Store and nonempty requests")
 	}
-	request := &pb.ReadBatchRequest{StoreName: options.StoreName, Requests: options.Requests}
-	if err := protocol.ValidateReadBatchRequest(request); err != nil {
-		return nil, err
-	}
-	return request, nil
-}
-
-func prepareMutations(ctx context.Context, options MutateOptions) (*pb.MutateBatchRequest, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	request := &pb.MutateBatchRequest{StoreName: options.StoreName, Requests: make([]*pb.MutateRequest, len(options.Requests))}
 	for index, item := range options.Requests {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
+		}
+		if err := protocol.ValidateReadRequest(item); err != nil {
+			return fmt.Errorf("Read request %d: %w", index+1, err)
+		}
+	}
+	return nil
+}
+
+func validateMutations(ctx context.Context, options MutateOptions) error {
+	if !protocol.ValidStoreName(options.StoreName) || len(options.Requests) == 0 {
+		return errors.New("Mutate requires a Store and nonempty requests")
+	}
+	for index, item := range options.Requests {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		mutation, err := wireMutation(item)
 		if err != nil {
-			return nil, fmt.Errorf("Mutate request %d: %w", index, err)
+			return fmt.Errorf("Mutate request %d: %w", index+1, err)
 		}
-		request.Requests[index] = mutation
+		if err := protocol.ValidateMutationRequest(mutation); err != nil {
+			return fmt.Errorf("Mutate request %d: %w", index+1, err)
+		}
 	}
-	if err := protocol.ValidateMutateBatchRequest(request); err != nil {
-		return nil, err
+	return nil
+}
+
+func readRecords(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) ([]*ReadResult, error) {
+	results := make([]*ReadResult, len(options.Requests))
+	position := 0
+	streamOptions := ReadStreamOptions{StoreName: options.StoreName}
+	streamOptions.Next = func(context.Context) (*ReadRequest, error) {
+		if position == len(options.Requests) {
+			return nil, io.EOF
+		}
+		item := options.Requests[position]
+		position++
+		return item, nil
 	}
-	return request, nil
+	streamOptions.Consume = func(_ context.Context, index uint64, result *ReadResult) error {
+		results[index-1] = result
+		return nil
+	}
+	err := ReadStream(ctx, client, streamOptions)
+	return results, err
+}
+
+func mutateRecords(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) ([]*MutationResult, error) {
+	results := make([]*MutationResult, len(options.Requests))
+	position := 0
+	streamOptions := MutateStreamOptions{StoreName: options.StoreName}
+	streamOptions.Next = func(context.Context) (*MutateRequest, error) {
+		if position == len(options.Requests) {
+			return nil, io.EOF
+		}
+		item := options.Requests[position]
+		position++
+		return item, nil
+	}
+	streamOptions.Consume = func(_ context.Context, index uint64, result *MutationResult) error {
+		results[index-1] = result
+		return nil
+	}
+	err := MutateStream(ctx, client, streamOptions)
+	return results, err
 }
 
 func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
@@ -130,40 +166,4 @@ func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
 		return nil, errors.New("unknown mutation action")
 	}
 	return mutation, nil
-}
-
-func readBatch(ctx context.Context, client pb.StoreServiceClient, request *pb.ReadBatchRequest) ([]*ReadResult, error) {
-	if client == nil {
-		return nil, errors.New("Read requires a client")
-	}
-	results := make([]*ReadResult, len(request.Requests))
-	codec := batchResponseCodec{results: len(request.Requests)}
-	response, err := client.Read(ctx, request, grpc.ForceCodecV2(codec), grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
-	if err != nil {
-		return results, err
-	}
-	if err := protocol.ValidateReadBatchResponse(response, len(request.Requests)); err != nil {
-		return results, err
-	}
-	for index, item := range response.Results {
-		result := &ReadResult{Document: item.GetDocument(), Missing: item.GetMissing() != nil, Failure: item.GetFailure()}
-		results[index] = result
-	}
-	return results, nil
-}
-
-func mutationBatch(ctx context.Context, client pb.StoreServiceClient, request *pb.MutateBatchRequest) ([]*MutationResult, error) {
-	if client == nil {
-		return nil, errors.New("Mutate requires a client")
-	}
-	results := make([]*MutationResult, len(request.Requests))
-	codec := batchResponseCodec{results: len(request.Requests)}
-	response, err := client.Mutate(ctx, request, grpc.ForceCodecV2(codec), grpc.MaxCallSendMsgSize(MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(MaxBatchResponseBytes), grpc.MaxRetryRPCBufferSize(0))
-	if err != nil {
-		return results, fmt.Errorf("Mutate RPC failed; every submitted mutation is unacknowledged: %w", err)
-	}
-	if err := protocol.ValidateMutateBatchResponse(response, len(request.Requests)); err != nil {
-		return results, fmt.Errorf("Mutate response invalid; every submitted mutation is unacknowledged: %w", err)
-	}
-	return response.Results, nil
 }

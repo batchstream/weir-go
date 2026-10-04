@@ -167,7 +167,7 @@ func testLifecycle(t *testing.T, backend string) {
 	if err != nil || readResult == nil || !readResult.Missing {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
-	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered unary batch read-after-write, Scan, native Execute and Delete verified", backend)
+	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered streamed read-after-write, Scan, native Execute and Delete verified", backend)
 }
 
 func applied(t *testing.T, result *weir.MutationResult, err error) {

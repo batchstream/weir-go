@@ -18,7 +18,7 @@ func connectionOptions() []grpc.DialOption {
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
 		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
 		grpc.WithMaxHeaderListSize(16 << 10),
-		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallSendMsgSize(protocol.MaxBatchRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxBatchResponseBytes)),
+		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallSendMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxExecuteResponseBytes)),
 	}
 	return options
 }

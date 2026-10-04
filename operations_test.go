@@ -140,7 +140,7 @@ func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) err
 		events = []*pb.Event{headEvent, emptyEvent, endEvent}
 	}
 	for _, event := range events {
-		frame := &pb.ExecuteResponse{Event: event}
+		frame := &pb.ExecuteResponse{Index: 1, Event: event}
 		if err := stream.Send(frame); err != nil {
 			return err
 		}
