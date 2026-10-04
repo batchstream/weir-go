@@ -1,4 +1,4 @@
-// A finite Execute batch with a bounded native request and incremental response.
+// Native sends one bounded backend request and consumes its response incrementally.
 // Native backend errors remain native response data, not normalized write outcomes.
 package main
 
@@ -62,10 +62,10 @@ func run() error {
 	total := 0
 	opts := weir.NativeOptions{StoreName: *store, Request: request}
 	opts.Consume = func(_ context.Context, event *weir.Event) error {
-		if head := event.GetHead(); head != nil {
+		if head := event.Head; head != nil {
 			fmt.Printf("metadata=%v media=%s\n", head.Metadata, head.BodyMediaType)
 		}
-		total += len(event.GetChunk())
+		total += len(event.Chunk)
 		// Consume native bytes here without collecting the entire response.
 		return nil
 	}

@@ -19,22 +19,26 @@ import (
 
 // Only an explicit tag and operator-provided endpoint enable backend I/O. Each
 // test owns one generated record in a pre-created disposable collection/index.
-func TestMongoLifecycle(t *testing.T)  { testLifecycle(t, "mongo", "WEIR_MONGO_RESOURCE") }
-func TestSearchLifecycle(t *testing.T) { testLifecycle(t, "search", "WEIR_SEARCH_RESOURCE") }
+func TestMongoLifecycle(t *testing.T)  { testLifecycle(t, "mongo") }
+func TestSearchLifecycle(t *testing.T) { testLifecycle(t, "search") }
 
-func testLifecycle(t *testing.T, backend, variable string) {
+func testLifecycle(t *testing.T, backend string) {
 	t.Helper()
-	address, collection := os.Getenv("WEIR_ADDRESS"), os.Getenv(variable)
-	if address == "" || collection == "" {
-		t.Skip("requires WEIR_ADDRESS and " + variable)
+	prefix := "WEIR_" + strings.ToUpper(backend)
+	address := os.Getenv("WEIR_ADDRESS")
+	store := os.Getenv(prefix + "_STORE")
+	collection := os.Getenv(prefix + "_RESOURCE")
+	if address == "" || store == "" || collection == "" {
+		t.Skip("requires WEIR_ADDRESS, " + prefix + "_STORE and " + prefix + "_RESOURCE")
 	}
-	store, _, err := protocol.ParseResource(collection)
-	if err != nil {
-		t.Fatal(err)
+	if !protocol.ValidStoreName(store) {
+		t.Fatal("invalid Store name", store)
+	}
+	if _, err := protocol.ParseRelativeResource(collection); err != nil {
+		t.Fatal("invalid relative collection/index", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	collection = strings.TrimPrefix(collection, "weir://"+store+"/")
 	options := weir.OpenOptions{Seed: address, Stores: []string{store}}
 	client, err := weir.Open(ctx, options)
 	if err != nil {
@@ -81,7 +85,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	read := &weir.ReadRequest{Resource: builder.resource}
 	readOptions := weir.ReadOneOptions{StoreName: store, Request: read}
 	readResult, err := client.ReadOne(ctx, readOptions)
-	if err != nil || readResult.GetDocument() == nil || number(t, backend, readResult.GetDocument().GetData()) != 4 {
+	if err != nil || readResult == nil || readResult.Document == nil || number(t, backend, readResult.Document.GetData()) != 4 {
 		t.Fatalf("persisted read: %v %v", readResult, err)
 	}
 	write.Request = builder.write(5)
@@ -93,7 +97,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 		t.Fatal("batch read failed", batchResults, err)
 	}
 	for _, item := range batchResults {
-		if number(t, backend, item.GetDocument().GetData()) != 5 {
+		if number(t, backend, item.Document.GetData()) != 5 {
 			t.Fatal("read-after-write batch failed")
 		}
 	}
@@ -160,7 +164,7 @@ func testLifecycle(t *testing.T, backend, variable string) {
 	applied(t, result, err)
 	deleted = true
 	readResult, err = client.ReadOne(ctx, readOptions)
-	if err != nil || !readResult.GetMissing() {
+	if err != nil || readResult == nil || !readResult.Missing {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
 	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered unary batch read-after-write, Scan, native Execute and Delete verified", backend)

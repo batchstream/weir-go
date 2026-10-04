@@ -33,14 +33,14 @@ func main() {
 		panic(err)
 	}
 	for index, read := range reads {
-		if read.GetFailure() != nil {
-			panic(read.GetFailure())
+		if read.Failure != nil {
+			panic(read.Failure)
 		}
-		if read.GetMissing() {
+		if read.Missing {
 			fmt.Println(index, "missing")
 			continue
 		}
-		document := read.GetDocument()
+		document := read.Document
 		fmt.Printf("%d %s: %d bytes\n", index, document.MediaType, len(document.Data))
 	}
 }

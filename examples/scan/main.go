@@ -55,7 +55,7 @@ func run() error {
 		if end.Exhausted {
 			return nil
 		}
-		// Scan exposes this token only after the request end and final gRPC OK.
+		// Scan exposes this token only after ScanEnd and final gRPC OK.
 		// The next RPC may be handled by a different Weir instance.
 		request.ContinuationToken = end.NextContinuationToken
 	}

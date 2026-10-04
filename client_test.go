@@ -204,10 +204,10 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error
 	for range count {
 		document := &Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
 		value := &pb.Event_Document{Document: document}
-		event := &pb.Event{Version: 1, Value: value}
+		event := &pb.Event{Value: value}
 		frame := &pb.ExecuteResponse{Event: event}
 		if p.mode == "scan_unknown_fields" {
-			event.ProtoReflect().SetUnknown([]byte{0x10, 1})
+			event.ProtoReflect().SetUnknown([]byte{0xf8, 0x07, 1})
 		}
 		if err := stream.Send(frame); err != nil {
 			return err
@@ -228,7 +228,7 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error
 		end.DocumentCount++
 	}
 	value := &pb.Event_ScanEnd{ScanEnd: end}
-	event := &pb.Event{Version: 1, Value: value}
+	event := &pb.Event{Value: value}
 	frame := &pb.ExecuteResponse{Event: event}
 	if err := stream.Send(frame); err != nil {
 		return err

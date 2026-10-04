@@ -70,14 +70,14 @@ func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions
 		return nil, errors.New("Scan requires a request and document consumer")
 	}
 	variant := &pb.Command_Scan{Scan: options.Request}
-	command := &pb.Command{Version: 1, Operation: variant}
+	command := &pb.Command{Operation: variant}
 	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
 	var end *ScanEnd
-	consume := func(ctx context.Context, event *Event) error {
-		if event.Document != nil {
-			return options.Consume(ctx, event.Document)
+	consume := func(ctx context.Context, event *pb.Event) error {
+		if document := event.GetDocument(); document != nil {
+			return options.Consume(ctx, document)
 		}
-		end = event.ScanEnd
+		end = event.GetScanEnd()
 		return nil
 	}
 	err := execute(ctx, client, request, consume)
@@ -99,10 +99,11 @@ func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOpt
 	open := &pb.NativeOpen{Resource: options.Request.Resource, Descriptor_: options.Request.Descriptor, BodyMediaType: options.Request.BodyMediaType}
 	native := &pb.NativeRequest{Open: open, Body: options.Request.Body}
 	variant := &pb.Command_Native{Native: native}
-	command := &pb.Command{Version: 1, Operation: variant}
+	command := &pb.Command{Operation: variant}
 	request := &pb.ExecuteRequest{StoreName: options.StoreName, Command: command}
 	var end *NativeEnd
-	consume := func(ctx context.Context, event *Event) error {
+	consume := func(ctx context.Context, wire *pb.Event) error {
+		event := &Event{Head: wire.GetHead(), Chunk: wire.GetChunk(), NativeEnd: wire.GetNativeEnd()}
 		if event.NativeEnd != nil {
 			end = event.NativeEnd
 		}

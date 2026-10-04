@@ -140,7 +140,7 @@ func discoveryRead(t *testing.T, client *Client, store string) {
 	defer cancel()
 	options := ReadOneOptions{StoreName: store, Request: clientTestReadRequest()}
 	result, err := client.ReadOne(ctx, options)
-	if err != nil || result == nil || result.GetDocument() == nil {
+	if err != nil || result == nil || result.Document == nil {
 		t.Fatalf("direct Store read: result=%v error=%v", result, err)
 	}
 }

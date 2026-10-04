@@ -17,7 +17,7 @@ func TestReadBatchKeepsInputOrderAndIndividualFailures(t *testing.T) {
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}
 	for range 25 {
-		// Repeated resources still have distinct request IDs and result positions.
+		// Repeated resources retain distinct result positions.
 		request := &ReadRequest{Resource: "records/s:repeated"}
 		options.Requests = append(options.Requests, request)
 	}
@@ -34,12 +34,12 @@ func TestReadBatchKeepsInputOrderAndIndividualFailures(t *testing.T) {
 				t.Fatal("missing result lost", result)
 			}
 		case 2:
-			if result.GetFailure().GetCode() != FailurePermissionDenied {
+			if result.Failure.GetCode() != FailurePermissionDenied {
 				t.Fatal("individual backend failure lost", result)
 			}
 		default:
 			expected := fmt.Sprintf(`{"id":%d}`, index+1)
-			if string(result.GetDocument().GetData()) != expected {
+			if string(result.Document.GetData()) != expected {
 				t.Fatal("result associated with wrong input", index, result)
 			}
 		}
@@ -156,7 +156,7 @@ func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
 	if results, err := Mutate(t.Context(), client, mutations); err == nil || results != nil {
 		t.Fatal("oversized encoded input accepted", len(results), err)
 	}
-	oversized := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxPayload+1)}
+	oversized := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxCommandBytes+1)}
 	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: oversized}
 	mutations.Requests = []*MutateRequest{request}
 	if results, err := Mutate(t.Context(), client, mutations); err == nil || results != nil {
@@ -268,7 +268,7 @@ func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 	}
 }
 
-func TestReadBatchAcceptsMoreThanFormerCountLimit(t *testing.T) {
+func TestReadBatchAcceptsLargeRequestCountWithinByteBudget(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_order"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}

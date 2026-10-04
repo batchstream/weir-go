@@ -24,7 +24,7 @@ func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
 			if mode == "read_missing" && (!result.Missing || result.Failure != nil) {
 				t.Fatal("Read changed missing into failure", result)
 			}
-			if mode == "read_failure" && (result.Missing || result.GetFailure().GetCode() != FailurePermissionDenied) {
+			if mode == "read_failure" && (result.Missing || result.Failure.GetCode() != FailurePermissionDenied) {
 				t.Fatal("Read lost failure evidence", result)
 			}
 		})
@@ -127,14 +127,14 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
 	head := &pb.NativeHead{BodyMediaType: "application/octet-stream"}
 	headValue := &pb.Event_Head{Head: head}
-	headEvent := &pb.Event{Version: 1, Value: headValue}
+	headEvent := &pb.Event{Value: headValue}
 	emptyValue := &pb.Event_Chunk{}
-	emptyEvent := &pb.Event{Version: 1, Value: emptyValue}
+	emptyEvent := &pb.Event{Value: emptyValue}
 	chunkValue := &pb.Event_Chunk{Chunk: []byte("bounded native bytes")}
-	chunkEvent := &pb.Event{Version: 1, Value: chunkValue}
+	chunkEvent := &pb.Event{Value: chunkValue}
 	end := &pb.NativeEnd{Completion: pb.NativeCompletion_RESPONSE_COMPLETE}
 	endValue := &pb.Event_NativeEnd{NativeEnd: end}
-	endEvent := &pb.Event{Version: 1, Value: endValue}
+	endEvent := &pb.Event{Value: endValue}
 	events := []*pb.Event{headEvent, chunkEvent, endEvent}
 	if p.mode == "native_empty_chunk" {
 		events = []*pb.Event{headEvent, emptyEvent, endEvent}

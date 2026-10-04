@@ -3,13 +3,13 @@
 Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.1.
 Initialize through any application node, then send business requests directly to
 its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
-work in Kubernetes and other deployments; URI affinity is not implemented.
+work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.4.2
+go get github.com/batchstream/weir-go@v0.5.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.2.1`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.3.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -45,10 +45,10 @@ context bounds initialization; it does not own the returned client. Open accepts
 1–16 Stores. Discovery may retry read-only initialization; business requests are
 never replayed. A stale directory cache fails closed when its lease expires.
 
-Resources are relative to `StoreName`, without a `weir://STORE/` prefix.
+Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
 are `DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
-`application/bson` with the first `_id` matching the URI key. Search documents
+`application/bson` with the first `_id` matching the resource key. Search documents
 use `application/json`. The caller owns its document codec; the SDK preserves bytes.
 
 ## Business operations
@@ -71,14 +71,14 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 connection or opening their single typed unary RPC. An empty batch, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one outer `StoreName`; full `weir://STORE/` URIs are rejected. Results preserve
+one outer `StoreName`. Results preserve
 input order, including repeated resources. Individual backend failures stay in
 their result positions. A failed RPC returns a result slice of the submitted
 length with nil entries: the whole response is unacknowledged and any mutation
 may have applied. The SDK never automatically replays business requests.
 Before protobuf decoding, each batch reply is checked against the submitted
 request count and the encoded byte budget. Malformed or excess results leave the
-entire batch unacknowledged. The request count adds no separate batch-size cap.
+entire batch unacknowledged.
 
 ```go
 firstDoc := &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
@@ -98,8 +98,7 @@ BackendExpression. A batch is not a transaction. Mutations to the same resource
 execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
 
-There is no independent request-count or in-flight-item limit. Complete protobuf
-request and response envelopes are each bounded at 32 MiB
+Complete protobuf request and response envelopes are each bounded at 32 MiB
 (`MaxBatchRequestBytes`, `MaxBatchResponseBytes`). Documents are bounded at 2 MiB.
 Use smaller batches when documents are large. The SDK validates every result and
 requires exactly one result per input before exposing any unary batch evidence.
@@ -134,9 +133,8 @@ without importing generated protobuf packages. Mongo command bodies use BSON and
 
 Scan and Native each issue one server-streaming RPC with one typed request and
 incrementally consume typed Events. Native chunks are bounded at 64 KiB, Scan
-pages at 256 documents and selectors/transform expressions at 16 KiB. There are
-no per-record Commands, request IDs, fragments, producer callbacks or completion
-frames in the SDK API. Consumers must honor their context and return promptly.
+pages at 256 documents and selectors/transform expressions at 16 KiB. Consumers
+must honor their context and return promptly.
 Do not retain unbounded events or mutate requests/documents while a call runs.
 
 Use caller deadlines. Business operations have no implicit retry or failover.
@@ -150,9 +148,7 @@ methods. The caller owns target validation and connection lifetime for Dial.
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
 mutates a document then reads multiple resources in a single typed batch, [scan](examples/scan/main.go)
 commits finite-page checkpoints, and [native](examples/native/main.go) consumes
-native responses. These examples use SDK request/result/event types. The explicit
-[soak workload](examples/soak/README.md) audits fixed owners and write uncertainty;
-its advanced owner check uses the public discovery transport on the same connection.
+native responses. These examples use SDK request/result/event types.
 
 ```sh
 python3 scripts/download_modules.py
@@ -165,7 +161,7 @@ Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption, scan checkpoints,
 completion/cancellation, no replay, deadline admission, directory expiry/conflicts,
-DNS refresh and fixed-owner workload routing. The full module graph and normal/
+DNS refresh and direct Store routing. The full module graph and normal/
 integration package closures must remain independent of the Weir server. Releases
 require stable unreplaced dependencies and compile a separate ordinary consumer
 that imports only this SDK for all business operations.
@@ -174,15 +170,17 @@ Real backend tests require an explicit tag and operator-provided fixtures:
 
 ```sh
 WEIR_ADDRESS=127.0.0.1:7447 \
-WEIR_MONGO_RESOURCE=weir://mongo/weir_acceptance/records \
-WEIR_SEARCH_RESOURCE=weir://search/weir_acceptance \
+WEIR_MONGO_STORE=mongo \
+WEIR_MONGO_RESOURCE=weir_acceptance/records \
+WEIR_SEARCH_STORE=search \
+WEIR_SEARCH_RESOURCE=weir_acceptance \
 go test -race -tags integration -run 'Test(Mongo|Search)Lifecycle' -v .
 ```
 
 Pre-create disposable collections/indexes. Each backend owns one generated record
-and checks the typed operations, Complete-gated mixed Execute, Scan and Native.
-The [qualification record](docs/qualification.md) separates current protocol checks
-from historical release/deployment evidence.
+and checks unary reads/mutations, Scan and Native. System integration tests,
+backend fault tests and throughput benchmarks belong to the independent
+[weir-tests](https://github.com/batchstream/weir-tests) repository.
 
 Application and peer listeners use plaintext gRPC; restrict their network access.
 This repository follows the upstream project's current licensing status; no new
