@@ -131,7 +131,7 @@ func wireMutation(request *MutateRequest) (*pb.MutateRequest, error) {
 	if request == nil {
 		return nil, errors.New("missing mutation")
 	}
-	mutation := &pb.MutateRequest{Resource: request.Resource, AdapterOptions: request.AdapterOptions}
+	mutation := &pb.MutateRequest{Resource: request.Resource}
 	switch request.Action {
 	case MutationCreate, MutationPut, MutationReplace:
 		if request.Document == nil || request.Program != nil || request.BackendExpression != nil {

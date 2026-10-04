@@ -48,9 +48,8 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 	client := clientTestConnection(t, peer)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	document := &Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
-	adapter := &Document{MediaType: "application/json", Data: []byte(`{"option":true}`)}
-	request := &WriteRequest{Resource: "records/s:key", Document: document, AdapterOptions: adapter}
+	document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
+	request := &WriteRequest{Resource: "records/s:key", Document: document}
 	write := WriteOptions{StoreName: "records", Request: request}
 	for _, action := range []string{"create", "put", "replace", "delete", "transform"} {
 		var result *MutationResult
@@ -63,12 +62,12 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 		case "replace":
 			result, err = Replace(ctx, client, write)
 		case "delete":
-			request := &DeleteRequest{Resource: "records/s:key", AdapterOptions: adapter}
+			request := &DeleteRequest{Resource: "records/s:key"}
 			options := DeleteOptions{StoreName: "records", Request: request}
 			result, err = Delete(ctx, client, options)
 		case "transform":
 			program := &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
-			request := &AtomicTransformRequest{Resource: "records/s:key", Program: program, AdapterOptions: adapter}
+			request := &AtomicTransformRequest{Resource: "records/s:key", Program: program}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
 			result, err = AtomicTransform(ctx, client, options)
 		}
@@ -76,8 +75,8 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 			t.Fatal(action, result, err)
 		}
 		mutation := <-peer.mutations
-		if mutation.Resource != request.Resource || string(mutation.AdapterOptions.Data) != string(adapter.Data) {
-			t.Fatal("typed operation lost resource or adapter options", action, mutation)
+		if mutation.Resource != request.Resource {
+			t.Fatal("typed operation lost its resource", action, mutation)
 		}
 		selected := false
 		switch action {
@@ -109,7 +108,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 			request := &AtomicTransformRequest{Resource: "records/s:key"}
 			if both {
 				request.Program = &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
-				request.BackendExpression = &Document{MediaType: "application/json", Data: []byte(`{}`)}
+				request.BackendExpression = &Document{ContentType: "application/json", Data: []byte(`{}`)}
 			}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -125,7 +124,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 }
 
 func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
-	head := &pb.NativeHead{BodyMediaType: "application/octet-stream"}
+	head := &pb.NativeHead{BodyContentType: "application/octet-stream"}
 	headValue := &pb.Event_Head{Head: head}
 	headEvent := &pb.Event{Value: headValue}
 	emptyValue := &pb.Event_Chunk{}
@@ -156,7 +155,7 @@ func TestNativeIncrementalEventsPreserveTerminalEvidence(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
-			descriptor := &Document{MediaType: "application/vnd.weir.search-http.v1+protobuf"}
+			descriptor := &Document{ContentType: "application/vnd.weir.search-http.v1+protobuf"}
 			request := &NativeRequest{Resource: "records", Descriptor: descriptor}
 			chunks, heads, terminals, bytes := 0, 0, 0, 0
 			failure := errors.New("terminal consumer rejected output")
@@ -199,7 +198,7 @@ func TestNativeIncrementalEventsPreserveTerminalEvidence(t *testing.T) {
 func TestNativeRejectsEmptyWireChunk(t *testing.T) {
 	peer := &clientTestPeer{mode: "native_empty_chunk"}
 	client := clientTestConnection(t, peer)
-	descriptor := &Document{MediaType: "application/vnd.weir.search-http.v1+protobuf"}
+	descriptor := &Document{ContentType: "application/vnd.weir.search-http.v1+protobuf"}
 	request := &NativeRequest{Resource: "records", Descriptor: descriptor}
 	chunks := 0
 	options := NativeOptions{StoreName: "records", Request: request}

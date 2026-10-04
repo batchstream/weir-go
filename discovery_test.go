@@ -436,7 +436,7 @@ func TestDiscoveredWriteLossIsNeverReplayed(t *testing.T) {
 	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
 	options := OpenOptions{Seed: seedListener.address, Stores: []string{"records"}}
 	client := openDiscovery(t, options)
-	document := &Document{MediaType: "application/octet-stream", Data: []byte("one write")}
+	document := &Document{ContentType: "application/octet-stream", Data: []byte("one write")}
 	request := &WriteRequest{Resource: "records/s:key", Document: document}
 	record := WriteOptions{StoreName: "records", Request: request}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)

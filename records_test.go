@@ -12,7 +12,7 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
-func TestReadBatchKeepsInputOrderAndIndividualFailures(t *testing.T) {
+func TestReadKeepsInputOrderAndIndividualFailures(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_order"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}
@@ -52,7 +52,7 @@ func TestReadBatchKeepsInputOrderAndIndividualFailures(t *testing.T) {
 func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_mutate_order", mutations: make(chan *pb.MutateRequest, 5)}
 	client := clientTestConnection(t, peer)
-	document := &Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+	document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
 	program := &ProgramTransform{Runtime: "lua.v1", Source: []byte("return doc")}
 	options := MutateOptions{StoreName: "records"}
 	for _, action := range []MutationAction{MutationCreate, MutationPut, MutationReplace, MutationDelete, MutationAtomicTransform} {
@@ -111,11 +111,7 @@ func TestBatchPreflightRejectsEntireInputBeforeRPC(t *testing.T) {
 	if results, err := Read(t.Context(), client, options); err == nil || results != nil {
 		t.Fatal("invalid store accepted", results, err)
 	}
-	badMedia := &ReadRequest{Resource: "records/s:key", ReadMediaType: "not-a-media-type"}
-	options.StoreName, options.Requests = "records", []*ReadRequest{clientTestReadRequest(), badMedia}
-	if results, err := Read(t.Context(), client, options); err == nil || results != nil {
-		t.Fatal("invalid read envelope accepted", results, err)
-	}
+	options.StoreName = "records"
 	options.Requests = nil
 	for range 12 {
 		options.Requests = append(options.Requests, clientTestReadRequest())
@@ -124,7 +120,7 @@ func TestBatchPreflightRejectsEntireInputBeforeRPC(t *testing.T) {
 	if results, err := Read(t.Context(), client, options); err == nil || results != nil {
 		t.Fatal("late invalid input sent earlier valid requests", results, err)
 	}
-	document := &Document{MediaType: "application/json", Data: []byte(`{}`)}
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
 	valid := &MutateRequest{Resource: "records/s:first", Action: MutationPut, Document: document}
 	for _, invalid := range []*MutateRequest{
 		nil,
@@ -148,7 +144,7 @@ func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
 	mutations := MutateOptions{StoreName: "records"}
-	oversized := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxCommandBytes+1)}
+	oversized := &Document{ContentType: "application/octet-stream", Data: make([]byte, protocol.MaxCommandBytes+1)}
 	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: oversized}
 	mutations.Requests = []*MutateRequest{request}
 	if results, err := Mutate(t.Context(), client, mutations); err == nil || results != nil {
@@ -162,7 +158,7 @@ func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
 func TestMutateStreamFailurePreservesConfirmedPrefix(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_partial"}
 	client := clientTestConnection(t, peer)
-	document := &Document{MediaType: "application/json", Data: []byte(`{}`)}
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
 	first := &MutateRequest{Resource: "records/s:first", Action: MutationPut, Document: document}
 	second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete}
 	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
@@ -170,7 +166,7 @@ func TestMutateStreamFailurePreservesConfirmedPrefix(t *testing.T) {
 	if err == nil || len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1] != nil {
 		t.Fatal("stream failure lost confirmed prefix or acknowledged missing result", results, err)
 	}
-	if peer.streams.Load() != 1 || peer.received.Load() != 2 {
+	if peer.streams.Load() != 1 || peer.received.Load() != 1 {
 		t.Fatal("uncertain mutation replayed", peer.streams.Load(), peer.received.Load())
 	}
 }
@@ -222,7 +218,7 @@ func TestClientBatchesRouteDirectlyToOneInitializedStore(t *testing.T) {
 	if err != nil || len(readResults) != 2 || readResults[0] == nil || !readResults[1].Missing {
 		t.Fatal("direct read batch failed", readResults, err)
 	}
-	document := &Document{MediaType: "application/json", Data: []byte(`{}`)}
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
 	first := &MutateRequest{Resource: "records/s:first", Action: MutationPut, Document: document}
 	second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete}
 	mutation := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
@@ -238,7 +234,7 @@ func TestClientBatchesRouteDirectlyToOneInitializedStore(t *testing.T) {
 func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
-	document := &Document{MediaType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
+	document := &Document{ContentType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
 	options := MutateOptions{StoreName: "records"}
 	for range 20 {
 		request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: document}
@@ -255,12 +251,12 @@ func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 			t.Fatal("large mutation lost acknowledgement", result)
 		}
 	}
-	if peer.streams.Load() != 1 || peer.received.Load() != 20 || peer.frames.Load() < 2 || peer.maxBytes.Load() > protocol.MaxRecordFrameBytes {
+	if peer.streams.Load() != 1 || peer.received.Load() != 20 || peer.maxBytes.Load() > protocol.MaxExecuteRequestBytes {
 		t.Fatal("large batch opened multiple RPCs", peer.streams.Load(), peer.received.Load())
 	}
 }
 
-func TestReadBatchAcceptsLargeRequestCountWithinByteBudget(t *testing.T) {
+func TestReadAcceptsLargeRequestSequence(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_order"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}

@@ -40,10 +40,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	document := &weir.Document{MediaType: "application/bson", Data: data}
+	document := &weir.Document{ContentType: "application/bson", Data: data}
 	if *storeName == "search" {
 		target = weir.EncodeSegment(*index) + "/s:example"
-		document = &weir.Document{MediaType: "application/json", Data: []byte(`{"n":1}`)}
+		document = &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
 	}
 	request := &weir.MutateRequest{Resource: target, Action: weir.MutationPut, Document: document}
 	opts := weir.MutateOptions{StoreName: *storeName, Requests: []*weir.MutateRequest{request}}

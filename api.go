@@ -50,14 +50,12 @@ const (
 func EncodeSegment(segment string) string { return protocol.EncodeSegment(segment) }
 
 type WriteRequest struct {
-	Resource       string
-	Document       *Document
-	AdapterOptions *Document
+	Resource string
+	Document *Document
 }
 
 type DeleteRequest struct {
-	Resource       string
-	AdapterOptions *Document
+	Resource string
 }
 
 // AtomicTransformRequest requires exactly one of Program and BackendExpression.
@@ -65,14 +63,13 @@ type AtomicTransformRequest struct {
 	Resource          string
 	Program           *ProgramTransform
 	BackendExpression *Document
-	AdapterOptions    *Document
 }
 
 type NativeRequest struct {
-	Resource      string
-	Descriptor    *Document
-	BodyMediaType string
-	Body          []byte
+	Resource        string
+	Descriptor      *Document
+	BodyContentType string
+	Body            []byte
 }
 
 // ReadOneOptions describes a single read. Use ReadOptions to share one RPC across
@@ -82,7 +79,7 @@ type ReadOneOptions struct {
 	Request   *ReadRequest
 }
 
-// ReadOptions describes a finite read batch addressed to one Store. Resources
+// ReadOptions describes a finite read sequence addressed to one Store. Resources
 // are canonical paths relative to StoreName. Results have the input order. Do
 // not mutate requests or their document bytes until the call returns.
 type ReadOptions struct {
@@ -109,7 +106,6 @@ type MutateRequest struct {
 	Document          *Document
 	Program           *ProgramTransform
 	BackendExpression *Document
-	AdapterOptions    *Document
 }
 
 // MutateOptions describes independent mutations addressed to one Store. It is
@@ -123,7 +119,7 @@ type MutateOptions struct {
 
 // ReadStreamOptions produces a finite sequence without retaining every input or
 // result. Next returns io.EOF after its final item. Items are validated before
-// their frame is sent; an invalid later item does not undo earlier requests.
+// they are sent; an invalid later item does not undo earlier requests.
 // Consume receives each confirmed result in ordinal order, starting at 1.
 // Next and Consume run concurrently; synchronize any shared application state.
 // Both callbacks must honor their context and return promptly. Keep yielded

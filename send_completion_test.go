@@ -105,7 +105,7 @@ func TestSingleExecuteWaitsForSendAfterTerminalEOF(t *testing.T) {
 					_, err := Scan(ctx, client, options)
 					done <- err
 				} else {
-					descriptor := &Document{MediaType: "application/octet-stream"}
+					descriptor := &Document{ContentType: "application/octet-stream"}
 					request := &NativeRequest{Resource: "records", Descriptor: descriptor}
 					options := NativeOptions{StoreName: "records", Request: request}
 					options.Consume = func(context.Context, *Event) error { return nil }
@@ -168,11 +168,11 @@ func TestLocalSendFailureCancelsReceiveAndJoins(t *testing.T) {
 	}
 }
 
-func TestNativeLocalProtobufSendFailureStopsRealRPC(t *testing.T) {
+func TestNativeRejectsInvalidBodyContentTypeBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{}
 	client := clientTestConnection(t, peer)
-	descriptor := &Document{MediaType: "application/octet-stream"}
-	request := &NativeRequest{Resource: "records", Descriptor: descriptor, BodyMediaType: string([]byte{0xff})}
+	descriptor := &Document{ContentType: "application/octet-stream"}
+	request := &NativeRequest{Resource: "records", Descriptor: descriptor, BodyContentType: string([]byte{0xff})}
 	options := NativeOptions{StoreName: "records", Request: request}
 	options.Consume = func(context.Context, *Event) error { return nil }
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)

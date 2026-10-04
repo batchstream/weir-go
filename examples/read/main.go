@@ -41,6 +41,6 @@ func main() {
 			continue
 		}
 		document := read.Document
-		fmt.Printf("%d %s: %d bytes\n", index, document.MediaType, len(document.Data))
+		fmt.Printf("%d %s: %d bytes\n", index, document.ContentType, len(document.Data))
 	}
 }

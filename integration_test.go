@@ -101,7 +101,7 @@ func testLifecycle(t *testing.T, backend string) {
 			t.Fatal("read-after-write batch failed")
 		}
 	}
-	selector := &weir.Document{MediaType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
+	selector := &weir.Document{ContentType: "application/json", Data: []byte(`{"query":{"ids":{"values":["` + id + `"]}}}`)}
 	if backend == "mongo" {
 		filter := bson.D{{Key: "_id", Value: id}}
 		query := bson.D{{Key: "filter", Value: filter}}
@@ -182,7 +182,7 @@ func bsonDocument(t *testing.T, value bson.D) *weir.Document {
 	if err != nil {
 		t.Fatal(err)
 	}
-	document := &weir.Document{MediaType: "application/bson", Data: data}
+	document := &weir.Document{ContentType: "application/bson", Data: data}
 	return document
 }
 
@@ -193,7 +193,7 @@ type mutationBuilder struct {
 
 func (b mutationBuilder) write(n int) *weir.WriteRequest {
 	b.t.Helper()
-	document := &weir.Document{MediaType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
+	document := &weir.Document{ContentType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d}`, n))}
 	if b.backend == "mongo" {
 		value := bson.D{{Key: "_id", Value: b.id}, {Key: "n", Value: n}}
 		document = bsonDocument(b.t, value)
@@ -203,12 +203,12 @@ func (b mutationBuilder) write(n int) *weir.WriteRequest {
 }
 func (b mutationBuilder) transform(n int) *weir.AtomicTransformRequest {
 	b.t.Helper()
-	expression := &weir.Document{MediaType: "application/vnd.weir.search-update.v1+json", Data: []byte(fmt.Sprintf(`{"doc":{"n":%d}}`, n))}
+	expression := &weir.Document{ContentType: "application/vnd.weir.search-update.v1+json", Data: []byte(fmt.Sprintf(`{"doc":{"n":%d}}`, n))}
 	if b.backend == "mongo" {
 		fields := bson.D{{Key: "n", Value: n}}
 		update := bson.D{{Key: "$set", Value: fields}}
 		expression = bsonDocument(b.t, update)
-		expression.MediaType = "application/vnd.weir.mongodb-update.v1+bson"
+		expression.ContentType = "application/vnd.weir.mongodb-update.v1+bson"
 	}
 	request := &weir.AtomicTransformRequest{Resource: b.resource, BackendExpression: expression}
 	return request
@@ -234,8 +234,8 @@ func nativeRequest(t *testing.T, backend, collection, id string) *weir.NativeReq
 		query := bson.D{{Key: "_id", Value: id}}
 		command := bson.D{{Key: "count", Value: parts[len(parts)-1]}, {Key: "query", Value: query}}
 		request.Body = bsonDocument(t, command).Data
-		request.Descriptor = &weir.Document{MediaType: "application/vnd.weir.mongodb-command.v1+protobuf"}
-		request.BodyMediaType = "application/bson"
+		request.Descriptor = &weir.Document{ContentType: "application/vnd.weir.mongodb-command.v1+protobuf"}
+		request.BodyContentType = "application/bson"
 	} else {
 		descriptor := &weir.SearchHTTPRequest{Method: "GET", Path: "/_doc/" + id}
 		encoded, err := weir.SearchHTTPDescriptor(descriptor)
