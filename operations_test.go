@@ -69,7 +69,7 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 			options := DeleteOptions{StoreName: "records", Request: request}
 			result, err = Delete(ctx, client, options)
 		case "transform":
-			program := &LuaTransform{Source: []byte("return doc")}
+			program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
 			request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
 			result, err = AtomicTransform(ctx, client, options)
@@ -110,7 +110,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 			client := clientTestConnection(t, peer)
 			request := &AtomicTransformRequest{Resource: "records/s:key"}
 			if both {
-				request.Lua = &LuaTransform{Source: []byte("return doc")}
+				request.Lua = &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
 				request.BackendExpression = &Document{ContentType: "application/json", Data: []byte(`{}`)}
 			}
 			options := AtomicTransformOptions{StoreName: "records", Request: request}
