@@ -330,7 +330,7 @@ func TestOpenValidatesWholeMappingAndBoundsDeadTargets(t *testing.T) {
 	_ = dead.Close()
 	seed := &discoveryPeer{}
 	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
-	for _, invalid := range []string{"wrong-store", "bad-target", "duplicate-target", "empty-ttl", "overflow-ttl", "unknown-field", "dead-only"} {
+	for _, invalid := range []string{"wrong-store", "bad-target", "duplicate-target", "empty-ttl", "overflow-ttl", "dead-only"} {
 		t.Run(invalid, func(t *testing.T) {
 			response := discoveryRecord("records", targetListener.address)
 			switch invalid {
@@ -344,8 +344,6 @@ func TestOpenValidatesWholeMappingAndBoundsDeadTargets(t *testing.T) {
 				response.CacheTtlMs = 0
 			case "overflow-ttl":
 				response.CacheTtlMs = ^uint64(0)
-			case "unknown-field":
-				response.ProtoReflect().SetUnknown([]byte{0x22, 0x01, 0x00})
 			case "dead-only":
 				response.Endpoints = []string{deadAddress}
 			}
@@ -370,6 +368,23 @@ func TestOpenValidatesWholeMappingAndBoundsDeadTargets(t *testing.T) {
 	discoveryRead(t, client, "records")
 	if seed.executions.Load() != 0 {
 		t.Fatal("initialization sent a business request")
+	}
+}
+
+func TestOpenAcceptsAdditiveDirectoryFields(t *testing.T) {
+	business := &clientTestPeer{mode: "normal"}
+	target := &discoveryPeer{business: business}
+	targetListener := listenDiscovery(t, target, "127.0.0.1:0")
+	response := discoveryRecord("records", targetListener.address)
+	addResponseFields(response)
+	seed := &discoveryPeer{}
+	seed.set("records", response)
+	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
+	options := OpenOptions{Seed: seedListener.address, Stores: []string{"records"}}
+	client := openDiscovery(t, options)
+	discoveryRead(t, client, "records")
+	if target.executions.Load() != 1 || seed.executions.Load() != 0 {
+		t.Fatal("additive directory fields changed business routing")
 	}
 }
 
