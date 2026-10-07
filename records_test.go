@@ -53,7 +53,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_mutate_order", mutations: make(chan *pb.MutateRequest, 5)}
 	client := clientTestConnection(t, peer)
 	document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-	program := &LuaTransform{Source: []byte("return doc")}
+	program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
 	options := MutateOptions{StoreName: "records"}
 	for _, action := range []MutationAction{MutationCreate, MutationPut, MutationReplace, MutationDelete, MutationAtomicTransform} {
 		request := &MutateRequest{Resource: "records/s:key", Action: action}
