@@ -55,6 +55,27 @@ func TestScanRejectsInvalidProjectionBeforeRPC(t *testing.T) {
 	}
 }
 
+func TestRequestExtensionsRejectBeforeRPC(t *testing.T) {
+	peer := &clientTestPeer{}
+	client := clientTestConnection(t, peer)
+	read := clientTestReadRequest()
+	addResponseFields(read)
+	readOptions := ReadOneOptions{StoreName: "records", Request: read}
+	if result, err := ReadOne(t.Context(), client, readOptions); result != nil || err == nil {
+		t.Fatal("unknown request option was silently ignored", result, err)
+	}
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
+	addResponseFields(document)
+	write := &WriteRequest{Resource: "records/s:key", Document: document}
+	writeOptions := WriteOptions{StoreName: "records", Request: write}
+	if result, err := Put(t.Context(), client, writeOptions); result != nil || err == nil {
+		t.Fatal("unknown document option was silently ignored", result, err)
+	}
+	if peer.streams.Load() != 0 {
+		t.Fatal("unsupported request extensions opened an RPC")
+	}
+}
+
 func TestNativeAcceptsNewStoreFormatsWithoutSchemaSelection(t *testing.T) {
 	for _, mode := range []string{"native_normal", "native_no_metadata"} {
 		peer := &clientTestPeer{mode: mode}

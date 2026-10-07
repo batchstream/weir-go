@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.9.0
+go get github.com/batchstream/weir-go@v0.10.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.7.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.8.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -129,6 +129,14 @@ cannot establish whether it applied. A later RPC failure does not revoke any
 confirmed item. Unconfirmed nil positions may have applied; reconcile them through
 application knowledge and never automatically replay writes.
 
+Responses may contain additive protobuf fields that this SDK does not recognize.
+Those fields are ignored while required result variants, completion evidence,
+document envelopes, indexes and byte bounds remain validated. A future positive
+`FailureCode` is retained unchanged as a generic business failure; an unknown code
+never authorizes a retry or changes a confirmed `MutationApplied` outcome.
+Unknown request fields are rejected so unsupported execution options cannot be
+silently ignored. New execution semantics require an explicit protocol boundary.
+
 ### Lua transforms
 
 `LuaTransform` accepts UTF-8 Source and optional Input. Source must return exactly
@@ -156,8 +164,10 @@ or `weir.keep()`, `weir.delete()` or `weir.reject(message)`. Reject returns
 NOT_APPLIED with PRECONDITION_FAILED; nil, missing/multiple returns and scalar
 results are errors. `weir.object()` and `weir.array()` distinguish empty containers.
 Lua integers preserve 64 bits, and `weir.time.now()` returns one fixed UTC timestamp
-per operation, including confirmed conflict retries. The old global-value/helper
-API is removed. See the server's [Lua guide](https://github.com/batchstream/weir/blob/main/docs/lua.md).
+per operation, including confirmed conflict retries. This function entry point,
+return contract, helper behavior and document conversion are part of `weir.v1`;
+changes to their meaning require an explicit protocol boundary. See the server's
+[Lua guide](https://github.com/batchstream/weir/blob/main/docs/lua.md).
 Concurrent first creation can trigger a bounded fresh read/evaluation after a
 confirmed conflict. An ambiguous write or commit acknowledgement never triggers
 automatic replay.
@@ -188,6 +198,15 @@ For Mongo, marshal the native object directly, for example `bson.D{{Key: "state"
 Value: "ready"}}`, into an `application/bson` Filter. Traversal ordering belongs to
 the adapter. Continuations bind Store, resource, filter and projection; repeat those
 settings with the returned token, while page size may change.
+
+Scan is read-only and returns documents. Tokens are opaque, versioned and usable
+on another equivalent Store replica without issuer process state. Continuation
+requires the same backing target and adapter traversal profile; compatible token
+readers must remain available throughout a rolling upgrade. Mongo traverses by
+ascending native BSON `_id` without a cross-page snapshot or token expiry. Search
+uses a backend point-in-time snapshot with a 60-second keep-alive renewed by
+backend requests. An expired or lost snapshot fails continuation; it never starts
+a replacement traversal silently.
 
 `Scan` consumes a finite page incrementally. A transport, protocol or consumer
 failure returns a Go error and no ScanEnd; keep the previous checkpoint. A completed

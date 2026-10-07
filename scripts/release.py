@@ -85,7 +85,7 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     remove := &weir.DeleteRequest{Resource: read.Resource}
     deleteOptions := weir.DeleteOptions{StoreName: "records", Request: remove}
     _, _ = client.Delete(ctx, deleteOptions)
-    lua := &weir.LuaTransform{Source: []byte("return weir.keep()"), Input: document}
+    lua := &weir.LuaTransform{Source: []byte("return function(current, incoming) return weir.keep() end"), Input: document}
     transform := &weir.AtomicTransformRequest{Resource: read.Resource, Lua: lua}
     transformOptions := weir.AtomicTransformOptions{StoreName: "records", Request: transform}
     _, _ = client.AtomicTransform(ctx, transformOptions)

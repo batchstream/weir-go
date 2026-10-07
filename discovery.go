@@ -226,7 +226,7 @@ func (c *Client) resolve(ctx context.Context, seed *addressChannel, store string
 	if err != nil {
 		return nil, fmt.Errorf("resolve Store %s: %w", store, err)
 	}
-	if response == nil || response.StoreName != store || response.CacheTtlMs == 0 || response.CacheTtlMs > uint64(protocol.MaxDiscoveryCacheTTL/time.Millisecond) || len(response.ProtoReflect().GetUnknown()) != 0 {
+	if response == nil || response.StoreName != store || response.CacheTtlMs == 0 || response.CacheTtlMs > uint64(protocol.MaxDiscoveryCacheTTL/time.Millisecond) {
 		return nil, fmt.Errorf("resolve Store %s: invalid directory response", store)
 	}
 	endpoints, err := protocol.CanonicalEndpoints(response.Endpoints)
