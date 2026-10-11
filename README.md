@@ -352,11 +352,14 @@ WEIR_MONGO_STORE=mongo \
 WEIR_MONGO_RESOURCE=weir_acceptance/records \
 WEIR_SEARCH_STORE=search \
 WEIR_SEARCH_RESOURCE=weir_acceptance \
-go test -race -tags integration -run 'Test(Mongo|Search)Lifecycle' -v .
+go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|StreamingAndPagination)' -v .
 ```
 
-Pre-create disposable collections/indexes. Each backend owns one generated record
-and checks streamed reads/mutations, Scan and Native. System integration tests,
+Pre-create disposable collections/indexes. Each test creates and cleans up only
+its generated records. Lifecycle tests cover CRUD, backend expressions, Scan and
+Native; streaming tests verify same-resource ordering through an individual
+failure, Lua persistence, repeated and missing reads, projection and multi-page
+checkpoints continued through a reopened client. System integration tests,
 backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 
