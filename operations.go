@@ -30,7 +30,7 @@ func Replace(ctx context.Context, client pb.StoreServiceClient, options WriteOpt
 func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOptions, action MutationAction) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document, WaitUntilVisible: options.Request.WaitUntilVisible}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -39,7 +39,7 @@ func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOp
 func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOptions) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete, WaitUntilVisible: options.Request.WaitUntilVisible}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
@@ -48,7 +48,7 @@ func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOpt
 func AtomicTransform(ctx context.Context, client pb.StoreServiceClient, options AtomicTransformOptions) (*MutationResult, error) {
 	var request *MutateRequest
 	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Lua: options.Request.Lua, BackendExpression: options.Request.BackendExpression}
+		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Lua: options.Request.Lua, BackendExpression: options.Request.BackendExpression, WaitUntilVisible: options.Request.WaitUntilVisible}
 	}
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)

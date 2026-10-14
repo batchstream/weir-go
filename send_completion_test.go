@@ -18,7 +18,7 @@ type completionClient struct {
 	stream *completionStream
 }
 
-func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOption) (pb.StoreService_ExecuteClient, error) {
+func (client *completionClient) ExecuteV2(ctx context.Context, _ ...grpc.CallOption) (pb.StoreService_ExecuteV2Client, error) {
 	client.stream.ctx = ctx
 	return client.stream, nil
 }

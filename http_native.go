@@ -19,14 +19,17 @@ type HTTPNativeResponse struct {
 }
 
 // NewHTTPNativeRequest serializes a standard HTTP/1.1 request using an origin-form
-// request target. It consumes and closes request.Body. The owning adapter decides
-// which methods, paths and headers it supports; Host does not select a Store.
+// request target. It consumes and closes request.Body. Native imposes no method,
+// path or parameter allowlist. Resource is an optional
+// target prefix; empty addresses the backend root. Host does not select a Store.
 func NewHTTPNativeRequest(resource string, request *http.Request) (*NativeRequest, error) {
 	if request == nil || request.URL == nil || request.URL.Opaque != "" || !strings.HasPrefix(request.URL.RequestURI(), "/") {
 		return nil, errors.New("Native HTTP requires an origin-form request target")
 	}
-	if _, err := protocol.ParseRelativeResource(resource); err != nil {
-		return nil, err
+	if resource != "" {
+		if _, err := protocol.ParseRelativeResource(resource); err != nil {
+			return nil, err
+		}
 	}
 	if len(request.Trailer) != 0 || request.Header.Get("Trailer") != "" {
 		return nil, errors.New("Native HTTP requires a complete body without trailers")

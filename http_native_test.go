@@ -67,6 +67,33 @@ func TestHTTPNativeRequestPreservesExplicitUserAgent(t *testing.T) {
 	}
 }
 
+func TestHTTPNativeBackendRootPreservesNativeOptions(t *testing.T) {
+	request, err := http.NewRequestWithContext(t.Context(), "CUSTOM", "/_plugins/example%2Ftarget?filter=a%2Fb&filter=c", strings.NewReader("opaque body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/vendor-format; version=2")
+	request.Header.Set("Accept-Encoding", "gzip")
+	request.Header["X-Native"] = []string{"first", "second"}
+	native, err := NewHTTPNativeRequest("", request)
+	if err != nil {
+		t.Fatal("backend root rejected", err)
+	}
+	if failure := protocol.ValidateNative(native); failure != nil {
+		t.Fatal("helper produced an invalid Native request", failure)
+	}
+	reader := bufio.NewReader(bytes.NewReader(native.Request.Data))
+	parsed, err := http.ReadRequest(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parsed.Body.Close()
+	body, err := io.ReadAll(parsed.Body)
+	if err != nil || native.Resource != "" || parsed.Method != "CUSTOM" || parsed.RequestURI != request.URL.RequestURI() || parsed.Header.Get("Content-Type") != request.Header.Get("Content-Type") || parsed.Header.Get("Accept-Encoding") != "gzip" || len(parsed.Header.Values("X-Native")) != 2 || string(body) != "opaque body" {
+		t.Fatal("Native codec changed opaque backend options", native.Resource, parsed, string(body), err)
+	}
+}
+
 type boundedHTTPBody struct {
 	read   int
 	closed bool
@@ -119,6 +146,15 @@ func TestHTTPNativeResponseParsesHeaderOnlyMetadata(t *testing.T) {
 	parsed, err := ParseHTTPNativeResponse(response)
 	if err != nil || parsed.StatusCode != 404 || parsed.Headers.Get("Content-Length") != "100" || len(parsed.Headers.Values("X-Example")) != 2 {
 		t.Fatal("body-free HTTP metadata lost status or headers", parsed, err)
+	}
+}
+
+func TestHTTPNativeResponseRetainsCompressionAndCustomHeaders(t *testing.T) {
+	metadata := &Document{ContentType: "application/http", Data: []byte("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nX-Native: first\r\nX-Native: second\r\n\r\n")}
+	response := &NativeResponse{Metadata: metadata}
+	parsed, err := ParseHTTPNativeResponse(response)
+	if err != nil || parsed == nil || parsed.Headers.Get("Content-Encoding") != "gzip" || len(parsed.Headers.Values("X-Native")) != 2 || response.BodyContentType != "" {
+		t.Fatal("Native response options were dropped or synthesized", parsed, response, err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -62,12 +63,12 @@ func (p *discoveryPeer) ResolveStore(ctx context.Context, request *pb.ResolveSto
 	return response, nil
 }
 
-func (p *discoveryPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+func (p *discoveryPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
 	p.executions.Add(1)
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(stream)
+	return p.business.ExecuteV2(stream)
 }
 
 func (p *discoveryPeer) set(store string, response *pb.ResolveStoreResponse) {
@@ -131,6 +132,35 @@ func discoveryRead(t *testing.T, client *Client, store string) {
 	}
 }
 
+func waitDiscoveryAddresses(t *testing.T, client *Client, store string, addresses []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	entry := client.stores[store]
+	for {
+		entry.mu.RLock()
+		installed := slices.Clone(entry.channel.addresses)
+		connection := entry.channel.connection
+		entry.mu.RUnlock()
+		if slices.Equal(installed, addresses) {
+			// update publishes addresses under this lock only after the manual
+			// resolver synchronously installs the new gRPC picker. A newly added
+			// endpoint may still need to finish establishing its connection.
+			if err := waitReady(ctx, connection); err != nil {
+				t.Fatal("refreshed business channel did not become ready", err)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("discovery did not install addresses %v; installed %v: %v", addresses, installed, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestResolveStorePublicResponseContract(t *testing.T) {
 	response := &pb.ResolveStoreResponse{}
 	descriptor := response.ProtoReflect().Descriptor()
@@ -189,7 +219,6 @@ func TestClientDNSDiscoversScaleAndDrainsRetiredReplica(t *testing.T) {
 	secondBusiness := &clientTestPeer{mode: "normal"}
 	second := &discoveryPeer{business: secondBusiness}
 	secondListener := listenDiscovery(t, second, net.JoinHostPort("::1", port))
-	_ = secondListener
 	name := "store.replicas.test"
 	ipv4 := netip.MustParseAddr("127.0.0.1")
 	ipv6 := netip.MustParseAddr("::1")
@@ -213,10 +242,26 @@ func TestClientDNSDiscoversScaleAndDrainsRetiredReplica(t *testing.T) {
 	}
 	// Existing Store replicas remain discoverable while their directory lease
 	// is valid, even when the initialization Service loses its only endpoint.
+	// Hold an older refresh in its control RPC so retirement must wait for the
+	// next DNS round rather than relying on a fixed multiple of the interval.
+	for _, peer := range []*discoveryPeer{first, second} {
+		peer.mu.Lock()
+		peer.delay = time.Second
+		peer.mu.Unlock()
+	}
+	resolves := first.resolves.Load() + second.resolves.Load()
+	deadline = time.Now().Add(3 * time.Second)
+	for first.resolves.Load()+second.resolves.Load() == resolves && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if first.resolves.Load()+second.resolves.Load() == resolves {
+		t.Fatal("slow directory refresh did not start")
+	}
 	seedListener.stop()
 	answer.Addresses = []netip.Addr{ipv6}
 	dns.Set(name, answer)
-	time.Sleep(200 * time.Millisecond)
+	remaining := []string{secondListener.address}
+	waitDiscoveryAddresses(t, client, "records", remaining)
 	before := first.executions.Load()
 	for range 12 {
 		discoveryRead(t, client, "records")
@@ -258,7 +303,8 @@ func TestClientRefreshChangesEndpointsWithoutReplayingActiveStream(t *testing.T)
 	}
 	response := discoveryRecord("records", secondListener.address)
 	seed.set("records", response)
-	time.Sleep(200 * time.Millisecond)
+	remaining := []string{secondListener.address}
+	waitDiscoveryAddresses(t, client, "records", remaining)
 	discoveryRead(t, client, "records")
 	select {
 	case err := <-finished:
