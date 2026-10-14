@@ -43,7 +43,7 @@ const (
 	MutationUnknown    = pb.MutationOutcome_UNKNOWN
 
 	MutationApplicationAcknowledged = pb.MutationVisibility_APPLICATION_ACKNOWLEDGED
-	MutationSearchVisible           = pb.MutationVisibility_SEARCH_VISIBLE
+	MutationQueryVisible            = pb.MutationVisibility_QUERY_VISIBLE
 
 	ProjectionInclude = pb.ProjectionMode_INCLUDE
 	ProjectionExclude = pb.ProjectionMode_EXCLUDE
@@ -127,10 +127,10 @@ const (
 
 // MutateRequest describes one mutation. Create, Put and Replace require Document;
 // Delete accepts no payload; AtomicTransform requires Lua or BackendExpression.
-// Options applies to every action. MutationSearchVisible requires search
-// visibility before an APPLIED result without Failure. APPLIED with Failure
-// confirms application only. Nil Options or zero Visibility waits for application
-// acknowledgement without a separate visibility guarantee.
+// Options applies to every action. MutationQueryVisible requires visibility to
+// subsequent normal queries before an APPLIED result without Failure. APPLIED
+// with Failure confirms application only. Nil Options or zero Visibility waits
+// for application acknowledgement without a separate visibility guarantee.
 type MutateRequest struct {
 	Resource          string
 	Action            MutationAction

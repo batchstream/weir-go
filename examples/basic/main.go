@@ -45,7 +45,7 @@ func run() error {
 		target = weir.EncodeSegment(*index) + "/s:example"
 		document = &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
 	}
-	completion := &weir.MutationOptions{Visibility: weir.MutationSearchVisible}
+	completion := &weir.MutationOptions{Visibility: weir.MutationQueryVisible}
 	request := &weir.MutateRequest{Resource: target, Action: weir.MutationPut, Document: document, Options: completion}
 	opts := weir.MutateOptions{StoreName: *storeName, Requests: []*weir.MutateRequest{request}}
 	results, err := client.Mutate(ctx, opts)

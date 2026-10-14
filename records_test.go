@@ -61,7 +61,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 		if action == MutationReplace {
 			request.Options = &MutationOptions{}
 		} else if action != MutationPut {
-			request.Options = &MutationOptions{Visibility: MutationSearchVisible}
+			request.Options = &MutationOptions{Visibility: MutationQueryVisible}
 		}
 		if action == MutationAtomicTransform {
 			request.Lua = program
