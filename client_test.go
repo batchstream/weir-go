@@ -30,7 +30,7 @@ type clientTestPeer struct {
 	canceled  chan struct{}
 }
 
-func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
 	p.streams.Add(1)
 	for {
 		request, err := stream.Recv()
@@ -80,7 +80,7 @@ func (p *clientTestPeer) Execute(stream pb.StoreService_ExecuteServer) error {
 	}
 }
 
-func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteV2Server) error {
 	p.received.Add(1)
 	if p.mode == "blocked_receive" {
 		<-stream.Context().Done()
@@ -155,7 +155,7 @@ func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreS
 	return nil
 }
 
-func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteV2Server) error {
 	p.received.Add(1)
 	if p.mode == "blocked_mutation" {
 		<-stream.Context().Done()
@@ -357,7 +357,7 @@ func TestMutationCancellationStopsCallWithoutReplay(t *testing.T) {
 	}
 }
 
-func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteV2Server) error {
 	count := uint64(1)
 	if p.mode == "scan_overbound" {
 		count = 2

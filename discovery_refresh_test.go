@@ -33,11 +33,11 @@ type refreshControlPeer struct {
 	started   chan *refreshControlCall
 }
 
-func (p *refreshControlPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+func (p *refreshControlPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(stream)
+	return p.business.ExecuteV2(stream)
 }
 
 func (p *refreshControlPeer) ResolveStore(ctx context.Context, request *pb.ResolveStoreRequest) (*pb.ResolveStoreResponse, error) {

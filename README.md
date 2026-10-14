@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.10.0
+go get github.com/batchstream/weir-go@v0.11.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.8.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.9.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -72,7 +72,7 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
-connection or opening one bidirectional Execute RPC. An empty input, nil request,
+connection or opening one bidirectional ExecuteV2 RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
 one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
@@ -112,7 +112,17 @@ streaming interfaces to avoid retaining the full input and result sequence.
 
 `WriteRequest` contains Resource and Document. Create requires absence; Replace
 requires an existing resource; Put creates or replaces. AtomicTransform requires
-exactly one Lua or BackendExpression.
+exactly one Lua or BackendExpression. `MutateRequest`, `WriteRequest`,
+`DeleteRequest` and `AtomicTransformRequest` also accept `WaitUntilVisible`. Its
+zero value waits for application acknowledgement. Set it to true when subsequent
+searches must observe the mutation before the operation succeeds. An APPLIED
+result without Failure confirms that guarantee; APPLIED with Failure confirms
+application only and must not be replayed automatically. This includes Lua keep
+and missing-document deletes. Backends without a separate search refresh satisfy
+the option when the mutation is acknowledged.
+
+The SDK sends the explicit `ExecuteV2` RPC for every operation. Upgrade the SDK
+and server together; the earlier `Execute` RPC is removed.
 
 `ReadResult` contains exactly one of Document, Missing, or Failure. Missing is a
 successful read that confirmed document absence. `FailureTargetNotFound` means a
@@ -222,8 +232,11 @@ repeat documents; the caller owns deduplication and commits output with its chec
 identifies an adapter-owned format; Data carries up to 8 MiB of opaque bytes and
 may be empty. The public protocol and SDK do not select or interpret backends.
 A new Store can use its own content type without changing the schema or SDK.
-Adapters decide which formats and operations they support. For example, MongoDB
-accepts an `application/bson` command document, bounded at 4 MiB by its adapter.
+Native imposes no command, method, path or parameter allowlist. The backend
+handles authorization and operation semantics. Resource is an optional canonical
+prefix; empty addresses the backend root when supported. MongoDB accepts a
+database or historical database/collection target and an `application/bson`
+command document. Search uses `application/http` and an optional resource prefix.
 
 ```go
 document := &weir.Document{ContentType: "application/vnd.example.command", Data: commandBytes}
@@ -245,8 +258,9 @@ in a callback. The SDK hides the wire Head/Chunk/End phases.
 For HTTP-backed adapters, `NewHTTPNativeRequest(resource, request)` consumes and
 closes a standard `net/http.Request` body and serializes an `application/http`
 Document. It emits an HTTP/1.1 origin-form target, exact Content-Length and no
-default User-Agent. Explicit application headers are preserved for the adapter
-to validate. The complete encoded request is bounded at 8 MiB, including its
+default User-Agent. Methods, escaped paths, queries and application headers are
+preserved. Pass an empty resource for backend-root operations. The complete encoded
+request is bounded at 8 MiB, including its
 header block bounded at 64 KiB. Trailers are rejected. The Host header never
 chooses the owning Store or backend destination.
 
@@ -279,7 +293,7 @@ request is automatically replayed.
 
 ## Streaming and deadlines
 
-All business operations use bidirectional Execute streams. Each stream addresses
+All business operations use bidirectional ExecuteV2 streams. Each stream addresses
 one Store and one operation kind. Scan and Native send one request, close their
 input and incrementally consume typed Events. Native chunks are bounded at
 64 KiB, Scan pages at 256 documents and native filters/Lua source/backend expressions at 16 KiB.

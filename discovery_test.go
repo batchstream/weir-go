@@ -62,12 +62,12 @@ func (p *discoveryPeer) ResolveStore(ctx context.Context, request *pb.ResolveSto
 	return response, nil
 }
 
-func (p *discoveryPeer) Execute(stream pb.StoreService_ExecuteServer) error {
+func (p *discoveryPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
 	p.executions.Add(1)
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.Execute(stream)
+	return p.business.ExecuteV2(stream)
 }
 
 func (p *discoveryPeer) set(store string, response *pb.ResolveStoreResponse) {

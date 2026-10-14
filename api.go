@@ -25,7 +25,8 @@ type Projection = pb.Projection
 type ProjectionMode = pb.ProjectionMode
 
 // NativeRequest carries an opaque adapter-owned document. Keep its bytes
-// immutable until Native returns. Empty request data is permitted.
+// immutable until Native returns. Empty request data is permitted. Resource is
+// an optional target prefix; empty selects the backend root when supported.
 type NativeRequest = pb.NativeRequest
 type NativeResponse = pb.NativeHead
 type NativeCompletion = pb.NativeCompletion
@@ -62,12 +63,14 @@ const (
 func EncodeSegment(segment string) string { return protocol.EncodeSegment(segment) }
 
 type WriteRequest struct {
-	Resource string
-	Document *Document
+	Resource         string
+	Document         *Document
+	WaitUntilVisible bool
 }
 
 type DeleteRequest struct {
-	Resource string
+	Resource         string
+	WaitUntilVisible bool
 }
 
 // AtomicTransformRequest requires exactly one of Lua and BackendExpression.
@@ -75,6 +78,7 @@ type AtomicTransformRequest struct {
 	Resource          string
 	Lua               *LuaTransform
 	BackendExpression *Document
+	WaitUntilVisible  bool
 }
 
 // NativeResult retains validated response and completion evidence. Completion is
@@ -115,12 +119,16 @@ const (
 
 // MutateRequest describes one mutation. Create, Put and Replace require Document;
 // Delete accepts no payload; AtomicTransform requires Lua or BackendExpression.
+// WaitUntilVisible requires search visibility before an APPLIED result without
+// Failure. APPLIED with Failure confirms application only. The zero value waits
+// for application acknowledgement without a separate visibility guarantee.
 type MutateRequest struct {
 	Resource          string
 	Action            MutationAction
 	Document          *Document
 	Lua               *LuaTransform
 	BackendExpression *Document
+	WaitUntilVisible  bool
 }
 
 // MutateOptions describes independent mutations addressed to one Store. It is

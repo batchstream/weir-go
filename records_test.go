@@ -56,7 +56,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 	program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
 	options := MutateOptions{StoreName: "records"}
 	for _, action := range []MutationAction{MutationCreate, MutationPut, MutationReplace, MutationDelete, MutationAtomicTransform} {
-		request := &MutateRequest{Resource: "records/s:key", Action: action}
+		request := &MutateRequest{Resource: "records/s:key", Action: action, WaitUntilVisible: action != MutationPut}
 		if action == MutationAtomicTransform {
 			request.Lua = program
 		} else if action != MutationDelete {
@@ -75,7 +75,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 			request.Action == MutationReplace && mutation.GetReplace() != nil ||
 			request.Action == MutationDelete && mutation.GetDelete() != nil ||
 			request.Action == MutationAtomicTransform && mutation.GetAtomicTransform().GetLua() != nil
-		if !selected {
+		if !selected || mutation.WaitUntilVisible != request.WaitUntilVisible {
 			t.Fatal("wrong business operation", index, mutation)
 		}
 		if index == 1 {

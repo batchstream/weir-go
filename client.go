@@ -26,7 +26,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := client.Execute(ctx, grpc.MaxCallSendMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxExecuteResponseBytes), grpc.MaxRetryRPCBufferSize(0))
+	stream, err := client.ExecuteV2(ctx, grpc.MaxCallSendMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxExecuteResponseBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
 		return err
 	}

@@ -55,59 +55,63 @@ func TestScanPreservesBackendFailureWithoutCheckpoint(t *testing.T) {
 }
 
 func TestTypedMutationsSelectBackendOperation(t *testing.T) {
-	peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 5)}
-	client := clientTestConnection(t, peer)
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-	document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-	request := &WriteRequest{Resource: "records/s:key", Document: document}
-	write := WriteOptions{StoreName: "records", Request: request}
-	for _, action := range []string{"create", "put", "replace", "delete", "transform"} {
-		var result *MutationResult
-		var err error
-		switch action {
-		case "create":
-			result, err = Create(ctx, client, write)
-		case "put":
-			result, err = Put(ctx, client, write)
-		case "replace":
-			result, err = Replace(ctx, client, write)
-		case "delete":
-			request := &DeleteRequest{Resource: "records/s:key"}
-			options := DeleteOptions{StoreName: "records", Request: request}
-			result, err = Delete(ctx, client, options)
-		case "transform":
-			program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
-			request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program}
-			options := AtomicTransformOptions{StoreName: "records", Request: request}
-			result, err = AtomicTransform(ctx, client, options)
-		}
-		if err != nil || result.GetOutcome() != MutationApplied {
-			t.Fatal(action, result, err)
-		}
-		mutation := <-peer.mutations
-		if mutation.Resource != request.Resource {
-			t.Fatal("typed operation lost its resource", action, mutation)
-		}
-		selected := false
-		switch action {
-		case "create":
-			selected = mutation.GetCreate() != nil
-		case "put":
-			selected = mutation.GetPut() != nil
-		case "replace":
-			selected = mutation.GetReplace() != nil
-		case "delete":
-			selected = mutation.GetDelete() != nil
-		case "transform":
-			selected = mutation.GetAtomicTransform().GetLua() != nil
-		}
-		if !selected {
-			t.Fatal("SDK executed a different mutation", action, mutation)
-		}
-	}
-	if peer.received.Load() != 5 {
-		t.Fatal("typed mutations were replayed", peer.received.Load())
+	for _, waitUntilVisible := range []bool{false, true} {
+		t.Run(map[bool]string{false: "applied", true: "visible"}[waitUntilVisible], func(t *testing.T) {
+			peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 5)}
+			client := clientTestConnection(t, peer)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
+			request := &WriteRequest{Resource: "records/s:key", Document: document, WaitUntilVisible: waitUntilVisible}
+			write := WriteOptions{StoreName: "records", Request: request}
+			for _, action := range []string{"create", "put", "replace", "delete", "transform"} {
+				var result *MutationResult
+				var err error
+				switch action {
+				case "create":
+					result, err = Create(ctx, client, write)
+				case "put":
+					result, err = Put(ctx, client, write)
+				case "replace":
+					result, err = Replace(ctx, client, write)
+				case "delete":
+					request := &DeleteRequest{Resource: "records/s:key", WaitUntilVisible: waitUntilVisible}
+					options := DeleteOptions{StoreName: "records", Request: request}
+					result, err = Delete(ctx, client, options)
+				case "transform":
+					program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
+					request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program, WaitUntilVisible: waitUntilVisible}
+					options := AtomicTransformOptions{StoreName: "records", Request: request}
+					result, err = AtomicTransform(ctx, client, options)
+				}
+				if err != nil || result.GetOutcome() != MutationApplied {
+					t.Fatal(action, result, err)
+				}
+				mutation := <-peer.mutations
+				if mutation.Resource != request.Resource || mutation.WaitUntilVisible != waitUntilVisible {
+					t.Fatal("typed operation lost its resource or visibility option", action, mutation)
+				}
+				selected := false
+				switch action {
+				case "create":
+					selected = mutation.GetCreate() != nil
+				case "put":
+					selected = mutation.GetPut() != nil
+				case "replace":
+					selected = mutation.GetReplace() != nil
+				case "delete":
+					selected = mutation.GetDelete() != nil
+				case "transform":
+					selected = mutation.GetAtomicTransform().GetLua() != nil
+				}
+				if !selected {
+					t.Fatal("SDK executed a different mutation", action, mutation)
+				}
+			}
+			if peer.received.Load() != 5 {
+				t.Fatal("typed mutations were replayed", peer.received.Load())
+			}
+		})
 	}
 }
 
@@ -134,7 +138,7 @@ func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
 	}
 }
 
-func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteServer) error {
+func (p *clientTestPeer) nativeExecute(stream pb.StoreService_ExecuteV2Server) error {
 	metadata := &Document{ContentType: "application/vnd.example.response", Data: []byte{0xff, 0}}
 	head := &pb.NativeHead{Metadata: metadata, BodyContentType: "application/octet-stream"}
 	if p.mode == "native_invalid_metadata" {
