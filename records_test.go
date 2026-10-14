@@ -10,6 +10,7 @@ import (
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestReadKeepsInputOrderAndIndividualFailures(t *testing.T) {
@@ -56,7 +57,12 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 	program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
 	options := MutateOptions{StoreName: "records"}
 	for _, action := range []MutationAction{MutationCreate, MutationPut, MutationReplace, MutationDelete, MutationAtomicTransform} {
-		request := &MutateRequest{Resource: "records/s:key", Action: action, WaitUntilVisible: action != MutationPut}
+		request := &MutateRequest{Resource: "records/s:key", Action: action}
+		if action == MutationReplace {
+			request.Options = &MutationOptions{}
+		} else if action != MutationPut {
+			request.Options = &MutationOptions{Visibility: MutationSearchVisible}
+		}
 		if action == MutationAtomicTransform {
 			request.Lua = program
 		} else if action != MutationDelete {
@@ -75,7 +81,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 			request.Action == MutationReplace && mutation.GetReplace() != nil ||
 			request.Action == MutationDelete && mutation.GetDelete() != nil ||
 			request.Action == MutationAtomicTransform && mutation.GetAtomicTransform().GetLua() != nil
-		if !selected || mutation.WaitUntilVisible != request.WaitUntilVisible {
+		if !selected || !proto.Equal(mutation.Options, request.Options) {
 			t.Fatal("wrong business operation", index, mutation)
 		}
 		if index == 1 {

@@ -17,6 +17,11 @@ type Failure = pb.Failure
 type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome
+
+// MutationOptions controls completion uniformly for every mutation action.
+// A nil Options or zero Visibility waits for application acknowledgement.
+type MutationOptions = pb.MutationOptions
+type MutationVisibility = pb.MutationVisibility
 type LuaTransform = pb.LuaTransform
 type ReadRequest = pb.ReadRequest
 type ScanRequest = pb.ScanRequest
@@ -36,6 +41,9 @@ const (
 	MutationNotApplied = pb.MutationOutcome_NOT_APPLIED
 	MutationApplied    = pb.MutationOutcome_APPLIED
 	MutationUnknown    = pb.MutationOutcome_UNKNOWN
+
+	MutationApplicationAcknowledged = pb.MutationVisibility_APPLICATION_ACKNOWLEDGED
+	MutationSearchVisible           = pb.MutationVisibility_SEARCH_VISIBLE
 
 	ProjectionInclude = pb.ProjectionMode_INCLUDE
 	ProjectionExclude = pb.ProjectionMode_EXCLUDE
@@ -63,14 +71,14 @@ const (
 func EncodeSegment(segment string) string { return protocol.EncodeSegment(segment) }
 
 type WriteRequest struct {
-	Resource         string
-	Document         *Document
-	WaitUntilVisible bool
+	Resource string
+	Document *Document
+	Options  *MutationOptions
 }
 
 type DeleteRequest struct {
-	Resource         string
-	WaitUntilVisible bool
+	Resource string
+	Options  *MutationOptions
 }
 
 // AtomicTransformRequest requires exactly one of Lua and BackendExpression.
@@ -78,7 +86,7 @@ type AtomicTransformRequest struct {
 	Resource          string
 	Lua               *LuaTransform
 	BackendExpression *Document
-	WaitUntilVisible  bool
+	Options           *MutationOptions
 }
 
 // NativeResult retains validated response and completion evidence. Completion is
@@ -119,22 +127,23 @@ const (
 
 // MutateRequest describes one mutation. Create, Put and Replace require Document;
 // Delete accepts no payload; AtomicTransform requires Lua or BackendExpression.
-// WaitUntilVisible requires search visibility before an APPLIED result without
-// Failure. APPLIED with Failure confirms application only. The zero value waits
-// for application acknowledgement without a separate visibility guarantee.
+// Options applies to every action. MutationSearchVisible requires search
+// visibility before an APPLIED result without Failure. APPLIED with Failure
+// confirms application only. Nil Options or zero Visibility waits for application
+// acknowledgement without a separate visibility guarantee.
 type MutateRequest struct {
 	Resource          string
 	Action            MutationAction
 	Document          *Document
 	Lua               *LuaTransform
 	BackendExpression *Document
-	WaitUntilVisible  bool
+	Options           *MutationOptions
 }
 
 // MutateOptions describes independent mutations addressed to one Store. It is
 // not a transaction. Same-resource requests execute in input order; different
 // resources may execute concurrently. Cross-RPC ordering follows the database.
-// Do not mutate requests or their document bytes until the call returns.
+// Do not mutate requests, options or their document bytes until the call returns.
 type MutateOptions struct {
 	StoreName string
 	Requests  []*MutateRequest
@@ -159,7 +168,8 @@ type ReadStreamOptions struct {
 // not consumed remain unacknowledged and must never be automatically replayed.
 // Next and Consume run concurrently; synchronize any shared application state.
 // Both callbacks must honor their context and return promptly. Keep yielded
-// requests and document bytes immutable until the corresponding Consume call.
+// requests, options and document bytes immutable until the corresponding
+// Consume call.
 type MutateStreamOptions struct {
 	StoreName string
 	Next      func(context.Context) (*MutateRequest, error)
