@@ -12,8 +12,8 @@ import (
 type Document = pb.Document
 type Failure = pb.Failure
 
-// FailureCode preserves future positive codes as generic business failures.
-// Their presence never authorizes replay of a mutation or Native operation.
+// FailureCode identifies a declared operation failure. Only known nonzero codes
+// are accepted; a failure never authorizes automatic mutation or Native replay.
 type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome

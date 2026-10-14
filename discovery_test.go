@@ -22,7 +22,6 @@ import (
 )
 
 type discoveryPeer struct {
-	pb.UnimplementedStoreServiceServer
 	business   *clientTestPeer
 	executions atomic.Int64
 	resolves   atomic.Int64
@@ -63,12 +62,12 @@ func (p *discoveryPeer) ResolveStore(ctx context.Context, request *pb.ResolveSto
 	return response, nil
 }
 
-func (p *discoveryPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
+func (p *discoveryPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	p.executions.Add(1)
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.ExecuteV2(stream)
+	return p.business.Execute(stream)
 }
 
 func (p *discoveryPeer) set(store string, response *pb.ResolveStoreResponse) {
@@ -417,7 +416,7 @@ func TestOpenValidatesWholeMappingAndBoundsDeadTargets(t *testing.T) {
 	}
 }
 
-func TestOpenAcceptsAdditiveDirectoryFields(t *testing.T) {
+func TestOpenRejectsUnknownDirectoryFields(t *testing.T) {
 	business := &clientTestPeer{mode: "normal"}
 	target := &discoveryPeer{business: business}
 	targetListener := listenDiscovery(t, target, "127.0.0.1:0")
@@ -427,10 +426,15 @@ func TestOpenAcceptsAdditiveDirectoryFields(t *testing.T) {
 	seed.set("records", response)
 	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
 	options := OpenOptions{Seed: seedListener.address, Stores: []string{"records"}}
-	client := openDiscovery(t, options)
-	discoveryRead(t, client, "records")
-	if target.executions.Load() != 1 || seed.executions.Load() != 0 {
-		t.Fatal("additive directory fields changed business routing")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	client, err := Open(ctx, options)
+	if err == nil {
+		_ = client.Close()
+		t.Fatal("unknown directory fields accepted")
+	}
+	if target.executions.Load() != 0 || seed.executions.Load() != 0 {
+		t.Fatal("unknown directory fields sent business requests")
 	}
 }
 

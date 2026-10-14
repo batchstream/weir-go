@@ -14,11 +14,14 @@ import (
 // This fixture delivers a request and a complete response before allowing Send
 // to return. It forces the legitimate gap between wire delivery and bookkeeping.
 type completionClient struct {
-	pb.StoreServiceClient
 	stream *completionStream
 }
 
-func (client *completionClient) ExecuteV2(ctx context.Context, _ ...grpc.CallOption) (pb.StoreService_ExecuteV2Client, error) {
+func (client *completionClient) ResolveStore(context.Context, *pb.ResolveStoreRequest, ...grpc.CallOption) (*pb.ResolveStoreResponse, error) {
+	return nil, errors.New("fixture serves business requests only")
+}
+
+func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse], error) {
 	client.stream.ctx = ctx
 	return client.stream, nil
 }

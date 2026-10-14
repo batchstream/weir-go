@@ -47,7 +47,7 @@ func TestMutateStreamPreservesPerRecordVisibility(t *testing.T) {
 	}
 }
 
-func TestNativeBackendRootUsesExecuteV2(t *testing.T) {
+func TestNativeBackendRootUsesExecute(t *testing.T) {
 	peer := &clientTestPeer{mode: "native_no_metadata"}
 	client := clientTestConnection(t, peer)
 	document := &Document{ContentType: "application/http", Data: []byte("GET /_cluster/health HTTP/1.1\r\n\r\n")}
@@ -56,6 +56,6 @@ func TestNativeBackendRootUsesExecuteV2(t *testing.T) {
 	options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
 	result, err := Native(t.Context(), client, options)
 	if err != nil || result == nil || result.Completion != NativeResponseComplete || peer.streams.Load() != 1 || peer.received.Load() != 1 {
-		t.Fatal("Native backend root did not reach ExecuteV2", result, err, peer.streams.Load(), peer.received.Load())
+		t.Fatal("Native backend root did not reach Execute", result, err, peer.streams.Load(), peer.received.Load())
 	}
 }
