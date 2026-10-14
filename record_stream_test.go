@@ -39,7 +39,7 @@ func TestReadStreamLargeDuplexCallConsumesIncrementally(t *testing.T) {
 	if err := ReadStream(ctx, client, options); err != nil {
 		t.Fatal(err)
 	}
-	if produced != 48 || consumed != 48 || responseBytes <= 32<<20 || peer.streams.Load() != 1 || peer.maxBytes.Load() > protocol.MaxExecuteRequestBytes {
+	if produced != 48 || consumed != 48 || responseBytes <= 32<<20 || peer.streams.Load() != 1 || peer.maxBytes.Load() > int64(protocol.MaxTransportMessageBytes) {
 		t.Fatal("large call was truncated or split into RPCs", produced, consumed, responseBytes, peer.streams.Load(), peer.maxBytes.Load())
 	}
 }
@@ -47,7 +47,7 @@ func TestReadStreamLargeDuplexCallConsumesIncrementally(t *testing.T) {
 func TestMutateStreamPausedConsumerBoundsProducerAndCancels(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
-	document := &Document{ContentType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
+	document := &Document{ContentType: "application/octet-stream", Data: make([]byte, (2 << 20))}
 	var produced atomic.Int64
 	started := make(chan struct{})
 	options := MutateStreamOptions{StoreName: "records"}
@@ -85,7 +85,7 @@ func TestMutateStreamPausedConsumerBoundsProducerAndCancels(t *testing.T) {
 		t.Fatal("stream finished while its consumer was paused", err)
 	case <-timer.C:
 	}
-	if count := produced.Load(); count > 4 || peer.received.Load() > 3 || peer.maxBytes.Load() > protocol.MaxExecuteRequestBytes {
+	if count := produced.Load(); count > 4 || peer.received.Load() > 3 || peer.maxBytes.Load() > int64(protocol.MaxTransportMessageBytes) {
 		t.Fatal("paused consumer allowed unbounded input", count, peer.received.Load(), peer.maxBytes.Load())
 	}
 	cancel()

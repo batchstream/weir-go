@@ -23,9 +23,6 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const maxClientStores = 16
-const maxClientAddresses = 64
-
 var ErrClosed = errors.New("Weir client is closed")
 
 // OpenOptions identifies an initialization endpoint and the Stores required by
@@ -106,8 +103,8 @@ func Open(ctx context.Context, options OpenOptions) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialization address: %w", err)
 	}
-	if len(options.Stores) < 1 || len(options.Stores) > maxClientStores {
-		return nil, errors.New("initialization requires 1-16 Stores")
+	if len(options.Stores) < 1 {
+		return nil, errors.New("initialization requires at least one Store")
 	}
 	options.Seed = seed
 	options.Stores = slices.Clone(options.Stores)
@@ -274,7 +271,7 @@ func physicalAddresses(ctx context.Context, dns *net.Resolver, endpoints []strin
 		}
 		ips := []string{host}
 		if _, parseErr := netip.ParseAddr(host); parseErr != nil {
-			ips, err = netlimit.LookupHostLimit(ctx, dns, host, maxClientAddresses)
+			ips, err = netlimit.LookupHost(ctx, dns, host)
 			if err != nil {
 				return nil, fmt.Errorf("resolve business address %s: %w", host, err)
 			}
@@ -282,9 +279,6 @@ func physicalAddresses(ctx context.Context, dns *net.Resolver, endpoints []strin
 		for _, ip := range ips {
 			address := net.JoinHostPort(ip, port)
 			addresses[address] = struct{}{}
-			if len(addresses) > maxClientAddresses {
-				return nil, errors.New("Store exceeds 64 physical addresses")
-			}
 		}
 	}
 	if err := ctx.Err(); err != nil {

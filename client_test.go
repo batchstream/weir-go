@@ -222,7 +222,7 @@ func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceCli
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.MaxRecvMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxSendMsgSize(protocol.MaxExecuteResponseBytes))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxSendMsgSize(protocol.MaxTransportMessageBytes))
 	pb.RegisterStoreServiceServer(server, peer)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()

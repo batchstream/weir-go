@@ -94,38 +94,48 @@ func TestHTTPNativeBackendRootPreservesNativeOptions(t *testing.T) {
 	}
 }
 
-type boundedHTTPBody struct {
-	read   int
-	closed bool
+type nativeRequestBody struct {
+	remaining int
+	read      int
+	closed    bool
 }
 
-func (b *boundedHTTPBody) Read(data []byte) (int, error) {
-	b.read += len(data)
-	clear(data)
-	return len(data), nil
+func (b *nativeRequestBody) Read(data []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(data), b.remaining)
+	clear(data[:n])
+	b.remaining -= n
+	b.read += n
+	return n, nil
 }
 
-func (b *boundedHTTPBody) Close() error {
+func (b *nativeRequestBody) Close() error {
 	b.closed = true
 	return nil
 }
 
-func TestHTTPNativeRequestStopsOversizedBodiesAndHeaders(t *testing.T) {
-	body := &boundedHTTPBody{}
+func TestHTTPNativeRequestBeyondFormerBodyAndHeaderLimits(t *testing.T) {
+	const size = (9 << 20) + 1
+	body := &nativeRequestBody{remaining: size}
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/query", body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if native, err := NewHTTPNativeRequest("entries", request); err == nil || native != nil || !body.closed || body.read != protocol.MaxNativeRequestBytes+1 {
-		t.Fatal("unbounded input was not stopped and closed", native, err, body)
+	request.Header.Set("X-Large", strings.Repeat("x", 128<<10))
+	native, err := NewHTTPNativeRequest("entries", request)
+	if err != nil || native == nil || !body.closed || body.read != size {
+		t.Fatal("large request lost", err, body)
 	}
-	request, err = http.NewRequestWithContext(t.Context(), http.MethodGet, "/query", nil)
+	parsed, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(native.Request.Data)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("X-Large", strings.Repeat("x", protocol.MaxNativeMetadataBytes))
-	if native, err := NewHTTPNativeRequest("entries", request); err == nil || native != nil {
-		t.Fatal("oversized HTTP header block accepted", native, err)
+	defer parsed.Body.Close()
+	data, err := io.ReadAll(parsed.Body)
+	if err != nil || len(data) != size || parsed.Header.Get("X-Large") != request.Header.Get("X-Large") {
+		t.Fatal("large request changed", len(data), err)
 	}
 }
 
@@ -172,7 +182,6 @@ func TestHTTPNativeResponseRejectsMalformedMetadataFraming(t *testing.T) {
 		"HTTP/1.1 099 Invalid\r\n\r\n",
 		"HTTP/1.1 600 Invalid\r\n\r\n",
 		"HTTP/1.1 999 Invalid\r\n\r\n",
-		"HTTP/1.1 200 OK\r\nX-Large: " + strings.Repeat("x", protocol.MaxNativeMetadataBytes) + "\r\n\r\n",
 	} {
 		metadata := &Document{ContentType: "application/http", Data: []byte(data)}
 		response := &NativeResponse{Metadata: metadata}
@@ -184,5 +193,15 @@ func TestHTTPNativeResponseRejectsMalformedMetadataFraming(t *testing.T) {
 	response := &NativeResponse{Metadata: metadata}
 	if parsed, err := ParseHTTPNativeResponse(response); err == nil || parsed != nil {
 		t.Fatal("HTTP convenience interpreted another format", parsed, err)
+	}
+}
+
+func TestHTTPNativeResponseBeyondFormerMetadataLimit(t *testing.T) {
+	header := strings.Repeat("x", 3<<20)
+	metadata := &Document{ContentType: "application/http", Data: []byte("HTTP/1.1 200 OK\r\nX-Large: " + header + "\r\n\r\n")}
+	response := &NativeResponse{Metadata: metadata}
+	parsed, err := ParseHTTPNativeResponse(response)
+	if err != nil || parsed.Headers.Get("X-Large") != header {
+		t.Fatal("large metadata changed", err)
 	}
 }
