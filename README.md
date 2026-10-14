@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.12.0
+go get github.com/batchstream/weir-go@v0.13.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.10.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.11.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -113,13 +113,23 @@ streaming interfaces to avoid retaining the full input and result sequence.
 `WriteRequest` contains Resource and Document. Create requires absence; Replace
 requires an existing resource; Put creates or replaces. AtomicTransform requires
 exactly one Lua or BackendExpression. `MutateRequest`, `WriteRequest`,
-`DeleteRequest` and `AtomicTransformRequest` also accept `WaitUntilVisible`. Its
-zero value waits for application acknowledgement. Set it to true when subsequent
-searches must observe the mutation before the operation succeeds. An APPLIED
-result without Failure confirms that guarantee; APPLIED with Failure confirms
-application only and must not be replayed automatically. This includes Lua keep
-and missing-document deletes. Backends without a separate search refresh satisfy
-the option when the mutation is acknowledged.
+`DeleteRequest` and `AtomicTransformRequest` share `Options *MutationOptions`.
+Nil options or `MutationApplicationAcknowledged` (the zero Visibility value)
+wait for application acknowledgement. Set Visibility to `MutationSearchVisible`
+when subsequent searches must observe the mutation before the operation succeeds.
+An APPLIED result without Failure confirms that guarantee; APPLIED with Failure
+confirms application only and must not be replayed automatically. This includes
+Lua keep and missing-document deletes. Backends without a separate search refresh
+satisfy the option when the mutation is acknowledged. The SDK forwards the complete
+options message and rejects unknown option fields or undeclared visibility values.
+Keep options immutable until the call returns or its result is consumed.
+
+```go
+completion := &weir.MutationOptions{Visibility: weir.MutationSearchVisible}
+request := &weir.WriteRequest{Resource: "records/s:first", Document: document, Options: completion}
+options := weir.WriteOptions{StoreName: "search", Request: request}
+result, err := client.Put(ctx, options)
+```
 
 The SDK sends the single `Execute` RPC for every operation.
 

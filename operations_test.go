@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
@@ -59,14 +60,24 @@ func TestScanPreservesBackendFailureWithoutCheckpoint(t *testing.T) {
 }
 
 func TestTypedMutationsSelectBackendOperation(t *testing.T) {
-	for _, waitUntilVisible := range []bool{false, true} {
-		t.Run(map[bool]string{false: "applied", true: "visible"}[waitUntilVisible], func(t *testing.T) {
+	acknowledged := &MutationOptions{}
+	visible := &MutationOptions{Visibility: MutationSearchVisible}
+	cases := []struct {
+		name    string
+		options *MutationOptions
+	}{
+		{name: "default"},
+		{name: "acknowledged", options: acknowledged},
+		{name: "visible", options: visible},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
 			peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 5)}
 			client := clientTestConnection(t, peer)
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
 			document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-			request := &WriteRequest{Resource: "records/s:key", Document: document, WaitUntilVisible: waitUntilVisible}
+			request := &WriteRequest{Resource: "records/s:key", Document: document, Options: test.options}
 			write := WriteOptions{StoreName: "records", Request: request}
 			for _, action := range []string{"create", "put", "replace", "delete", "transform"} {
 				var result *MutationResult
@@ -79,12 +90,12 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 				case "replace":
 					result, err = Replace(ctx, client, write)
 				case "delete":
-					request := &DeleteRequest{Resource: "records/s:key", WaitUntilVisible: waitUntilVisible}
+					request := &DeleteRequest{Resource: "records/s:key", Options: test.options}
 					options := DeleteOptions{StoreName: "records", Request: request}
 					result, err = Delete(ctx, client, options)
 				case "transform":
 					program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
-					request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program, WaitUntilVisible: waitUntilVisible}
+					request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program, Options: test.options}
 					options := AtomicTransformOptions{StoreName: "records", Request: request}
 					result, err = AtomicTransform(ctx, client, options)
 				}
@@ -92,8 +103,8 @@ func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 					t.Fatal(action, result, err)
 				}
 				mutation := <-peer.mutations
-				if mutation.Resource != request.Resource || mutation.WaitUntilVisible != waitUntilVisible {
-					t.Fatal("typed operation lost its resource or visibility option", action, mutation)
+				if mutation.Resource != request.Resource || !proto.Equal(mutation.Options, test.options) {
+					t.Fatal("typed operation lost its resource or complete options", action, mutation)
 				}
 				selected := false
 				switch action {
