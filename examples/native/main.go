@@ -29,7 +29,7 @@ func run() error {
 	request := &weir.NativeRequest{}
 	switch *store {
 	case "mongo":
-		request.Resource = weir.EncodeSegment(*database) + "/records"
+		request.Resource = weir.EncodeSegment(*database)
 		command := bson.D{{Key: "count", Value: "records"}}
 		data, err := bson.Marshal(command)
 		if err != nil {

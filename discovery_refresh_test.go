@@ -24,7 +24,6 @@ type refreshControlCall struct {
 }
 
 type refreshControlPeer struct {
-	pb.UnimplementedStoreServiceServer
 	business  *clientTestPeer
 	mu        sync.Mutex
 	phase     int
@@ -33,11 +32,11 @@ type refreshControlPeer struct {
 	started   chan *refreshControlCall
 }
 
-func (p *refreshControlPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
+func (p *refreshControlPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	if p.business == nil {
 		return status.Error(codes.FailedPrecondition, "initialization node received business traffic")
 	}
-	return p.business.ExecuteV2(stream)
+	return p.business.Execute(stream)
 }
 
 func (p *refreshControlPeer) ResolveStore(ctx context.Context, request *pb.ResolveStoreRequest) (*pb.ResolveStoreResponse, error) {

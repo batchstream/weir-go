@@ -21,7 +21,6 @@ import (
 )
 
 type clientTestPeer struct {
-	pb.UnimplementedStoreServiceServer
 	mode      string
 	streams   atomic.Int64
 	maxBytes  atomic.Int64
@@ -30,7 +29,11 @@ type clientTestPeer struct {
 	canceled  chan struct{}
 }
 
-func (p *clientTestPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error {
+func (p *clientTestPeer) ResolveStore(context.Context, *pb.ResolveStoreRequest) (*pb.ResolveStoreResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "fixture serves business requests only")
+}
+
+func (p *clientTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	p.streams.Add(1)
 	for {
 		request, err := stream.Recv()
@@ -80,7 +83,7 @@ func (p *clientTestPeer) ExecuteV2(stream pb.StoreService_ExecuteV2Server) error
 	}
 }
 
-func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteV2Server) error {
+func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	p.received.Add(1)
 	if p.mode == "blocked_receive" {
 		<-stream.Context().Done()
@@ -112,8 +115,7 @@ func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreS
 		read = &pb.ReadResult{}
 		addResponseFields(read)
 	case "read_unknown_failure":
-		read = protocol.ReadFailure(protocol.Fail(FailureCode(127), "future failure"))
-		addResponseFields(read.GetFailure())
+		read = protocol.ReadFailure(protocol.Fail(FailureCode(127), "undeclared failure"))
 	case "read_negative_failure":
 		read = protocol.ReadFailure(protocol.Fail(FailureCode(-1), "invalid failure"))
 	case "read_unknown_missing":
@@ -125,7 +127,7 @@ func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreS
 	value := &pb.Event_ReadResult{ReadResult: read}
 	event := &pb.Event{Value: value}
 	response := &pb.ExecuteResponse{Index: index, Event: event}
-	if strings.HasPrefix(p.mode, "read_unknown_") {
+	if strings.HasPrefix(p.mode, "read_unknown_") && p.mode != "read_unknown_failure" {
 		addResponseFields(response, event, read)
 		if read.GetDocument() != nil {
 			addResponseFields(read.GetDocument())
@@ -155,7 +157,7 @@ func (p *clientTestPeer) readRecord(request *pb.ExecuteRequest, stream pb.StoreS
 	return nil
 }
 
-func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream pb.StoreService_ExecuteV2Server) error {
+func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	p.received.Add(1)
 	if p.mode == "blocked_mutation" {
 		<-stream.Context().Done()
@@ -180,27 +182,33 @@ func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream pb.St
 		result.Failure = protocol.Fail(FailureUnavailable, "unrecognized application evidence")
 	case "negative_failure":
 		result.Failure = protocol.Fail(FailureCode(-1), "invalid failure")
-	case "applied_failure":
+	case "applied_failure", "applied_known_failure", "applied_known_failure_later_error":
 		result.Failure = protocol.Fail(FailureUnavailable, "replica acknowledgement failed")
 	case "applied_unknown_failure", "applied_unknown_failure_later_error":
-		result.Failure = protocol.Fail(FailureCode(127), "future acknowledgement failure")
+		result.Failure = protocol.Fail(FailureCode(127), "undeclared acknowledgement failure")
+	}
+	if p.mode == "applied_then_unknown_code" && request.Index == 2 {
+		result.Failure = protocol.Fail(FailureCode(127), "undeclared failure")
 	}
 	value := &pb.Event_MutationResult{MutationResult: result}
 	event := &pb.Event{Value: value}
 	response := &pb.ExecuteResponse{Index: request.Index, Event: event}
+	if p.mode == "applied_then_unknown_fields" && request.Index == 2 {
+		addResponseFields(response)
+	}
 	if strings.HasPrefix(p.mode, "applied_unknown_failure") {
 		addResponseFields(response, event, result, result.Failure)
 	}
 	if err := stream.Send(response); err != nil {
 		return err
 	}
-	if p.mode == "batch_partial" || p.mode == "applied_unknown_failure_later_error" {
+	if p.mode == "batch_partial" || p.mode == "applied_unknown_failure_later_error" || p.mode == "applied_known_failure_later_error" {
 		return status.Error(codes.Unavailable, "later mutation response lost")
 	}
 	return nil
 }
 
-// Field 127 represents additive response metadata from a future schema. These
+// Field 127 is undeclared by the current response schema. These
 // bytes travel through the real protobuf codec before SDK validation.
 func addResponseFields(messages ...proto.Message) {
 	for _, message := range messages {
@@ -246,60 +254,61 @@ func TestReadRejectsMalformedStreamWithoutEvidence(t *testing.T) {
 	}
 }
 
-func TestReadAcceptsAdditiveFieldsAndUnknownFailureCodes(t *testing.T) {
+func TestReadRejectsUnknownFieldsAndFailureCodes(t *testing.T) {
 	for _, mode := range []string{"read_unknown_fields", "read_unknown_fields_final_error", "read_unknown_missing", "read_unknown_failure"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
 			options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
 			result, err := ReadOne(t.Context(), client, options)
-			if result == nil || (err != nil) != (mode == "read_unknown_fields_final_error") {
-				t.Fatal("additive fields discarded read evidence", result, err)
-			}
-			switch mode {
-			case "read_unknown_failure":
-				if result.Failure.GetCode() != FailureCode(127) || result.Missing || result.Document != nil {
-					t.Fatal("future failure lost or treated as document absence", result)
-				}
-			case "read_unknown_missing":
-				if !result.Missing || result.Failure != nil || result.Document != nil {
-					t.Fatal("confirmed absence changed", result)
-				}
-			default:
-				if result.Document.GetContentType() != "application/octet-stream" || !bytes.Equal(result.Document.Data, bytes.Repeat([]byte{37}, 257<<10)) {
-					t.Fatal("document payload changed", result)
-				}
-				if mode == "read_unknown_fields_final_error" && status.Code(err) != codes.Unavailable {
-					t.Fatal("later stream failure classification lost", err)
-				}
+			if err == nil || result != nil {
+				t.Fatal("unknown response accepted as Read evidence", result, err)
 			}
 			if peer.streams.Load() != 1 || peer.received.Load() != 1 {
-				t.Fatal("response extension caused read replay")
+				t.Fatal("malformed response caused read replay")
 			}
 		})
 	}
 }
 
-func TestMutationKeepsAppliedEvidenceWithUnknownFailureAndLaterError(t *testing.T) {
-	for _, mode := range []string{"applied_unknown_failure", "applied_unknown_failure_later_error"} {
+func TestMutationKeepsAppliedEvidenceWithKnownFailureAndLaterError(t *testing.T) {
+	for _, mode := range []string{"applied_known_failure", "applied_known_failure_later_error"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
 			request := &MutateRequest{Resource: "records/s:key", Action: MutationDelete}
 			options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request, request}}
 			results, err := Mutate(t.Context(), client, options)
-			if len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[0].GetFailure().GetCode() != FailureCode(127) {
+			if len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[0].GetFailure().GetCode() != FailureUnavailable {
 				t.Fatal("confirmed application evidence lost", results, err)
 			}
-			if mode == "applied_unknown_failure_later_error" {
+			if mode == "applied_known_failure_later_error" {
 				if status.Code(err) != codes.Unavailable || results[1] != nil || peer.received.Load() != 1 {
 					t.Fatal("later failure acknowledged or replayed another mutation", results, err, peer.received.Load())
 				}
-			} else if err != nil || results[1].GetOutcome() != MutationApplied || results[1].GetFailure().GetCode() != FailureCode(127) || peer.received.Load() != 2 {
-				t.Fatal("additive response fields rejected", results, err)
+			} else if err != nil || results[1].GetOutcome() != MutationApplied || results[1].GetFailure().GetCode() != FailureUnavailable || peer.received.Load() != 2 {
+				t.Fatal("known acknowledgement failure rejected", results, err)
 			}
 			if peer.streams.Load() != 1 {
 				t.Fatal("mutation replayed")
+			}
+		})
+	}
+}
+
+func TestMutationRetainsConfirmedPrefixBeforeUnknownResponse(t *testing.T) {
+	for _, mode := range []string{"applied_then_unknown_fields", "applied_then_unknown_code"} {
+		t.Run(mode, func(t *testing.T) {
+			peer := &clientTestPeer{mode: mode}
+			client := clientTestConnection(t, peer)
+			request := &MutateRequest{Resource: "records/s:key", Action: MutationDelete}
+			options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request, request}}
+			results, err := Mutate(t.Context(), client, options)
+			if err == nil || len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1] != nil {
+				t.Fatal("malformed later response changed confirmed prefix", results, err)
+			}
+			if peer.streams.Load() != 1 || peer.received.Load() != 2 {
+				t.Fatal("malformed mutation was replayed", peer.streams.Load(), peer.received.Load())
 			}
 		})
 	}
@@ -318,7 +327,7 @@ func TestPutLostResponseHasNoAcknowledgementOrReplay(t *testing.T) {
 }
 
 func TestMutationRejectsInvalidOutcomeAndKeepsAppliedFailure(t *testing.T) {
-	for _, mode := range []string{"invalid_outcome", "unknown_outcome", "negative_failure", "applied_failure"} {
+	for _, mode := range []string{"invalid_outcome", "unknown_outcome", "negative_failure", "applied_failure", "applied_unknown_failure", "applied_unknown_failure_later_error"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
@@ -357,7 +366,7 @@ func TestMutationCancellationStopsCallWithoutReplay(t *testing.T) {
 	}
 }
 
-func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteV2Server) error {
+func (p *clientTestPeer) scanExecute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	count := uint64(1)
 	if p.mode == "scan_overbound" {
 		count = 2
@@ -383,7 +392,6 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteV2Server) err
 		end.NextContinuationToken = nil
 		if p.mode == "scan_unknown_failure" {
 			end.Failure.Code = FailureCode(127)
-			addResponseFields(end.Failure)
 		}
 	}
 	if p.mode == "scan_invalid_end" {
@@ -395,7 +403,7 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteV2Server) err
 	value := &pb.Event_ScanEnd{ScanEnd: end}
 	event := &pb.Event{Value: value}
 	frame := &pb.ExecuteResponse{Index: 1, Event: event}
-	if p.mode == "scan_unknown_fields" || p.mode == "scan_unknown_failure" {
+	if p.mode == "scan_unknown_fields" {
 		addResponseFields(frame, event, end)
 	}
 	if err := stream.Send(frame); err != nil {
@@ -411,7 +419,7 @@ func (p *clientTestPeer) scanExecute(stream pb.StoreService_ExecuteV2Server) err
 }
 
 func TestScanCommitsOnlyCompleteBoundedPage(t *testing.T) {
-	for _, mode := range []string{"scan_normal", "scan_missing_business_end", "scan_non_ok", "scan_overbound", "scan_invalid_end", "scan_bad_count", "scan_unknown_fields", "scan_after_end", "scan_consumer_failure"} {
+	for _, mode := range []string{"scan_normal", "scan_missing_business_end", "scan_non_ok", "scan_overbound", "scan_invalid_end", "scan_bad_count", "scan_unknown_fields", "scan_unknown_failure", "scan_after_end", "scan_consumer_failure"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
@@ -426,7 +434,7 @@ func TestScanCommitsOnlyCompleteBoundedPage(t *testing.T) {
 				return nil
 			}
 			end, err := Scan(t.Context(), client, options)
-			if mode == "scan_normal" || mode == "scan_unknown_fields" {
+			if mode == "scan_normal" {
 				if err != nil || end.GetDocumentCount() != 1 || string(end.NextContinuationToken) != "checkpoint" || consumed != 1 {
 					t.Fatal("complete page lost", end, err, consumed)
 				}

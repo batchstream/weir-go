@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.11.0
+go get github.com/batchstream/weir-go@v0.12.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.9.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.10.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -72,7 +72,7 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
-connection or opening one bidirectional ExecuteV2 RPC. An empty input, nil request,
+connection or opening one bidirectional Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
 one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
@@ -121,8 +121,7 @@ application only and must not be replayed automatically. This includes Lua keep
 and missing-document deletes. Backends without a separate search refresh satisfy
 the option when the mutation is acknowledged.
 
-The SDK sends the explicit `ExecuteV2` RPC for every operation. Upgrade the SDK
-and server together; the earlier `Execute` RPC is removed.
+The SDK sends the single `Execute` RPC for every operation.
 
 `ReadResult` contains exactly one of Document, Missing, or Failure. Missing is a
 successful read that confirmed document absence. `FailureTargetNotFound` means a
@@ -139,13 +138,11 @@ cannot establish whether it applied. A later RPC failure does not revoke any
 confirmed item. Unconfirmed nil positions may have applied; reconcile them through
 application knowledge and never automatically replay writes.
 
-Responses may contain additive protobuf fields that this SDK does not recognize.
-Those fields are ignored while required result variants, completion evidence,
-document envelopes, indexes and byte bounds remain validated. A future positive
-`FailureCode` is retained unchanged as a generic business failure; an unknown code
-never authorizes a retry or changes a confirmed `MutationApplied` outcome.
-Unknown request fields are rejected so unsupported execution options cannot be
-silently ignored. New execution semantics require an explicit protocol boundary.
+Requests and responses reject unknown protobuf fields recursively. FailureCode
+accepts only declared nonzero values. Required result variants, completion
+evidence, document envelopes, indexes and byte bounds remain validated. A known
+Failure never authorizes a retry or changes confirmed MutationApplied evidence.
+A malformed later response preserves previously confirmed results.
 
 ### Lua transforms
 
@@ -175,8 +172,8 @@ NOT_APPLIED with PRECONDITION_FAILED; nil, missing/multiple returns and scalar
 results are errors. `weir.object()` and `weir.array()` distinguish empty containers.
 Lua integers preserve 64 bits, and `weir.time.now()` returns one fixed UTC timestamp
 per operation, including confirmed conflict retries. This function entry point,
-return contract, helper behavior and document conversion are part of `weir.v1`;
-changes to their meaning require an explicit protocol boundary. See the server's
+return contract, helper behavior and document conversion follow the current
+protocol contract. See the server's
 [Lua guide](https://github.com/batchstream/weir/blob/main/docs/lua.md).
 Concurrent first creation can trigger a bounded fresh read/evaluation after a
 confirmed conflict. An ambiguous write or commit acknowledgement never triggers
@@ -211,8 +208,8 @@ settings with the returned token, while page size may change.
 
 Scan is read-only and returns documents. Tokens are opaque, versioned and usable
 on another equivalent Store replica without issuer process state. Continuation
-requires the same backing target and adapter traversal profile; compatible token
-readers must remain available throughout a rolling upgrade. Mongo traverses by
+requires the same backing target, adapter traversal profile and current token
+format. Mongo traverses by
 ascending native BSON `_id` without a cross-page snapshot or token expiry. Search
 uses a backend point-in-time snapshot with a 60-second keep-alive renewed by
 backend requests. An expired or lost snapshot fails continuation; it never starts
@@ -235,8 +232,8 @@ A new Store can use its own content type without changing the schema or SDK.
 Native imposes no command, method, path or parameter allowlist. The backend
 handles authorization and operation semantics. Resource is an optional canonical
 prefix; empty addresses the backend root when supported. MongoDB accepts a
-database or historical database/collection target and an `application/bson`
-command document. Search uses `application/http` and an optional resource prefix.
+database target or an empty Resource with `$db` in its `application/bson` command
+document. Search uses `application/http` and an optional resource prefix.
 
 ```go
 document := &weir.Document{ContentType: "application/vnd.example.command", Data: commandBytes}
@@ -293,7 +290,7 @@ request is automatically replayed.
 
 ## Streaming and deadlines
 
-All business operations use bidirectional ExecuteV2 streams. Each stream addresses
+All business operations use bidirectional Execute streams. Each stream addresses
 one Store and one operation kind. Scan and Native send one request, close their
 input and incrementally consume typed Events. Native chunks are bounded at
 64 KiB, Scan pages at 256 documents and native filters/Lua source/backend expressions at 16 KiB.
