@@ -511,3 +511,39 @@ func TestDiscoveredWriteLossIsNeverReplayed(t *testing.T) {
 		t.Fatalf("write evidence/replay: result=%v error=%v direct=%d seed=%d", result, err, target.executions.Load(), seed.executions.Load())
 	}
 }
+
+func TestOpenBeyondFormerStoreCount(t *testing.T) {
+	business := &clientTestPeer{mode: "normal"}
+	owner := &discoveryPeer{business: business}
+	listener := listenDiscovery(t, owner, "127.0.0.1:0")
+	stores := make([]string, 24)
+	for index := range stores {
+		stores[index] = fmt.Sprintf("records-%d", index)
+		record := discoveryRecord(stores[index], listener.address)
+		owner.set(stores[index], record)
+	}
+	options := OpenOptions{Seed: listener.address, Stores: stores}
+	client := openDiscovery(t, options)
+	for _, store := range stores {
+		discoveryRead(t, client, store)
+	}
+	if owner.resolves.Load() != int64(len(stores)) || business.received.Load() != int64(len(stores)) {
+		t.Fatal("Store initialization lost records", owner.resolves.Load(), business.received.Load())
+	}
+}
+
+func TestPhysicalAddressesBeyondFormerReplicaCount(t *testing.T) {
+	dns := testdns.Start(t)
+	addresses := make([]netip.Addr, 192)
+	for index := range addresses {
+		addresses[index] = netip.AddrFrom4([4]byte{127, 0, 0, byte(index + 1)})
+	}
+	answer := testdns.Answer{Addresses: addresses, TCP: true}
+	dns.Set("replicas.test", answer)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	actual, err := physicalAddresses(ctx, dns.Resolver(), []string{"replicas.test:7447"})
+	if err != nil || len(actual) != len(addresses) {
+		t.Fatal("large replica set rejected", len(actual), err)
+	}
+}

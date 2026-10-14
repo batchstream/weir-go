@@ -146,18 +146,18 @@ func TestBatchPreflightRejectsEntireInputBeforeRPC(t *testing.T) {
 	}
 }
 
-func TestBatchRejectsEncodedInputBoundsBeforeRPC(t *testing.T) {
+func TestBatchAcceptsRecordBeyondFormerFrameLimit(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
 	mutations := MutateOptions{StoreName: "records"}
-	oversized := &Document{ContentType: "application/octet-stream", Data: make([]byte, protocol.MaxCommandBytes+1)}
+	oversized := &Document{ContentType: "application/octet-stream", Data: make([]byte, (10<<20)+1)}
 	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: oversized}
 	mutations.Requests = []*MutateRequest{request}
-	if results, err := Mutate(t.Context(), client, mutations); err == nil || results != nil {
-		t.Fatal("oversized command accepted", len(results), err)
+	if results, err := Mutate(t.Context(), client, mutations); err != nil || len(results) != 1 || results[0].Outcome != MutationApplied || results[0].Failure != nil {
+		t.Fatal("large record rejected", len(results), err)
 	}
-	if peer.streams.Load() != 0 || peer.received.Load() != 0 {
-		t.Fatal("oversized batch opened RPC", peer.streams.Load(), peer.received.Load())
+	if peer.streams.Load() != 1 || peer.received.Load() != 1 {
+		t.Fatal("large record did not use one RPC", peer.streams.Load(), peer.received.Load())
 	}
 }
 
@@ -240,7 +240,7 @@ func TestClientBatchesRouteDirectlyToOneInitializedStore(t *testing.T) {
 func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
-	document := &Document{ContentType: "application/octet-stream", Data: make([]byte, protocol.MaxDocument)}
+	document := &Document{ContentType: "application/octet-stream", Data: make([]byte, (2 << 20))}
 	options := MutateOptions{StoreName: "records"}
 	for range 20 {
 		request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: document}
@@ -257,7 +257,7 @@ func TestMutateBatchLargeDocumentsUseOneRPC(t *testing.T) {
 			t.Fatal("large mutation lost acknowledgement", result)
 		}
 	}
-	if peer.streams.Load() != 1 || peer.received.Load() != 20 || peer.maxBytes.Load() > protocol.MaxExecuteRequestBytes {
+	if peer.streams.Load() != 1 || peer.received.Load() != 20 || peer.maxBytes.Load() > int64(protocol.MaxTransportMessageBytes) {
 		t.Fatal("large batch opened multiple RPCs", peer.streams.Load(), peer.received.Load())
 	}
 }

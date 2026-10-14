@@ -46,14 +46,12 @@ func NewHTTPNativeRequest(resource string, request *http.Request) (*NativeReques
 		copy.Header["User-Agent"] = []string{""}
 	}
 	if copy.Body != nil && copy.Body != http.NoBody {
-		data, err := io.ReadAll(io.LimitReader(copy.Body, protocol.MaxNativeRequestBytes+1))
+		data, err := io.ReadAll(copy.Body)
 		closeErr := copy.Body.Close()
 		if err != nil || closeErr != nil {
 			return nil, errors.Join(err, closeErr)
 		}
-		if len(data) > protocol.MaxNativeRequestBytes {
-			return nil, errors.New("Native HTTP request exceeds its byte bound")
-		}
+
 		copy.Body = http.NoBody
 		if len(data) != 0 {
 			copy.Body = io.NopCloser(bytes.NewReader(data))
@@ -64,11 +62,11 @@ func NewHTTPNativeRequest(resource string, request *http.Request) (*NativeReques
 	if copy.Host == "" && copy.URL.Host == "" {
 		copy.Host = "weir.invalid"
 	}
-	writer := nativeHTTPWriter{}
+	writer := bytes.Buffer{}
 	if err := copy.Write(&writer); err != nil {
 		return nil, err
 	}
-	document := &Document{ContentType: "application/http", Data: writer.data.Bytes()}
+	document := &Document{ContentType: "application/http", Data: writer.Bytes()}
 	native := &NativeRequest{Resource: resource, Request: document}
 	return native, nil
 }
@@ -77,8 +75,8 @@ func NewHTTPNativeRequest(resource string, request *http.Request) (*NativeReques
 // from Native response metadata. No body bytes may follow the terminating CRLF.
 // Other native formats stay opaque and do not require this optional helper.
 func ParseHTTPNativeResponse(response *NativeResponse) (*HTTPNativeResponse, error) {
-	if response == nil || response.Metadata == nil || response.Metadata.ContentType != "application/http" || len(response.Metadata.Data) > protocol.MaxNativeMetadataBytes {
-		return nil, errors.New("Native response requires bounded application/http metadata")
+	if response == nil || response.Metadata == nil || response.Metadata.ContentType != "application/http" {
+		return nil, errors.New("Native response requires application/http metadata")
 	}
 	data := response.Metadata.Data
 	if bytes.Index(data, []byte("\r\n\r\n")) != len(data)-4 || len(data) < 4 {
@@ -119,38 +117,4 @@ func ParseHTTPNativeResponse(response *NativeResponse) (*HTTPNativeResponse, err
 	}
 	result := &HTTPNativeResponse{StatusCode: parsed.StatusCode, Headers: parsed.Header}
 	return result, nil
-}
-
-type nativeHTTPWriter struct {
-	data        bytes.Buffer
-	headerBytes int
-	headerDone  bool
-	separator   int
-}
-
-func (w *nativeHTTPWriter) Write(data []byte) (int, error) {
-	if len(data) > protocol.MaxNativeRequestBytes-w.data.Len() {
-		return 0, errors.New("Native HTTP request exceeds its byte bound")
-	}
-	if !w.headerDone {
-		const end = "\r\n\r\n"
-		for _, value := range data {
-			w.headerBytes++
-			if w.headerBytes > protocol.MaxNativeMetadataBytes {
-				return 0, errors.New("Native HTTP request headers exceed their byte bound")
-			}
-			if value == end[w.separator] {
-				w.separator++
-			} else if value == '\r' {
-				w.separator = 1
-			} else {
-				w.separator = 0
-			}
-			if w.separator == len(end) {
-				w.headerDone = true
-				break
-			}
-		}
-	}
-	return w.data.Write(data)
 }

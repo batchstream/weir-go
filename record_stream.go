@@ -99,7 +99,7 @@ type recordStreamOptions struct {
 	consume func(context.Context, *pb.ExecuteResponse) error
 }
 
-// These SDK backpressure bounds are independent of the public wire contract.
+// These backpressure windows permit a larger individual request to proceed alone.
 const recordWindowItems = 32
 const recordWindowBytes = 8 << 20
 
@@ -117,7 +117,7 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := client.Execute(ctx, grpc.MaxCallSendMsgSize(protocol.MaxExecuteRequestBytes), grpc.MaxCallRecvMsgSize(protocol.MaxExecuteResponseBytes), grpc.MaxRetryRPCBufferSize(0))
+	stream, err := client.Execute(ctx, grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err != nil {
 		return err
 	}
@@ -176,10 +176,7 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			}
 			request := &pb.ExecuteRequest{StoreName: options.store, Index: result.count + 1, Command: command}
 			size := proto.Size(request)
-			if size > protocol.MaxExecuteRequestBytes {
-				result.err = errors.New("record exceeds request byte bound")
-				return
-			}
+
 			// A legal item larger than the byte window proceeds alone. Ordinary
 			// items wait for individual acknowledgements to return byte credit.
 			for inflight > 0 && size > recordWindowBytes-bytes {

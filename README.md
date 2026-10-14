@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.14.0
+go get github.com/batchstream/weir-go@v0.15.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.12.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.13.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -41,8 +41,7 @@ for index, result := range results {
 `Open` resolves ownership and establishes a ready direct connection for every
 requested Store. Reuse the client across goroutines and close it after callers
 finish. Its worker refreshes directory metadata and DNS replicas. The opening
-context bounds initialization; it does not own the returned client. Open accepts
-1–16 Stores. Discovery may retry read-only initialization; business requests are
+context bounds initialization; it does not own the returned client. Open accepts any nonempty set of distinct Stores. Discovery may retry read-only initialization; business requests are
 never replayed. A stale directory cache fails closed when its lease expires. Refresh failures
 preserve their error cause and gRPC classification; no live ownership announcement
 means Unavailable, while conflicting owners mean FailedPrecondition.
@@ -100,8 +99,7 @@ execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
 
 A logical call has no total byte or item limit. Each ExecuteRequest carries one
-read or mutation and each response carries its indexed result. Documents are
-bounded at 2 MiB. The SDK permits at most 32 unconsumed results and 8 MiB of
+read or mutation and each response carries its indexed result. Backend protocols determine accepted document sizes. The SDK permits at most 32 unconsumed results and 8 MiB of
 unacknowledged encoded input; a larger legal request uses the window alone.
 Credit returns after each Consume callback finishes. A size-dependent wait can
 hold one produced item that has not yet been sent. Sending and receiving run
@@ -177,8 +175,8 @@ options := weir.AtomicTransformOptions{StoreName: "search", Request: request}
 result, err := client.AtomicTransform(ctx, options)
 ```
 
-Mongo Input uses BSON. Lua source is bounded at 16 KiB and typed current/input/result
-trees at 256 KiB. The callback must return exactly one object to create/replace,
+Mongo Input uses BSON. Lua source and document values have no Weir size, depth,
+or node-count gate. The callback must return exactly one object to create/replace,
 or `weir.keep()`, `weir.delete()` or `weir.reject(message)`. Reject returns
 NOT_APPLIED with PRECONDITION_FAILED; nil, missing/multiple returns and scalar
 results are errors. `weir.object()` and `weir.array()` distinguish empty containers.
@@ -198,8 +196,7 @@ filter object or a Search JSON query object. There is no outer filter/query/sele
 wrapper. An absent filter matches all documents. Projection is optional; absent
 means full documents. An explicit `Projection` requires Include or Exclude mode
 and nonempty dot-separated field paths. Duplicate, overlapping ancestor paths,
-wildcards and control characters are rejected before the RPC. Projection permits 128 fields,
-512 bytes per path and 8 KiB encoded metadata. Literal `$field` paths are allowed
+wildcards and control characters are rejected before the RPC. Literal `$field` paths are allowed
 by the shared protocol; Mongo rejects them in its adapter and Search permits them.
 Mongo `_id` may be selected or excluded
 as a whole; `_id` subpaths return Unsupported. Search returns the projected
@@ -238,8 +235,7 @@ repeat documents; the caller owns deduplication and commits output with its chec
 ### Native requests and responses
 
 `NativeRequest` has Resource and a required Request Document. Its ContentType
-identifies an adapter-owned format; Data carries up to 8 MiB of opaque bytes and
-may be empty. The public protocol and SDK do not select or interpret backends.
+identifies an adapter-owned format; Data carries opaque bytes and may be empty. The public protocol and SDK do not select or interpret backends.
 A new Store can use its own content type without changing the schema or SDK.
 Native imposes no command, method, path or parameter allowlist. The backend
 handles authorization and operation semantics. Resource is an optional canonical
@@ -259,7 +255,7 @@ result, err := client.Native(ctx, options)
 
 Consume receives nonempty response chunks and finishes before the next chunk.
 `NativeResult.Response` also retains metadata for an empty body when no callback
-runs. Response.Metadata is an optional opaque Document bounded at 64 KiB of data;
+runs. Response.Metadata is an optional opaque Document;
 Response.BodyContentType describes the separately streamed body. Metadata may
 use a different content type from the request. Do not mutate response metadata
 in a callback. The SDK hides the wire Head/Chunk/End phases.
@@ -268,9 +264,8 @@ For HTTP-backed adapters, `NewHTTPNativeRequest(resource, request)` consumes and
 closes a standard `net/http.Request` body and serializes an `application/http`
 Document. It emits an HTTP/1.1 origin-form target, exact Content-Length and no
 default User-Agent. Methods, escaped paths, queries and application headers are
-preserved. Pass an empty resource for backend-root operations. The complete encoded
-request is bounded at 8 MiB, including its
-header block bounded at 64 KiB. Trailers are rejected. The Host header never
+preserved. Pass an empty resource for backend-root operations. HTTP request bodies
+and headers have no SDK size gate. Trailers are rejected. The Host header never
 chooses the owning Store or backend destination.
 
 ```go
@@ -304,8 +299,9 @@ request is automatically replayed.
 
 All business operations use bidirectional Execute streams. Each stream addresses
 one Store and one operation kind. Scan and Native send one request, close their
-input and incrementally consume typed Events. Native chunks are bounded at
-64 KiB, Scan pages at 256 documents and native filters/Lua source/backend expressions at 16 KiB.
+input and incrementally consume typed Events. Servers emit Native body chunks
+incrementally. Scan page size controls logical pagination; transport and backend
+protocols govern representable messages and accepted data.
 
 `ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
 returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
