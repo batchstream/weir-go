@@ -14,7 +14,7 @@ func TestMutateStreamPreservesPerRecordVisibility(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 2)}
 	client := clientTestConnection(t, peer)
 	expression := &Document{ContentType: "application/json", Data: []byte(`{"doc":{"n":1}}`)}
-	completion := &MutationOptions{Visibility: MutationSearchVisible}
+	completion := &MutationOptions{Visibility: MutationQueryVisible}
 	first := &MutateRequest{Resource: "records/s:first", Action: MutationAtomicTransform, BackendExpression: expression, Options: completion}
 	second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete}
 	requests := []*MutateRequest{first, second}
@@ -63,7 +63,7 @@ func TestNativeBackendRootUsesExecute(t *testing.T) {
 }
 
 func TestMutationOptionsRejectInvalidBatchBeforeRPC(t *testing.T) {
-	unknown := &MutationOptions{Visibility: MutationSearchVisible}
+	unknown := &MutationOptions{Visibility: MutationQueryVisible}
 	unknown.ProtoReflect().SetUnknown([]byte{0x10, 1})
 	negative := &MutationOptions{Visibility: MutationVisibility(-1)}
 	undeclared := &MutationOptions{Visibility: MutationVisibility(2)}

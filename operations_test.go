@@ -61,7 +61,7 @@ func TestScanPreservesBackendFailureWithoutCheckpoint(t *testing.T) {
 
 func TestTypedMutationsSelectBackendOperation(t *testing.T) {
 	acknowledged := &MutationOptions{}
-	visible := &MutationOptions{Visibility: MutationSearchVisible}
+	visible := &MutationOptions{Visibility: MutationQueryVisible}
 	cases := []struct {
 		name    string
 		options *MutationOptions
