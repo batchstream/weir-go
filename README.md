@@ -6,10 +6,10 @@ its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
 work in Kubernetes and other deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.15.0
+go get github.com/batchstream/weir-go@v0.16.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.13.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.14.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
