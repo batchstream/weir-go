@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Scan/Native operations, ResolveStore initialization, bounded bidirectional Execute streams, incremental ReadStream/MutateStream producers and consumers, indexed acknowledgements and Scan/Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Native operations, ResolveStore initialization, bounded bidirectional Execute streams, incremental ReadStream/MutateStream producers and consumers, indexed acknowledgements and incremental Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.
@@ -89,12 +89,6 @@ func typedAPI(ctx context.Context, client *weir.Client) {
     transform := &weir.AtomicTransformRequest{Resource: read.Resource, Lua: lua}
     transformOptions := weir.AtomicTransformOptions{StoreName: "records", Request: transform}
     _, _ = client.AtomicTransform(ctx, transformOptions)
-    filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"match_all":{}}`)}
-    projection := &weir.Projection{Mode: weir.ProjectionInclude, Fields: []string{"n"}}
-    scan := &weir.ScanRequest{Resource: "records", Filter: filter, Projection: projection, PageSize: 1}
-    scanOptions := weir.ScanOptions{StoreName: "records", Request: scan}
-    scanOptions.Consume = func(context.Context, *weir.Document) error { return nil }
-    _, _ = client.Scan(ctx, scanOptions)
     httpRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/key", nil)
     native, _ := weir.NewHTTPNativeRequest("records", httpRequest)
     nativeOptions := weir.NativeOptions{StoreName: "records", Request: native}
@@ -128,7 +122,7 @@ func main() {
         resolved = json.loads(run(['go', 'list', '-m', '-json', 'github.com/batchstream/weir-go'], cwd=root, env=env))
         if resolved['Version'] != version or resolved.get('Replace'):
             raise ValueError('external consumer did not use the published module')
-        for example in ('read', 'basic', 'scan', 'native'):
+        for example in ('read', 'basic', 'native'):
             run(['go', 'install', f'github.com/batchstream/weir-go/examples/{example}@{version}'], cwd=root, env=env)
         print('Verified external module and example installation:', version, sha)
 

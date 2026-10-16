@@ -12,8 +12,8 @@ import (
 	"google.golang.org/grpc"
 )
 
-// execute consumes one finite Scan or Native request incrementally. Scan callers
-// expose a checkpoint only after the terminal event and final gRPC OK.
+// execute consumes one Native request incrementally through its terminal event
+// and final gRPC status.
 func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.ExecuteRequest, consume func(context.Context, *pb.Event) error) (resultErr error) {
 	if client == nil || consume == nil {
 		return errors.New("Execute requires a client and consumer")
@@ -56,13 +56,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 			resultErr = errors.Join(resultErr, sendErr)
 		}
 	}()
-	state := streamState{}
-	if scan := request.Command.GetScan(); scan != nil {
-		state.kind = "scan"
-		state.pageSize = protocol.ScanPageSize(scan)
-	} else {
-		state.kind = "native"
-	}
+	state := nativeStreamState{}
 	for {
 		response, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -84,7 +78,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 			return err
 		}
 		if response.Index != 1 {
-			return errors.New("unexpected Scan or Native response ordinal")
+			return errors.New("unexpected Native response ordinal")
 		}
 		if err := state.validate(response.Event); err != nil {
 			return err
@@ -95,45 +89,29 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 	}
 }
 
-type streamState struct {
-	kind      string
-	terminal  bool
-	head      bool
-	documents uint64
-	pageSize  uint64
+type nativeStreamState struct {
+	terminal bool
+	head     bool
 }
 
-func (s *streamState) validate(event *pb.Event) error {
+func (s *nativeStreamState) validate(event *pb.Event) error {
 	switch value := event.Value.(type) {
-	case *pb.Event_Document:
-		if s.kind != "scan" {
-			return errors.New("unexpected Scan document")
-		}
-		s.documents++
-		if s.documents > s.pageSize {
-			return errors.New("Scan exceeded requested page size")
-		}
-	case *pb.Event_ScanEnd:
-		if s.kind != "scan" || value.ScanEnd.DocumentCount != s.documents {
-			return errors.New("Scan document count does not match completion")
-		}
-		s.terminal = true
 	case *pb.Event_Head:
-		if s.kind != "native" || s.head {
+		if s.head {
 			return errors.New("invalid Native response head")
 		}
 		s.head = true
 	case *pb.Event_Chunk:
-		if s.kind != "native" || !s.head {
+		if !s.head {
 			return errors.New("Native chunk before head")
 		}
 	case *pb.Event_NativeEnd:
-		if s.kind != "native" || value.NativeEnd.Completion == NativeResponseComplete && !s.head || value.NativeEnd.Completion == NativeNotStarted && s.head {
+		if value.NativeEnd.Completion == NativeResponseComplete && !s.head || value.NativeEnd.Completion == NativeNotStarted && s.head {
 			return errors.New("invalid Native completion")
 		}
 		s.terminal = true
 	default:
-		return errors.New("unexpected Execute event")
+		return errors.New("unexpected Native event")
 	}
 	return nil
 }

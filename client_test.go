@@ -3,7 +3,6 @@ package weir
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -75,10 +74,7 @@ func (p *clientTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteReque
 			if _, err := stream.Recv(); err != io.EOF {
 				return status.Error(codes.InvalidArgument, "single request did not close its input")
 			}
-			if request.Command.GetNative() != nil {
-				return p.nativeExecute(stream)
-			}
-			return p.scanExecute(stream)
+			return p.nativeExecute(stream)
 		}
 	}
 }
@@ -363,84 +359,5 @@ func TestMutationCancellationStopsCallWithoutReplay(t *testing.T) {
 	}
 	if peer.received.Load() != 1 {
 		t.Fatal("canceled mutation replayed")
-	}
-}
-
-func (p *clientTestPeer) scanExecute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
-	count := uint64(1)
-	if p.mode == "scan_overbound" {
-		count = 2
-	}
-	for range count {
-		document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-		value := &pb.Event_Document{Document: document}
-		event := &pb.Event{Value: value}
-		frame := &pb.ExecuteResponse{Index: 1, Event: event}
-		if p.mode == "scan_unknown_fields" {
-			addResponseFields(frame, event, document)
-		}
-		if err := stream.Send(frame); err != nil {
-			return err
-		}
-	}
-	if p.mode == "scan_missing_business_end" {
-		return nil
-	}
-	end := &ScanEnd{DocumentCount: count, NextContinuationToken: []byte("checkpoint")}
-	if p.mode == "scan_business_failure" || p.mode == "scan_unknown_failure" {
-		end.Failure = protocol.Fail(FailureUnavailable, "backend failed the Scan")
-		end.NextContinuationToken = nil
-		if p.mode == "scan_unknown_failure" {
-			end.Failure.Code = FailureCode(127)
-		}
-	}
-	if p.mode == "scan_invalid_end" {
-		end.Exhausted = true
-	}
-	if p.mode == "scan_bad_count" {
-		end.DocumentCount++
-	}
-	value := &pb.Event_ScanEnd{ScanEnd: end}
-	event := &pb.Event{Value: value}
-	frame := &pb.ExecuteResponse{Index: 1, Event: event}
-	if p.mode == "scan_unknown_fields" {
-		addResponseFields(frame, event, end)
-	}
-	if err := stream.Send(frame); err != nil {
-		return err
-	}
-	if p.mode == "scan_after_end" {
-		return stream.Send(frame)
-	}
-	if p.mode == "scan_non_ok" {
-		return status.Error(codes.Unavailable, "lost final status")
-	}
-	return nil
-}
-
-func TestScanCommitsOnlyCompleteBoundedPage(t *testing.T) {
-	for _, mode := range []string{"scan_normal", "scan_missing_business_end", "scan_non_ok", "scan_overbound", "scan_invalid_end", "scan_bad_count", "scan_unknown_fields", "scan_unknown_failure", "scan_after_end", "scan_consumer_failure"} {
-		t.Run(mode, func(t *testing.T) {
-			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			request := &ScanRequest{Resource: "records", PageSize: 1}
-			consumed := 0
-			options := ScanOptions{StoreName: "search", Request: request}
-			options.Consume = func(context.Context, *Document) error {
-				consumed++
-				if mode == "scan_consumer_failure" {
-					return errors.New("consumer failed")
-				}
-				return nil
-			}
-			end, err := Scan(t.Context(), client, options)
-			if mode == "scan_normal" {
-				if err != nil || end.GetDocumentCount() != 1 || string(end.NextContinuationToken) != "checkpoint" || consumed != 1 {
-					t.Fatal("complete page lost", end, err, consumed)
-				}
-			} else if err == nil || end != nil {
-				t.Fatal("invalid page exposed checkpoint", end, err)
-			}
-		})
 	}
 }

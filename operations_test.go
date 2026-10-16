@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -31,29 +32,6 @@ func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
 			}
 			if mode == "read_target_missing" && (result.Missing || result.Failure.GetCode() != FailureTargetNotFound) {
 				t.Fatal("missing backend target became successful document absence", result)
-			}
-		})
-	}
-}
-
-func TestScanPreservesBackendFailureWithoutCheckpoint(t *testing.T) {
-	for _, mode := range []string{"scan_business_failure", "scan_unknown_failure"} {
-		t.Run(mode, func(t *testing.T) {
-			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			request := &ScanRequest{Resource: "records", PageSize: 1}
-			options := ScanOptions{StoreName: "records", Request: request}
-			options.Consume = func(context.Context, *Document) error { return nil }
-			end, err := Scan(t.Context(), client, options)
-			if mode == "scan_unknown_failure" {
-				if err == nil || end != nil {
-					t.Fatal("undeclared Scan failure accepted", end, err)
-				}
-				return
-			}
-			expectedCode := FailureUnavailable
-			if err != nil || end.GetFailure().GetCode() != expectedCode || end.Exhausted || len(end.NextContinuationToken) != 0 {
-				t.Fatal("Scan lost backend failure or exposed a checkpoint", end, err)
 			}
 		})
 	}
@@ -203,9 +181,20 @@ func (p *clientTestPeer) nativeExecute(stream grpc.BidiStreamingServer[pb.Execut
 		events = []*pb.Event{headEvent, headEvent, chunkEvent, endEvent}
 	case "native_chunk_before_head":
 		events = []*pb.Event{chunkEvent, headEvent, endEvent}
+	case "native_missing_end":
+		events = []*pb.Event{headEvent, chunkEvent}
+	case "native_after_end":
+		events = []*pb.Event{headEvent, chunkEvent, endEvent, chunkEvent}
+	case "native_wrong_kind":
+		readValue := &pb.Event_ReadResult{ReadResult: protocol.Missing()}
+		readEvent := &pb.Event{Value: readValue}
+		events = []*pb.Event{readEvent}
 	}
 	for _, event := range events {
 		response := &pb.ExecuteResponse{Index: 1, Event: event}
+		if p.mode == "native_wrong_index" {
+			response.Index = 2
+		}
 		if p.mode == "native_unknown_fields" || p.mode == "native_unknown_fields_final_error" {
 			addResponseFields(response, event, head, metadata, end)
 		}
@@ -242,6 +231,7 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 		{mode: "native_incomplete", completion: NativeResponseIncomplete, chunks: 1, response: true, failure: true},
 		{mode: "native_incomplete_without_head", completion: NativeResponseIncomplete, failure: true},
 		{mode: "native_final_status_error", completion: NativeResponseComplete, chunks: 1, response: true, rpcError: true},
+		{mode: "native_after_end", completion: NativeResponseComplete, chunks: 1, response: true, rpcError: true},
 		{mode: "native_consumer_chunk_error", completion: NativeCompletionUnconfirmed, chunks: 1, response: true, rpcError: true},
 	}
 	for _, test := range cases {
@@ -288,7 +278,7 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 }
 
 func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
-	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_invalid_metadata", "native_unknown_completion", "native_unknown_fields", "native_unknown_fields_final_error", "native_unknown_failure"} {
+	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_invalid_metadata", "native_unknown_completion", "native_unknown_fields", "native_unknown_fields_final_error", "native_unknown_failure", "native_missing_end", "native_wrong_kind", "native_wrong_index"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
 			client := clientTestConnection(t, peer)
@@ -300,7 +290,7 @@ func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
 				t.Fatal("invalid completion evidence exposed", result, err)
 			}
 			expectedChunks := 0
-			if mode == "native_not_started_after_chunk" || mode == "native_unknown_completion" || mode == "native_unknown_failure" {
+			if mode == "native_not_started_after_chunk" || mode == "native_unknown_completion" || mode == "native_unknown_failure" || mode == "native_missing_end" {
 				expectedChunks = 1
 			}
 			if chunks != expectedChunks {

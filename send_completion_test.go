@@ -29,7 +29,6 @@ func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOptio
 type completionStream struct {
 	grpc.ClientStream
 	ctx       context.Context
-	mode      string
 	delivered chan struct{}
 	eofSeen   chan struct{}
 	release   chan struct{}
@@ -65,23 +64,14 @@ func (stream *completionStream) Recv() (*pb.ExecuteResponse, error) {
 		return nil, stream.ctx.Err()
 	}
 	var event *pb.Event
-	switch stream.mode {
-	case "scan":
-		if stream.stage == 0 {
-			end := &pb.ScanEnd{Exhausted: true}
-			value := &pb.Event_ScanEnd{ScanEnd: end}
-			event = &pb.Event{Value: value}
-		}
-	case "native":
-		if stream.stage == 0 {
-			head := &pb.NativeHead{}
-			value := &pb.Event_Head{Head: head}
-			event = &pb.Event{Value: value}
-		} else if stream.stage == 1 {
-			end := &pb.NativeEnd{Completion: NativeResponseComplete}
-			value := &pb.Event_NativeEnd{NativeEnd: end}
-			event = &pb.Event{Value: value}
-		}
+	if stream.stage == 0 {
+		head := &pb.NativeHead{}
+		value := &pb.Event_Head{Head: head}
+		event = &pb.Event{Value: value}
+	} else if stream.stage == 1 {
+		end := &pb.NativeEnd{Completion: NativeResponseComplete}
+		value := &pb.Event_NativeEnd{NativeEnd: end}
+		event = &pb.Event{Value: value}
 	}
 	stream.stage++
 	if event == nil {
@@ -92,74 +82,59 @@ func (stream *completionStream) Recv() (*pb.ExecuteResponse, error) {
 	return response, nil
 }
 
-func TestSingleExecuteWaitsForSendAfterTerminalEOF(t *testing.T) {
-	for _, mode := range []string{"scan", "native"} {
-		t.Run(mode, func(t *testing.T) {
-			stream := &completionStream{mode: mode, delivered: make(chan struct{}), eofSeen: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
-			client := &completionClient{stream: stream}
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-			defer cancel()
-			done := make(chan error, 1)
-			go func() {
-				if mode == "scan" {
-					request := &ScanRequest{Resource: "records"}
-					options := ScanOptions{StoreName: "records", Request: request}
-					options.Consume = func(context.Context, *Document) error { return nil }
-					_, err := Scan(ctx, client, options)
-					done <- err
-				} else {
-					document := &Document{ContentType: "application/vnd.example.request", Data: []byte{1}}
-					request := &NativeRequest{Resource: "records", Request: document}
-					options := NativeOptions{StoreName: "records", Request: request}
-					options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
-					_, err := Native(ctx, client, options)
-					done <- err
-				}
-			}()
-			select {
-			case <-stream.eofSeen:
-			case <-ctx.Done():
-				t.Fatal("fixture did not complete before Send returned")
-			}
-			select {
-			case err := <-done:
-				t.Fatal("terminal EOF bypassed sender completion", err)
-			case <-stream.ctx.Done():
-				t.Fatal("legitimate EOF cancelled the unfinished sender", stream.ctx.Err())
-			case <-time.After(50 * time.Millisecond):
-			}
-			close(stream.release)
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal("valid completion raced sender bookkeeping", err)
-				}
-				select {
-				case <-stream.closed:
-				default:
-					t.Fatal("completion did not wait for CloseSend")
-				}
-			case <-ctx.Done():
-				t.Fatal("sender completion was not joined")
-			}
-		})
+func TestNativeWaitsForSendAfterTerminalEOF(t *testing.T) {
+	stream := &completionStream{delivered: make(chan struct{}), eofSeen: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+	client := &completionClient{stream: stream}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+		options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
+		_, err := Native(ctx, client, options)
+		done <- err
+	}()
+	select {
+	case <-stream.eofSeen:
+	case <-ctx.Done():
+		t.Fatal("fixture did not complete before Send returned")
+	}
+	select {
+	case err := <-done:
+		t.Fatal("terminal EOF bypassed sender completion", err)
+	case <-stream.ctx.Done():
+		t.Fatal("legitimate EOF cancelled the unfinished sender", stream.ctx.Err())
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(stream.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal("valid completion raced sender bookkeeping", err)
+		}
+		select {
+		case <-stream.closed:
+		default:
+			t.Fatal("completion did not wait for CloseSend")
+		}
+	case <-ctx.Done():
+		t.Fatal("sender completion was not joined")
 	}
 }
 
 func TestLocalSendFailureCancelsReceiveAndJoins(t *testing.T) {
-	for _, mode := range []string{"scan", "read"} {
+	for _, mode := range []string{"native", "read"} {
 		t.Run(mode, func(t *testing.T) {
 			failure := errors.New("local send failed")
-			stream := &completionStream{mode: mode, delivered: make(chan struct{}), sendErr: failure}
+			stream := &completionStream{delivered: make(chan struct{}), sendErr: failure}
 			client := &completionClient{stream: stream}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 			var err error
-			if mode == "scan" {
-				request := &ScanRequest{Resource: "records"}
-				options := ScanOptions{StoreName: "records", Request: request}
-				options.Consume = func(context.Context, *Document) error { return nil }
-				_, err = Scan(ctx, client, options)
+			if mode == "native" {
+				options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+				options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
+				_, err = Native(ctx, client, options)
 			} else {
 				options := ReadOptions{StoreName: "records", Requests: []*ReadRequest{clientTestReadRequest()}}
 				_, err = Read(ctx, client, options)

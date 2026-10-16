@@ -24,10 +24,6 @@ type MutationOptions = pb.MutationOptions
 type MutationVisibility = pb.MutationVisibility
 type LuaTransform = pb.LuaTransform
 type ReadRequest = pb.ReadRequest
-type ScanRequest = pb.ScanRequest
-type ScanEnd = pb.ScanEnd
-type Projection = pb.Projection
-type ProjectionMode = pb.ProjectionMode
 
 // NativeRequest carries an opaque adapter-owned document. Keep its bytes
 // immutable until Native returns. Empty request data is permitted. Resource is
@@ -44,9 +40,6 @@ const (
 
 	MutationApplicationAcknowledged = pb.MutationVisibility_APPLICATION_ACKNOWLEDGED
 	MutationQueryVisible            = pb.MutationVisibility_QUERY_VISIBLE
-
-	ProjectionInclude = pb.ProjectionMode_INCLUDE
-	ProjectionExclude = pb.ProjectionMode_EXCLUDE
 
 	NativeCompletionUnconfirmed = pb.NativeCompletion_NATIVE_COMPLETION_UNSPECIFIED
 	NativeNotStarted            = pb.NativeCompletion_NATIVE_NOT_STARTED
@@ -189,14 +182,6 @@ type DeleteOptions struct {
 type AtomicTransformOptions struct {
 	StoreName string
 	Request   *AtomicTransformRequest
-}
-
-// Scan executes one finite page. Consume must finish before the next document.
-// A transport failure returns no checkpoint, even after a ScanEnd was observed.
-type ScanOptions struct {
-	StoreName string
-	Request   *ScanRequest
-	Consume   func(context.Context, *Document) error
 }
 
 // Native consumes only nonempty response chunks with their validated metadata.

@@ -35,26 +35,6 @@ func TestCachedDiscoveryFailurePreservesClassificationAndCause(t *testing.T) {
 	}
 }
 
-func TestScanRejectsInvalidProjectionBeforeRPC(t *testing.T) {
-	for _, projection := range []*Projection{
-		{},
-		{Mode: ProjectionInclude, Fields: []string{"name", "name"}},
-		{Mode: ProjectionExclude, Fields: []string{"name", "name.first"}},
-	} {
-		peer := &clientTestPeer{}
-		client := clientTestConnection(t, peer)
-		request := &ScanRequest{Resource: "records", Projection: projection}
-		options := ScanOptions{StoreName: "records", Request: request}
-		options.Consume = func(context.Context, *Document) error { return nil }
-		if result, err := Scan(t.Context(), client, options); result != nil || err == nil {
-			t.Fatal("invalid projection was not rejected", result, err)
-		}
-		if peer.streams.Load() != 0 {
-			t.Fatal("invalid projection opened an RPC")
-		}
-	}
-}
-
 func TestRequestExtensionsRejectBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{}
 	client := clientTestConnection(t, peer)
