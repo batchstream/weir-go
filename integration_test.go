@@ -331,11 +331,14 @@ func number(t *testing.T, backend string, data []byte) int64 {
 func nativeRequest(t *testing.T, backend, collection, id string) *weir.NativeRequest {
 	t.Helper()
 	if backend == "mongo" {
-		parts := strings.Split(collection, "/")
+		parts, err := protocol.ParseRelativeResource(collection)
+		if err != nil || len(parts) != 2 {
+			t.Fatal("Mongo integration resource requires database/collection", collection, err)
+		}
 		query := bson.D{{Key: "_id", Value: id}}
-		command := bson.D{{Key: "count", Value: parts[len(parts)-1]}, {Key: "query", Value: query}}
+		command := bson.D{{Key: "count", Value: parts[1]}, {Key: "query", Value: query}}
 		document := bsonDocument(t, command)
-		request := &weir.NativeRequest{Resource: collection, Request: document}
+		request := &weir.NativeRequest{Resource: protocol.EncodeSegment(parts[0]), Request: document}
 		return request
 	}
 	httpRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/_doc/"+id, nil)
