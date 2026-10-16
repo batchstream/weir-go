@@ -62,31 +62,6 @@ func mutateOne(ctx context.Context, client pb.StoreServiceClient, options Mutate
 	return results[0], err
 }
 
-// Scan consumes one finite page incrementally. Only final RPC OK exposes its
-// next checkpoint; retrying a failed page may redeliver documents and must use
-// the previous token. The caller owns deduplication and output commits.
-func Scan(ctx context.Context, client pb.StoreServiceClient, options ScanOptions) (*ScanEnd, error) {
-	if options.Request == nil || options.Consume == nil {
-		return nil, errors.New("Scan requires a request and document consumer")
-	}
-	variant := &pb.Command_Scan{Scan: options.Request}
-	command := &pb.Command{Operation: variant}
-	request := &pb.ExecuteRequest{StoreName: options.StoreName, Index: 1, Command: command}
-	var end *ScanEnd
-	consume := func(ctx context.Context, event *pb.Event) error {
-		if document := event.GetDocument(); document != nil {
-			return options.Consume(ctx, document)
-		}
-		end = event.GetScanEnd()
-		return nil
-	}
-	err := execute(ctx, client, request, consume)
-	if err != nil {
-		return nil, err
-	}
-	return end, nil
-}
-
 // Native consumes response bytes incrementally. Backend errors remain native
 // response data. A validated result remains evidence alongside later RPC errors.
 func Native(ctx context.Context, client pb.StoreServiceClient, options NativeOptions) (*NativeResult, error) {

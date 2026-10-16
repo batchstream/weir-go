@@ -569,14 +569,6 @@ func (c *Client) AtomicTransform(ctx context.Context, options AtomicTransformOpt
 	return AtomicTransform(ctx, client, options)
 }
 
-func (c *Client) Scan(ctx context.Context, options ScanOptions) (*ScanEnd, error) {
-	client, err := c.storeClient(options.StoreName)
-	if err != nil {
-		return nil, err
-	}
-	return Scan(ctx, client, options)
-}
-
 func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
 	client, err := c.storeClient(options.StoreName)
 	if err != nil {

@@ -67,7 +67,6 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
 | `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
 | `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
-| `Scan` | `ScanOptions` / `ScanRequest`, document consumer | `ScanEnd` |
 | `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
 `Read` and `Mutate` validate the complete input before selecting the Store
@@ -189,54 +188,13 @@ Concurrent first creation can trigger a bounded fresh read/evaluation after a
 confirmed conflict. An ambiguous write or commit acknowledgement never triggers
 automatic replay.
 
-### Scan filters and projection
-
-`ScanRequest.Filter` contains only the backend's native condition: a Mongo BSON
-filter object or a Search JSON query object. There is no outer filter/query/selector
-wrapper. An absent filter matches all documents. Projection is optional; absent
-means full documents. An explicit `Projection` requires Include or Exclude mode
-and nonempty dot-separated field paths. Duplicate, overlapping ancestor paths,
-wildcards and control characters are rejected before the RPC. Literal `$field` paths are allowed
-by the shared protocol; Mongo rejects them in its adapter and Search permits them.
-Mongo `_id` may be selected or excluded
-as a whole; `_id` subpaths return Unsupported. Search returns the projected
-`_source` object, without backend hit metadata.
-
-```go
-filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"term":{"state":"ready"}}`)}
-projection := &weir.Projection{Mode: weir.ProjectionInclude, Fields: []string{"name", "profile.age"}}
-request := &weir.ScanRequest{Resource: "records", Filter: filter, Projection: projection, PageSize: 128}
-options := weir.ScanOptions{StoreName: "search", Request: request, Consume: processDocument}
-end, err := client.Scan(ctx, options)
-```
-
-For Mongo, marshal the native object directly, for example `bson.D{{Key: "state",
-Value: "ready"}}`, into an `application/bson` Filter. Traversal ordering belongs to
-the adapter. Continuations bind Store, resource, filter and projection; repeat those
-settings with the returned token, while page size may change.
-
-Scan is read-only and returns documents. Tokens are opaque, versioned and usable
-on another equivalent Store replica without issuer process state. Continuation
-requires the same backing target, adapter traversal profile and current token
-format. Mongo traverses by
-ascending native BSON `_id` without a cross-page snapshot or token expiry. Search
-uses a backend point-in-time snapshot with a 60-second keep-alive renewed by
-backend requests. An expired or lost snapshot fails continuation; it never starts
-a replacement traversal silently.
-
-`Scan` consumes a finite page incrementally. A transport, protocol or consumer
-failure returns a Go error and no ScanEnd; keep the previous checkpoint. A completed
-RPC can instead return `ScanEnd.Failure` with a nil Go error. That business failure
-has no continuation token and is not exhausted. A successful empty traversal returns
-Exhausted, not a document-missing result. Accept a checkpoint only after the matching
-document count, terminal ScanEnd and final gRPC OK. Retrying an interrupted page can
-repeat documents; the caller owns deduplication and commits output with its checkpoint.
-
 ### Native requests and responses
 
 `NativeRequest` has Resource and a required Request Document. Its ContentType
 identifies an adapter-owned format; Data carries opaque bytes and may be empty. The public protocol and SDK do not select or interpret backends.
 A new Store can use its own content type without changing the schema or SDK.
+Backend queries, counts and traversal use Native with caller-owned backend
+commands, pagination and cleanup.
 Native imposes no command, method, path or parameter allowlist. The backend
 handles authorization and operation semantics. Resource is an optional canonical
 prefix; empty addresses the backend root when supported. MongoDB accepts a
@@ -298,9 +256,8 @@ request is automatically replayed.
 ## Streaming and deadlines
 
 All business operations use bidirectional Execute streams. Each stream addresses
-one Store and one operation kind. Scan and Native send one request, close their
-input and incrementally consume typed Events. Servers emit Native body chunks
-incrementally. Scan page size controls logical pagination; transport and backend
+one Store and one operation kind. Native sends one request, closes its input and
+consumes response metadata and body chunks incrementally. Transport and backend
 protocols govern representable messages and accepted data.
 
 `ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
@@ -343,8 +300,8 @@ methods. The caller owns target validation and connection lifetime for Dial.
 ## Examples and validation
 
 [read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
-mutates a document then reads multiple resources in one stream, [scan](examples/scan/main.go)
-commits finite-page checkpoints, and [native](examples/native/main.go) consumes
+mutates a document then reads multiple resources in one stream, and
+[native](examples/native/main.go) consumes
 native responses. These examples use SDK request and result types.
 
 ```sh
@@ -356,7 +313,7 @@ GOWORK=off GOPROXY=off GOSUMDB=off python3 scripts/check_dependencies.py
 
 Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
-malformed/empty native chunks, incremental consumption, scan checkpoints,
+malformed/empty native chunks, incremental consumption,
 completion/cancellation, no replay, deadline admission, directory expiry/conflicts,
 DNS refresh and direct Store routing. The full module graph and normal/
 integration package closures must remain independent of the Weir server. Releases
@@ -371,14 +328,13 @@ WEIR_MONGO_STORE=mongo \
 WEIR_MONGO_RESOURCE=weir_acceptance/records \
 WEIR_SEARCH_STORE=search \
 WEIR_SEARCH_RESOURCE=weir_acceptance \
-go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|StreamingAndPagination)' -v .
+go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|Streaming)' -v .
 ```
 
 Pre-create disposable collections/indexes. Each test creates and cleans up only
-its generated records. Lifecycle tests cover CRUD, backend expressions, Scan and
+its generated records. Lifecycle tests cover CRUD, backend expressions and
 Native; streaming tests verify same-resource ordering through an individual
-failure, Lua persistence, repeated and missing reads, projection and multi-page
-checkpoints continued through a reopened client. System integration tests,
+failure, Lua persistence, and repeated and missing reads. System integration tests,
 backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 

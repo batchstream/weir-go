@@ -24,8 +24,8 @@ import (
 func TestMongoLifecycle(t *testing.T)  { testLifecycle(t, "mongo") }
 func TestSearchLifecycle(t *testing.T) { testLifecycle(t, "search") }
 
-func TestMongoStreamingAndPagination(t *testing.T)  { testStreamingAndPagination(t, "mongo") }
-func TestSearchStreamingAndPagination(t *testing.T) { testStreamingAndPagination(t, "search") }
+func TestMongoStreaming(t *testing.T)  { testStreaming(t, "mongo") }
+func TestSearchStreaming(t *testing.T) { testStreaming(t, "search") }
 
 type integrationTarget struct {
 	options    weir.OpenOptions
@@ -121,30 +121,6 @@ func testLifecycle(t *testing.T, backend string) {
 			t.Fatal("read-after-write batch failed")
 		}
 	}
-	filter := &weir.Document{ContentType: "application/json", Data: []byte(`{"ids":{"values":["` + id + `"]}}`)}
-	if backend == "mongo" {
-		query := bson.D{{Key: "_id", Value: id}}
-		filter = bsonDocument(t, query)
-	}
-	scan := &weir.ScanRequest{Resource: collection, Filter: filter, PageSize: 1}
-	count := 0
-	scanOptions := weir.ScanOptions{StoreName: store, Request: scan}
-	scanOptions.Consume = func(context.Context, *weir.Document) error { count++; return nil }
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		count = 0
-		end, err := client.Scan(ctx, scanOptions)
-		if err != nil || end.GetFailure() != nil {
-			t.Fatal("Scan:", end, err)
-		}
-		if count == 1 {
-			break
-		}
-		if count > 1 || time.Now().After(deadline) {
-			t.Fatalf("Scan count=%d", count)
-		}
-		time.Sleep(100 * time.Millisecond) // Explicit read-only Search visibility poll.
-	}
 	native := nativeRequest(t, backend, collection, id)
 	var body []byte
 	nativeOptions := weir.NativeOptions{StoreName: store, Request: native}
@@ -179,10 +155,10 @@ func testLifecycle(t *testing.T, backend string) {
 	if err != nil || readResult == nil || !readResult.Missing {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
-	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered streamed read-after-write, Scan, native Execute and Delete verified", backend)
+	t.Logf("%s: Create, duplicate precondition, Replace, Put, AtomicTransform, Read, ordered streamed read-after-write, native Execute and Delete verified", backend)
 }
 
-func testStreamingAndPagination(t *testing.T, backend string) {
+func testStreaming(t *testing.T, backend string) {
 	t.Helper()
 	target := integrationFixture(t, backend)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -293,90 +269,7 @@ end`)}
 	if err := client.ReadStream(ctx, read); err != nil || confirmed != len(resources) {
 		t.Fatalf("stream read acknowledgements=%d: %v", confirmed, err)
 	}
-	nativeFilter := map[string]any{"ids": map[string]any{"values": ids}}
-	filterData, err := json.Marshal(nativeFilter)
-	if err != nil {
-		t.Fatal(err)
-	}
-	filter := &weir.Document{ContentType: "application/json", Data: filterData}
-	if backend == "mongo" {
-		condition := bson.D{{Key: "$in", Value: ids}}
-		query := bson.D{{Key: "_id", Value: condition}}
-		filter = bsonDocument(t, query)
-	}
-	projection := &weir.Projection{Mode: weir.ProjectionInclude, Fields: []string{"n"}}
-	scan := &weir.ScanRequest{Resource: target.collection, Filter: filter, Projection: projection, PageSize: 1}
-	scanOptions := weir.ScanOptions{StoreName: target.store, Request: scan}
-	seen := make(map[int64]bool)
-	scanOptions.Consume = func(_ context.Context, document *weir.Document) error {
-		if backend == "mongo" {
-			if bson.Raw(document.Data).Lookup("unprojected").Type != 0 {
-				return errors.New("Mongo projection retained an unselected field")
-			}
-		} else {
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(document.Data, &fields); err != nil {
-				return err
-			}
-			if _, exists := fields["unprojected"]; exists {
-				return errors.New("Search projection retained an unselected field")
-			}
-		}
-		value := number(t, backend, document.Data)
-		if value != 1 && value != 2 && value != 17 || seen[value] {
-			return fmt.Errorf("unexpected or duplicate traversal value %d", value)
-		}
-		seen[value] = true
-		return nil
-	}
-	// Wait until every owned record is visible before Search pins a snapshot.
-	scan.PageSize = uint32(len(builders))
-	visibilityDeadline := time.Now().Add(10 * time.Second)
-	var end *weir.ScanEnd
-	for {
-		clear(seen)
-		end, err = client.Scan(ctx, scanOptions)
-		if err != nil || end.GetFailure() != nil {
-			t.Fatal("initial Scan:", end, err)
-		}
-		if len(seen) == len(builders) {
-			break
-		}
-		if time.Now().After(visibilityDeadline) {
-			t.Fatal("created documents did not become visible to Scan")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	clear(seen)
-	scan.PageSize = 1
-	end, err = client.Scan(ctx, scanOptions)
-	if err != nil || end.GetFailure() != nil {
-		t.Fatal("first bounded Scan:", end, err)
-	}
-	if end.Exhausted || len(end.NextContinuationToken) == 0 || end.DocumentCount != 1 {
-		t.Fatal("first bounded page has no continuation:", end)
-	}
-	// Reopening removes any SDK state that could accidentally make tokens work.
-	continuationClient, err := weir.Open(ctx, target.options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer continuationClient.Close()
-	scan.PageSize = 2
-	for page := 0; !end.Exhausted; page++ {
-		if page >= len(builders) {
-			t.Fatal("Scan did not terminate within its owned record count")
-		}
-		scan.ContinuationToken = end.NextContinuationToken
-		end, err = continuationClient.Scan(ctx, scanOptions)
-		if err != nil || end.GetFailure() != nil {
-			t.Fatal("continued Scan:", end, err)
-		}
-	}
-	if len(seen) != len(builders) || len(end.NextContinuationToken) != 0 {
-		t.Fatalf("completed traversal count=%d, end=%v", len(seen), end)
-	}
-	t.Logf("%s: stream same-key order, duplicate-create continuation, Lua readback, repeated/missing streamed reads and projected checkpoint continuation on a reopened client verified", backend)
+	t.Logf("%s: stream same-key order, duplicate-create continuation, Lua readback and repeated/missing streamed reads verified", backend)
 }
 
 func applied(t *testing.T, result *weir.MutationResult, err error) {
