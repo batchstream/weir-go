@@ -325,9 +325,9 @@ Real backend tests require an explicit tag and operator-provided fixtures:
 ```sh
 WEIR_ADDRESS=127.0.0.1:7447 \
 WEIR_MONGO_STORE=mongo \
-WEIR_MONGO_RESOURCE=weir_acceptance/records \
+WEIR_MONGO_RESOURCE=weir_example/records \
 WEIR_SEARCH_STORE=search \
-WEIR_SEARCH_RESOURCE=weir_acceptance \
+WEIR_SEARCH_RESOURCE=weir_example \
 go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|Streaming)' -v .
 ```
 
