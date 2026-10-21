@@ -22,8 +22,8 @@ func main() {
 func run() error {
 	address := flag.String("address", "127.0.0.1:7447", "Weir initialization listener")
 	store := flag.String("store", "mongo", "mongo or search")
-	database := flag.String("database", "weir_m1", "configured Mongo database")
-	index := flag.String("index", "weir_m2_example", "configured Search index")
+	database := flag.String("database", "weir_example", "configured Mongo database")
+	index := flag.String("index", "weir_example", "configured Search index")
 	flag.Parse()
 
 	request := &weir.NativeRequest{}
