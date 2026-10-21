@@ -19,8 +19,8 @@ func main() {
 func run() error {
 	address := flag.String("address", "127.0.0.1:7447", "Weir initialization listener")
 	storeName := flag.String("store", "mongo", "logical Store: mongo or search")
-	database := flag.String("database", "weir_m1", "pre-created MongoDB database")
-	index := flag.String("index", "weir_m2_example", "pre-created Search index")
+	database := flag.String("database", "weir_example", "pre-created MongoDB database")
+	index := flag.String("index", "weir_example", "pre-created Search index")
 	count := flag.Int("count", 100, "finite number of read requests")
 	flag.Parse()
 	if *storeName != "mongo" && *storeName != "search" || *count < 1 {
