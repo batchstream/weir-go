@@ -146,12 +146,12 @@ func TestBatchPreflightRejectsEntireInputBeforeRPC(t *testing.T) {
 	}
 }
 
-func TestBatchAcceptsRecordBeyondFormerFrameLimit(t *testing.T) {
+func TestBatchAcceptsLargeRecord(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
 	client := clientTestConnection(t, peer)
 	mutations := MutateOptions{StoreName: "records"}
-	oversized := &Document{ContentType: "application/octet-stream", Data: make([]byte, (10<<20)+1)}
-	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: oversized}
+	large := &Document{ContentType: "application/octet-stream", Data: make([]byte, 16<<20)}
+	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: large}
 	mutations.Requests = []*MutateRequest{request}
 	if results, err := Mutate(t.Context(), client, mutations); err != nil || len(results) != 1 || results[0].Outcome != MutationApplied || results[0].Failure != nil {
 		t.Fatal("large record rejected", len(results), err)
@@ -266,11 +266,11 @@ func TestReadAcceptsLargeRequestSequence(t *testing.T) {
 	peer := &clientTestPeer{mode: "batch_read_order"}
 	client := clientTestConnection(t, peer)
 	options := ReadOptions{StoreName: "records"}
-	for range 3073 {
+	for range 5000 {
 		options.Requests = append(options.Requests, clientTestReadRequest())
 	}
 	results, err := Read(t.Context(), client, options)
-	if err != nil || len(results) != 3073 || peer.streams.Load() != 1 || peer.received.Load() != 3073 {
-		t.Fatal("bounded large batch was split or limited by count", len(results), err, peer.streams.Load(), peer.received.Load())
+	if err != nil || len(results) != 5000 || peer.streams.Load() != 1 || peer.received.Load() != 5000 {
+		t.Fatal("large batch was split or limited by count", len(results), err, peer.streams.Load(), peer.received.Load())
 	}
 }

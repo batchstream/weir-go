@@ -57,9 +57,6 @@ func (p *clientTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteReque
 		if p.mode == "early_eof" {
 			return nil
 		}
-		if p.mode == "reject_early" {
-			return status.Error(codes.InvalidArgument, "fixture rejection")
-		}
 		switch {
 		case request.Command.GetRead() != nil:
 			if err := p.readRecord(request, stream); err != nil {
@@ -163,7 +160,7 @@ func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream grpc.
 	if p.mutations != nil {
 		p.mutations <- request.Command.GetMutate()
 	}
-	if p.mode == "write_reply_loss" || p.mode == "write_end_failure" {
+	if p.mode == "write_reply_loss" {
 		return status.Error(codes.Unavailable, "applied but response lost")
 	}
 	result := protocol.Mutation(MutationApplied, nil)
@@ -204,7 +201,7 @@ func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream grpc.
 	return nil
 }
 
-// Field 127 is undeclared by the current response schema. These
+// Field 127 is undeclared in the response schema. These
 // bytes travel through the real protobuf codec before SDK validation.
 func addResponseFields(messages ...proto.Message) {
 	for _, message := range messages {
