@@ -146,7 +146,7 @@ func (p *clientTestPeer) nativeExecute(stream grpc.BidiStreamingServer[pb.Execut
 	}
 	headValue := &pb.Event_Head{Head: head}
 	headEvent := &pb.Event{Value: headValue}
-	chunkValue := &pb.Event_Chunk{Chunk: []byte("bounded native bytes")}
+	chunkValue := &pb.Event_Chunk{Chunk: []byte("native body bytes")}
 	chunkEvent := &pb.Event{Value: chunkValue}
 	end := &pb.NativeEnd{Completion: pb.NativeCompletion_RESPONSE_COMPLETE}
 	if p.mode == "native_not_started" || p.mode == "native_not_started_after_head" || p.mode == "native_not_started_after_chunk" {
@@ -243,7 +243,7 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 			failure := errors.New("consumer rejected body")
 			options.Consume = func(_ context.Context, response *NativeResponse, data []byte) error {
 				chunks++
-				if string(data) != "bounded native bytes" {
+				if string(data) != "native body bytes" {
 					t.Fatal("body bytes changed", response, data)
 				}
 				if test.mode == "native_http_error" {
@@ -274,6 +274,19 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 				t.Fatal("Native request replayed", peer.received.Load())
 			}
 		})
+	}
+}
+
+func TestNativeSendsBackendRootRequest(t *testing.T) {
+	peer := &clientTestPeer{mode: "native_no_metadata"}
+	client := clientTestConnection(t, peer)
+	document := &Document{ContentType: "application/http", Data: []byte("GET /_cluster/health HTTP/1.1\r\n\r\n")}
+	request := &NativeRequest{Request: document}
+	options := NativeOptions{StoreName: "search", Request: request}
+	options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
+	result, err := Native(t.Context(), client, options)
+	if err != nil || result == nil || result.Completion != NativeResponseComplete || peer.streams.Load() != 1 || peer.received.Load() != 1 {
+		t.Fatal("Native backend root request failed", result, err, peer.streams.Load(), peer.received.Load())
 	}
 }
 

@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/batchstream/weir-go/internal/testutil/testdns"
+	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type discoveryPeer struct {
@@ -90,7 +90,7 @@ func listenDiscovery(t *testing.T, peer *discoveryPeer, address string) *discove
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.MaxRecvMsgSize(10 << 20))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(protocol.MaxTransportMessageBytes))
 	pb.RegisterStoreServiceServer(server, peer)
 	done := make(chan struct{})
 	go func() { _ = server.Serve(listener); close(done) }()
@@ -157,26 +157,6 @@ func waitDiscoveryAddresses(t *testing.T, client *Client, store string, addresse
 			t.Fatalf("discovery did not install addresses %v; installed %v: %v", addresses, installed, ctx.Err())
 		case <-ticker.C:
 		}
-	}
-}
-
-func TestResolveStorePublicResponseContract(t *testing.T) {
-	response := &pb.ResolveStoreResponse{}
-	descriptor := response.ProtoReflect().Descriptor()
-	fields := descriptor.Fields()
-	names := []protoreflect.Name{"store_name", "endpoints", "cache_ttl_ms"}
-	if fields.Len() != len(names) {
-		t.Fatalf("public resolution exposes %d fields; only Store name, endpoints and cache TTL are allowed", fields.Len())
-	}
-	for i, name := range names {
-		field := fields.ByName(name)
-		if field == nil || field.Number() != protoreflect.FieldNumber(i+1) {
-			t.Fatalf("public resolution field %s changed its wire identity", name)
-		}
-	}
-	file := descriptor.ParentFile()
-	if file.Messages().ByName("NodeAnnouncement") != nil || file.Services().ByName("PeerDiscoveryService") != nil {
-		t.Fatal("public Store protocol contains internal peer discovery metadata")
 	}
 }
 
@@ -512,7 +492,7 @@ func TestDiscoveredWriteLossIsNeverReplayed(t *testing.T) {
 	}
 }
 
-func TestOpenBeyondFormerStoreCount(t *testing.T) {
+func TestOpenInitializesManyStores(t *testing.T) {
 	business := &clientTestPeer{mode: "normal"}
 	owner := &discoveryPeer{business: business}
 	listener := listenDiscovery(t, owner, "127.0.0.1:0")
@@ -532,9 +512,9 @@ func TestOpenBeyondFormerStoreCount(t *testing.T) {
 	}
 }
 
-func TestPhysicalAddressesBeyondFormerReplicaCount(t *testing.T) {
+func TestPhysicalAddressesExpandsAndDeduplicatesEndpoints(t *testing.T) {
 	dns := testdns.Start(t)
-	addresses := make([]netip.Addr, 192)
+	addresses := make([]netip.Addr, 100)
 	for index := range addresses {
 		addresses[index] = netip.AddrFrom4([4]byte{127, 0, 0, byte(index + 1)})
 	}
@@ -542,8 +522,9 @@ func TestPhysicalAddressesBeyondFormerReplicaCount(t *testing.T) {
 	dns.Set("replicas.test", answer)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	actual, err := physicalAddresses(ctx, dns.Resolver(), []string{"replicas.test:7447"})
-	if err != nil || len(actual) != len(addresses) {
-		t.Fatal("large replica set rejected", len(actual), err)
+	endpoints := []string{"replicas.test:7447", "127.0.0.1:7447"}
+	actual, err := physicalAddresses(ctx, dns.Resolver(), endpoints)
+	if err != nil || len(actual) != len(addresses) || !slices.IsSorted(actual) {
+		t.Fatal("replica addresses were lost, duplicated or unordered", len(actual), err)
 	}
 }

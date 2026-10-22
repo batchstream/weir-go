@@ -12,7 +12,7 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 )
 
-func TestHTTPNativeRequestUsesBoundedOriginFormAndExactLength(t *testing.T) {
+func TestHTTPNativeRequestUsesOriginFormAndExactLength(t *testing.T) {
 	for _, incoming := range []bool{false, true} {
 		t.Run(strconv.FormatBool(incoming), func(t *testing.T) {
 			body := io.NopCloser(strings.NewReader(`{"n":1}`))
@@ -116,14 +116,14 @@ func (b *nativeRequestBody) Close() error {
 	return nil
 }
 
-func TestHTTPNativeRequestBeyondFormerBodyAndHeaderLimits(t *testing.T) {
-	const size = (9 << 20) + 1
+func TestHTTPNativeRequestPreservesLargeBodyAndHeaders(t *testing.T) {
+	const size = 16 << 20
 	body := &nativeRequestBody{remaining: size}
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "/query", body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("X-Large", strings.Repeat("x", 128<<10))
+	request.Header.Set("X-Large", strings.Repeat("x", 256<<10))
 	native, err := NewHTTPNativeRequest("entries", request)
 	if err != nil || native == nil || !body.closed || body.read != size {
 		t.Fatal("large request lost", err, body)
@@ -196,8 +196,8 @@ func TestHTTPNativeResponseRejectsMalformedMetadataFraming(t *testing.T) {
 	}
 }
 
-func TestHTTPNativeResponseBeyondFormerMetadataLimit(t *testing.T) {
-	header := strings.Repeat("x", 3<<20)
+func TestHTTPNativeResponsePreservesLargeMetadata(t *testing.T) {
+	header := strings.Repeat("x", 4<<20)
 	metadata := &Document{ContentType: "application/http", Data: []byte("HTTP/1.1 200 OK\r\nX-Large: " + header + "\r\n\r\n")}
 	response := &NativeResponse{Metadata: metadata}
 	parsed, err := ParseHTTPNativeResponse(response)

@@ -136,8 +136,8 @@ func Open(ctx context.Context, options OpenOptions) (*Client, error) {
 		return nil, fmt.Errorf("initialization connection: %w", err)
 	}
 	defer seedChannel.connection.Close()
-	// Finish discovery before opening business channels so a server can honor
-	// its physical connection limit without needing an extra bootstrap slot.
+	// Resolve every Store and close the seed connection before opening business
+	// channels, so initialization never holds both kinds of connection.
 	for _, store := range options.Stores {
 		response, resolveErr := client.initialResolve(ctx, seedChannel, store)
 		if resolveErr != nil {
