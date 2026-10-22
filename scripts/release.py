@@ -42,7 +42,7 @@ def main():
             raise RuntimeError('could not determine existing release state')
         with tempfile.TemporaryDirectory(prefix='weir-sdk-release-') as directory:
             notes = Path(directory) / 'notes.md'
-            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Native operations, ResolveStore initialization, bounded bidirectional Execute streams, incremental ReadStream/MutateStream producers and consumers, indexed acknowledgements and incremental Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
+            notes.write_text(f'Go SDK with typed Read/Create/Put/Replace/Delete/AtomicTransform/Native operations, ResolveStore initialization, bidirectional Execute streams, incremental ReadStream/MutateStream producers and consumers, indexed acknowledgements and incremental Native responses, with no automatic business replay.\n\nSource: `{sha}`. Protocol: `{upstream["Version"]}`. Default race tests and vet passed before publication. Install with `go get github.com/batchstream/weir-go@{version}`. See the README for usage and validation.\n')
             run(['gh', 'release', 'create', version, '--repo', 'batchstream/weir-go', '--target', sha, '--title', version, '--notes-file', str(notes)])
     # Use a clean consumer module and cache: no workspace replace or existing SDK
     # checkout can mask a release-resolution problem. Retry read-only propagation.

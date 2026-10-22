@@ -1,4 +1,4 @@
-// Native sends one bounded backend request and consumes its response incrementally.
+// Native sends one backend request and consumes its response incrementally.
 // Native backend errors remain native response data, not normalized write outcomes.
 package main
 

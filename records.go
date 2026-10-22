@@ -10,7 +10,7 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
 
-// Read validates every input before opening one bounded Execute stream. Results
+// Read validates every input before opening one Execute stream. Results
 // retain input order. A later stream error preserves already confirmed items;
 // unconfirmed positions remain nil. Requests are never automatically replayed.
 func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) ([]*ReadResult, error) {
@@ -20,7 +20,7 @@ func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions
 	return readRecords(ctx, client, options)
 }
 
-// Mutate validates every input before opening one bounded Execute stream.
+// Mutate validates every input before opening one Execute stream.
 // Same-resource mutations execute in input order, including after item failures.
 // A later stream error preserves confirmed results; nil positions remain
 // unacknowledged and may have applied. The call is not a transaction or replayed.

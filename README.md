@@ -130,8 +130,6 @@ options := weir.WriteOptions{StoreName: "search", Request: request}
 result, err := client.Put(ctx, options)
 ```
 
-The SDK sends the single `Execute` RPC for every operation.
-
 `ReadResult` contains exactly one of Document, Missing, or Failure. Missing is a
 successful read that confirmed document absence. `FailureTargetNotFound` means a
 required backend collection or index is missing. A failure does not establish
@@ -148,9 +146,9 @@ confirmed item. Unconfirmed nil positions may have applied; reconcile them throu
 application knowledge and never automatically replay writes.
 
 Requests and responses reject unknown protobuf fields recursively. FailureCode
-accepts only declared nonzero values. Required result variants, completion
-evidence, document envelopes, indexes and byte bounds remain validated. A known
-Failure never authorizes a retry or changes confirmed MutationApplied evidence.
+accepts only declared nonzero values. The SDK validates required result variants,
+completion evidence, document envelopes and indexes. A known Failure never
+authorizes a retry or changes confirmed MutationApplied evidence.
 A malformed later response preserves previously confirmed results.
 
 ### Lua transforms
@@ -181,8 +179,8 @@ NOT_APPLIED with PRECONDITION_FAILED; nil, missing/multiple returns and scalar
 results are errors. `weir.object()` and `weir.array()` distinguish empty containers.
 Lua integers preserve 64 bits, and `weir.time.now()` returns one fixed UTC timestamp
 per operation, including confirmed conflict retries. This function entry point,
-return contract, helper behavior and document conversion follow the current
-protocol contract. See the server's
+return contract, helper behavior and document conversion follow the protocol's
+Lua contract. See the server's
 [Lua guide](https://github.com/batchstream/weir/blob/main/docs/lua.md).
 Concurrent first creation can trigger a bounded fresh read/evaluation after a
 confirmed conflict. An ambiguous write or commit acknowledgement never triggers
@@ -339,5 +337,3 @@ backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 
 Application and peer listeners use plaintext gRPC; restrict their network access.
-This repository follows the upstream project's current licensing status; no new
-license grant is introduced here.
