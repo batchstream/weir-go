@@ -103,9 +103,9 @@ func typedAPI(ctx context.Context, client *weir.Client) {
 
 }
 func main() {
-    connection, err := weir.Dial("127.0.0.1:7447")
+    client, err := weir.New("127.0.0.1:7447")
     if err != nil { panic(err) }
-    defer connection.Close()
+    defer client.Close()
     fmt.Println(weir.EncodeSegment("s:check/path"))
 }
 """

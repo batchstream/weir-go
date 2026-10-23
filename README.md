@@ -37,12 +37,17 @@ for index, result := range results {
 }
 ```
 
-`New` connects on first use and reconnects after failures. When a DNS name
-resolves to several Weir servers, calls are spread round-robin across them, so
-every server behind the address must host the Stores the client uses. A server
-that does not host the requested Store fails the call with NotFound. Reuse the
-client across goroutines and close it after callers finish. Business requests
-are never replayed.
+`New` takes a `host:port` address and rejects anything else. It connects on
+first use and reconnects after failures. When a DNS name resolves to several
+Weir servers, calls are spread round-robin across them, so every server behind
+the address must host the Stores the client uses. Use a name that lists every
+server, such as a Kubernetes headless Service; a ClusterIP Service resolves to
+one virtual IP. The client re-resolves the name only after a connection fails,
+so servers added later receive calls once existing connections reconnect. A
+server that does not host the requested Store fails the call with NotFound.
+Reuse the client across goroutines and close it after callers finish. Calls
+started after `Close` return `ErrClosed`; calls still running end with a gRPC
+cancellation error. Business requests are never replayed.
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
@@ -220,7 +225,7 @@ Document. It emits an HTTP/1.1 origin-form target, exact Content-Length and no
 default User-Agent. Methods, escaped paths, queries and application headers are
 preserved. Pass an empty resource for backend-root operations. HTTP request bodies
 and headers have no SDK size gate. Trailers are rejected. The Host header never
-chooses the owning Store or backend destination.
+chooses the Store or backend destination.
 
 ```go
 httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/example", nil)
@@ -291,7 +296,8 @@ Use caller deadlines. Business operations have no implicit retry or failover.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
 operation functions accept a generated StoreService client for custom
 connections and protocol fixtures; ordinary applications use New and typed Client
-methods. The caller owns target validation and connection lifetime for Dial.
+methods. `Dial` accepts any gRPC target; the caller owns its validation and the
+connection lifetime.
 
 ## Examples and validation
 
@@ -333,4 +339,4 @@ failure, Lua persistence, and repeated and missing reads. System integration tes
 backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 
-Application and peer listeners use plaintext gRPC; restrict their network access.
+The Weir application listener uses plaintext gRPC; restrict its network access.
