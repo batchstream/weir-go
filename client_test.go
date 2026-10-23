@@ -28,10 +28,6 @@ type clientTestPeer struct {
 	canceled  chan struct{}
 }
 
-func (p *clientTestPeer) ResolveStore(context.Context, *pb.ResolveStoreRequest) (*pb.ResolveStoreResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "fixture serves business requests only")
-}
-
 func (p *clientTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	p.streams.Add(1)
 	for {
@@ -209,7 +205,8 @@ func addResponseFields(messages ...proto.Message) {
 	}
 }
 
-func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceClient {
+// clientTestAddress serves peer on a loopback listener and returns its address.
+func clientTestAddress(t *testing.T, peer *clientTestPeer) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -220,7 +217,12 @@ func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceCli
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
-	connection, err := Dial("passthrough:///" + listener.Addr().String())
+	return listener.Addr().String()
+}
+
+func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceClient {
+	t.Helper()
+	connection, err := Dial("passthrough:///" + clientTestAddress(t, peer))
 	if err != nil {
 		t.Fatal(err)
 	}

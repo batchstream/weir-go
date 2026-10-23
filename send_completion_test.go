@@ -17,10 +17,6 @@ type completionClient struct {
 	stream *completionStream
 }
 
-func (client *completionClient) ResolveStore(context.Context, *pb.ResolveStoreRequest, ...grpc.CallOption) (*pb.ResolveStoreResponse, error) {
-	return nil, errors.New("fixture serves business requests only")
-}
-
 func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse], error) {
 	client.stream.ctx = ctx
 	return client.stream, nil

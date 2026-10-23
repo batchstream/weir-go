@@ -1,29 +1,28 @@
 # Weir Go SDK
 
 Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.1.
-Initialize through any application node, then send business requests directly to
-its Store replicas. Weir does not relay business traffic. IP and DNS endpoints
-work in Kubernetes and other deployments.
+Point a client at a Weir application address and send typed business requests to
+the Stores hosted there. IP and DNS addresses work in Kubernetes and other
+deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.16.0
+go get github.com/batchstream/weir-go@v0.17.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.14.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.15.0`
 release. The independent protocol repository owns public schemas, generated
-protobuf types and shared validation/DNS helpers. Both Weir and this SDK consume
+protobuf types and shared validation. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
 generate schemas, and CI rejects first-party pseudo versions and module replacements.
 
-## Initialize and read
+## Connect and read
 
 Import only `weir "github.com/batchstream/weir-go"` for ordinary business calls:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 defer cancel()
-options := weir.OpenOptions{Seed: "127.0.0.1:7447", Stores: []string{"search"}}
-client, err := weir.Open(ctx, options)
+client, err := weir.New("127.0.0.1:7447")
 if err != nil { return err }
 defer client.Close()
 
@@ -38,13 +37,12 @@ for index, result := range results {
 }
 ```
 
-`Open` resolves ownership and establishes a ready direct connection for every
-requested Store. Reuse the client across goroutines and close it after callers
-finish. Its worker refreshes directory metadata and DNS replicas. The opening
-context bounds initialization; it does not own the returned client. Open accepts any nonempty set of distinct Stores. Discovery may retry read-only initialization; business requests are
-never replayed. A stale directory cache fails closed when its lease expires. Refresh failures
-preserve their error cause and gRPC classification; no live ownership announcement
-means Unavailable, while conflicting owners mean FailedPrecondition.
+`New` connects on first use and reconnects after failures. When a DNS name
+resolves to several Weir servers, calls are spread round-robin across them, so
+every server behind the address must host the Stores the client uses. A server
+that does not host the requested Store fails the call with NotFound. Reuse the
+client across goroutines and close it after callers finish. Business requests
+are never replayed.
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
@@ -69,8 +67,8 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
 | `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
-`Read` and `Mutate` validate the complete input before selecting the Store
-connection or opening one bidirectional Execute RPC. An empty input, nil request,
+`Read` and `Mutate` validate the complete input before opening one bidirectional
+Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
 one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
@@ -291,8 +289,8 @@ each result promptly and avoid retaining unbounded events.
 
 Use caller deadlines. Business operations have no implicit retry or failover.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
-operation functions accept a generated StoreService client for fixed-owner
-connections and protocol fixtures; ordinary applications use Open and typed Client
+operation functions accept a generated StoreService client for custom
+connections and protocol fixtures; ordinary applications use New and typed Client
 methods. The caller owns target validation and connection lifetime for Dial.
 
 ## Examples and validation
@@ -312,8 +310,7 @@ GOWORK=off GOPROXY=off GOSUMDB=off python3 scripts/check_dependencies.py
 Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption,
-completion/cancellation, no replay, deadline admission, directory expiry/conflicts,
-DNS refresh and direct Store routing. The full module graph and normal/
+completion/cancellation, no replay and deadline admission. The full module graph and normal/
 integration package closures must remain independent of the Weir server. Releases
 require stable unreplaced dependencies and compile a separate ordinary consumer
 that imports only this SDK for all business operations.

@@ -28,7 +28,7 @@ func TestMongoStreaming(t *testing.T)  { testStreaming(t, "mongo") }
 func TestSearchStreaming(t *testing.T) { testStreaming(t, "search") }
 
 type integrationTarget struct {
-	options    weir.OpenOptions
+	address    string
 	store      string
 	collection string
 }
@@ -48,8 +48,7 @@ func integrationFixture(t *testing.T, backend string) integrationTarget {
 	if _, err := protocol.ParseRelativeResource(collection); err != nil {
 		t.Fatal("invalid relative collection/index", err)
 	}
-	options := weir.OpenOptions{Seed: address, Stores: []string{store}}
-	target := integrationTarget{options: options, store: store, collection: collection}
+	target := integrationTarget{address: address, store: store, collection: collection}
 	return target
 }
 
@@ -59,8 +58,7 @@ func testLifecycle(t *testing.T, backend string) {
 	store, collection := target.store, target.collection
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	options := target.options
-	client, err := weir.Open(ctx, options)
+	client, err := weir.New(target.address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +73,7 @@ func testLifecycle(t *testing.T, backend string) {
 		}
 		cleanup, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		cleanupClient, err := weir.Open(cleanup, options)
+		cleanupClient, err := weir.New(target.address)
 		if err != nil {
 			t.Error(err)
 			return
@@ -163,7 +161,7 @@ func testStreaming(t *testing.T, backend string) {
 	target := integrationFixture(t, backend)
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
-	client, err := weir.Open(ctx, target.options)
+	client, err := weir.New(target.address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,9 +177,9 @@ func testStreaming(t *testing.T, backend string) {
 	t.Cleanup(func() {
 		cleanup, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		cleanupClient, err := weir.Open(cleanup, target.options)
+		cleanupClient, err := weir.New(target.address)
 		if err != nil {
-			t.Error("open record cleanup:", err)
+			t.Error("record cleanup client:", err)
 			return
 		}
 		defer cleanupClient.Close()
