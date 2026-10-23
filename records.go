@@ -35,7 +35,7 @@ func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, 
 	if err := validateReads(ctx, options); err != nil {
 		return nil, err
 	}
-	client, err := c.storeClient(options.StoreName)
+	client, err := c.storeClient()
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*Mutation
 	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
 	}
-	client, err := c.storeClient(options.StoreName)
+	client, err := c.storeClient()
 	if err != nil {
 		return nil, err
 	}

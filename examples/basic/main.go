@@ -17,7 +17,7 @@ func main() {
 	}
 }
 func run() error {
-	address := flag.String("address", "127.0.0.1:7447", "Weir initialization listener")
+	address := flag.String("address", "127.0.0.1:7447", "Weir application address")
 	storeName := flag.String("store", "mongo", "logical Store: mongo or search")
 	database := flag.String("database", "weir_example", "pre-created MongoDB database")
 	index := flag.String("index", "weir_example", "pre-created Search index")
@@ -28,8 +28,7 @@ func run() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	openOptions := weir.OpenOptions{Seed: *address, Stores: []string{*storeName}}
-	client, err := weir.Open(ctx, openOptions)
+	client, err := weir.New(*address)
 	if err != nil {
 		return err
 	}

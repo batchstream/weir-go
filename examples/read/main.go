@@ -11,14 +11,13 @@ import (
 )
 
 func main() {
-	address := flag.String("address", "127.0.0.1:7447", "Weir initialization listener")
+	address := flag.String("address", "127.0.0.1:7447", "Weir application address")
 	store := flag.String("store", "mongo", "logical Store")
 	resources := flag.String("resources", "weir_example/records/s:example,weir_example/records/s:another", "comma-separated relative record resources in one Store")
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	options := weir.OpenOptions{Seed: *address, Stores: []string{*store}}
-	client, err := weir.Open(ctx, options)
+	client, err := weir.New(*address)
 	if err != nil {
 		panic(err)
 	}

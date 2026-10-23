@@ -1,5 +1,5 @@
-// Package weir initializes Store destinations and sends typed business requests
-// directly to their owners. Business RPCs are never automatically replayed.
+// Package weir sends typed business requests to the Stores hosted behind one
+// Weir application address. Business RPCs are never automatically replayed.
 package weir
 
 import (

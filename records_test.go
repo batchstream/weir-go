@@ -190,39 +190,37 @@ func TestReadStreamFinalFailurePreservesConfirmedResults(t *testing.T) {
 	}
 }
 
-func TestClientBatchPreflightBeforeStoreLookup(t *testing.T) {
+func TestClientBatchPreflightBeforeRPC(t *testing.T) {
 	client := &Client{}
 	options := ReadOptions{StoreName: "records"}
 	_, err := client.Read(t.Context(), options)
 	if err == nil || !strings.Contains(err.Error(), "nonempty requests") {
-		t.Fatal("Store lookup happened before input validation", err)
+		t.Fatal("RPC started before input validation", err)
 	}
 	mutation := MutateOptions{StoreName: "records"}
 	_, err = client.Mutate(t.Context(), mutation)
 	if err == nil || !strings.Contains(err.Error(), "nonempty requests") {
-		t.Fatal("Store lookup happened before mutation validation", err)
+		t.Fatal("RPC started before mutation validation", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	options.Requests = []*ReadRequest{clientTestReadRequest()}
 	if _, err := client.Read(ctx, options); !errors.Is(err, context.Canceled) {
-		t.Fatal("cancelled batch did not stop before routing", err)
+		t.Fatal("cancelled batch did not stop before its RPC", err)
 	}
 }
 
-func TestClientBatchesRouteDirectlyToOneInitializedStore(t *testing.T) {
-	business := &clientTestPeer{mode: "batch_mixed"}
-	owner := &discoveryPeer{business: business}
-	ownerListener := listenDiscovery(t, owner, "127.0.0.1:0")
-	seed := &discoveryPeer{}
-	seed.set("records", discoveryRecord("records", ownerListener.address))
-	seedListener := listenDiscovery(t, seed, "127.0.0.1:0")
-	openOptions := OpenOptions{Seed: seedListener.address, Stores: []string{"records"}}
-	client := openDiscovery(t, openOptions)
+func TestClientSendsBatchesToItsAddress(t *testing.T) {
+	peer := &clientTestPeer{mode: "batch_mixed"}
+	client, err := New(clientTestAddress(t, peer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
 	read := ReadOptions{StoreName: "records", Requests: []*ReadRequest{clientTestReadRequest(), clientTestReadRequest()}}
 	readResults, err := client.Read(t.Context(), read)
 	if err != nil || len(readResults) != 2 || readResults[0] == nil || !readResults[1].Missing {
-		t.Fatal("direct read batch failed", readResults, err)
+		t.Fatal("read batch failed", readResults, err)
 	}
 	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
 	first := &MutateRequest{Resource: "records/s:first", Action: MutationPut, Document: document}
@@ -230,10 +228,16 @@ func TestClientBatchesRouteDirectlyToOneInitializedStore(t *testing.T) {
 	mutation := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
 	mutationResults, err := client.Mutate(t.Context(), mutation)
 	if err != nil || len(mutationResults) != 2 || mutationResults[0].GetOutcome() != MutationApplied || mutationResults[1].GetFailure().GetCode() != FailureConflict {
-		t.Fatal("direct mutation batch failed", mutationResults, err)
+		t.Fatal("mutation batch failed", mutationResults, err)
 	}
-	if seed.resolves.Load() != 1 || seed.executions.Load() != 0 || owner.resolves.Load() != 0 || owner.executions.Load() != 2 {
-		t.Fatal("batch repeated resolution, forwarded business traffic, or split RPCs", seed.resolves.Load(), seed.executions.Load(), owner.resolves.Load(), owner.executions.Load())
+	if peer.streams.Load() != 2 {
+		t.Fatal("batches were split or replayed", peer.streams.Load())
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(t.Context(), read); !errors.Is(err, ErrClosed) {
+		t.Fatal("closed client accepted a call", err)
 	}
 }
 

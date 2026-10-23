@@ -2,38 +2,8 @@ package weir
 
 import (
 	"context"
-	"errors"
 	"testing"
-	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
-
-func TestCachedDiscoveryFailurePreservesClassificationAndCause(t *testing.T) {
-	causes := []error{
-		status.Error(codes.FailedPrecondition, "conflicting owners"),
-		status.Error(codes.NotFound, "requested Store not found"),
-		status.Error(codes.Unavailable, "discovery unavailable"),
-		context.Canceled,
-		context.DeadlineExceeded,
-	}
-	for _, cause := range causes {
-		entry := &storeChannel{expires: time.Now().Add(-time.Second), err: cause}
-		client := &Client{stores: map[string]*storeChannel{"records": entry}}
-		request := &ReadRequest{Resource: "collection/id"}
-		options := ReadOneOptions{StoreName: "records", Request: request}
-		result, err := client.ReadOne(t.Context(), options)
-		if result != nil || !errors.Is(err, cause) || status.Code(err) != status.Code(cause) {
-			t.Fatal("cached discovery cause or classification lost", result, err, cause)
-		}
-	}
-	entry := &storeChannel{expires: time.Now().Add(-time.Second)}
-	client := &Client{stores: map[string]*storeChannel{"records": entry}}
-	if _, err := client.storeClient("records"); status.Code(err) != codes.Unavailable {
-		t.Fatal("expired lease without a cause must be unavailable", err)
-	}
-}
 
 func TestRequestExtensionsRejectBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{}

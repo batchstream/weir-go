@@ -78,7 +78,7 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 }
 
 func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
-	client, err := c.storeClient(options.StoreName)
+	client, err := c.storeClient()
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 }
 
 func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) error {
-	client, err := c.storeClient(options.StoreName)
+	client, err := c.storeClient()
 	if err != nil {
 		return err
 	}

@@ -11,13 +11,12 @@ import check_dependencies
 class DependencyTests(unittest.TestCase):
     def test_public_helpers_and_protobuf_are_allowed(self):
         names = ['context', 'google.golang.org/grpc', 'github.com/batchstream/weir-go',
-                 'github.com/batchstream/weir-protocol/api/protocol', 'github.com/batchstream/weir-protocol/api/netlimit',
-                 'github.com/batchstream/weir-protocol/api/weir/v1', 'github.com/batchstream/weir-protocol/api/netlimit']
+                 'github.com/batchstream/weir-protocol/api/protocol', 'github.com/batchstream/weir-protocol/api/weir/v1']
         items = [{'ImportPath': name} for name in names]
         check_dependencies.check_dependencies(items)
 
     def test_server_public_and_internal_packages_are_rejected(self):
-        for path in ('api/protocol', 'api/weir/v1', 'internal/directory', 'internal/api/peer/v1', 'internal/server', 'internal/backend/mongodb'):
+        for path in ('api/protocol', 'api/weir/v1', 'internal/server', 'internal/backend/mongodb'):
             item = {'ImportPath': 'github.com/batchstream/weir/' + path}
             with self.assertRaisesRegex(ValueError, 'server module'):
                 check_dependencies.check_dependencies([item])
