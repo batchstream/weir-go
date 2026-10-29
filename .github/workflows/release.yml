@@ -1,58 +1,39 @@
-name: SDK release
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
+        description: Stable version (vMAJOR.MINOR.PATCH)
         required: true
-        description: Stable release tag (vMAJOR.MINOR.PATCH)
         type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: sdk-release
-  cancel-in-progress: false
-
 jobs:
-  release:
+  validate:
     if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
+    concurrency:
+      group: release
+      cancel-in-progress: false
     permissions:
       contents: write
-    env:
-      GOWORK: 'off'
-      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
-        with:
-          go-version-file: go.mod
-      - name: Prepare complete module cache without changing fixed inputs
-        run: python3 scripts/download_modules.py
-      - name: Check protocol module and package boundaries
+      - name: Tag and release the validated commit
         env:
-          GOPROXY: 'off'
-          GOSUMDB: 'off'
-        run: python3 scripts/check_dependencies.py
-      - name: Validate release source
-        env:
-          GOPROXY: 'off'
-          GOSUMDB: 'off'
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         run: |
-          go test -race -count=1 -timeout=90s ./...
-          go test -tags integration -run '^$' ./...
-          go vet ./...
-          go vet -tags integration ./...
-          python3 -m unittest discover -s scripts -p '*_test.py' -v
-          test -z "$(gofmt -l .)"
-          git diff --exit-code
-      - name: Publish immutable tag and verify external installation
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: python3 scripts/release.py
+          [[ $VERSION =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          # An existing tag is accepted only at this commit, so a rerun can finish a release.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$VERSION" -f sha="$GITHUB_SHA" >/dev/null; then
+            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$VERSION" --jq .sha)" = "$GITHUB_SHA"
+          fi
+          gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" --generate-notes

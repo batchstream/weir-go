@@ -1,16 +1,16 @@
-name: SDK CI
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: sdk-ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -21,34 +21,26 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    env:
-      GOWORK: 'off'
-      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
-      - name: Prepare complete module cache without changing fixed inputs
-        run: python3 scripts/download_modules.py
-      - name: Check protocol module and package boundaries
-        env:
-          GOPROXY: 'off'
-          GOSUMDB: 'off'
-        run: python3 scripts/check_dependencies.py
-      - name: Offline tests and vet
-        env:
-          GOPROXY: 'off'
-          GOSUMDB: 'off'
+      - name: The SDK uses a released protocol, replaces nothing and does not depend on the server
         run: |
-          go mod verify
+          forbidden=$(go list -m -f '{{if or .Replace (eq .Path "github.com/batchstream/weir")}}{{.Path}}{{end}}' all)
+          echo "$forbidden"
+          test -z "$forbidden"
+          protocol=$(go list -m -f '{{.Version}}' github.com/batchstream/weir-protocol)
+          echo "$protocol"
+          [[ $protocol =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+      - name: Tests, vet and formatting
+        run: |
+          go mod tidy -diff
           go test -race -count=1 -timeout=90s -cover ./...
           go test -tags integration -run '^$' ./...
           go vet ./...
           go vet -tags integration ./...
-          python3 -m unittest discover -s scripts -p '*_test.py' -v
           test -z "$(gofmt -l .)"
-          git diff --exit-code

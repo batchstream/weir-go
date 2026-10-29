@@ -13,7 +13,7 @@ The SDK depends on the stable `github.com/batchstream/weir-protocol v0.15.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
-generate schemas, and CI rejects first-party pseudo versions and module replacements.
+generate schemas.
 
 ## Connect and read
 
@@ -307,19 +307,21 @@ mutates a document then reads multiple resources in one stream, and
 native responses. These examples use SDK request and result types.
 
 ```sh
-python3 scripts/download_modules.py
-GOWORK=off GOPROXY=off GOSUMDB=off go test -race -count=1 ./...
-GOWORK=off GOPROXY=off GOSUMDB=off go vet ./...
-GOWORK=off GOPROXY=off GOSUMDB=off python3 scripts/check_dependencies.py
+go test -race ./...
+go vet ./...
 ```
 
 Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption,
-completion/cancellation, no replay and deadline admission. The full module graph and normal/
-integration package closures must remain independent of the Weir server. Releases
-require stable unreplaced dependencies and compile a separate ordinary consumer
-that imports only this SDK for all business operations.
+completion/cancellation, no replay and deadline admission. It also checks that
+the module graph does not contain the Weir server, that `go.mod` replaces no
+module and that the protocol is a released `vMAJOR.MINOR.PATCH` version.
+
+After a reviewed change is merged, an authorized maintainer publishes a stable
+version with `gh workflow run release.yml --ref main -f version=vX.Y.Z`. The
+workflow runs CI on the `main` commit, then tags that commit and creates its
+GitHub release; it refuses a version already tagged at another commit.
 
 Real backend tests require an explicit tag and operator-provided fixtures:
 
