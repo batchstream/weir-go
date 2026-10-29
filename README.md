@@ -315,7 +315,13 @@ Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption,
 completion/cancellation, no replay and deadline admission. It also checks that
-the module graph does not contain the Weir server.
+the module graph does not contain the Weir server, that `go.mod` replaces no
+module and that the protocol is a released `vMAJOR.MINOR.PATCH` version.
+
+After a reviewed change is merged, an authorized maintainer publishes a stable
+version with `gh workflow run release.yml --ref main -f version=vX.Y.Z`. The
+workflow runs CI on the `main` commit, then tags that commit and creates its
+GitHub release; it refuses a version already tagged at another commit.
 
 Real backend tests require an explicit tag and operator-provided fixtures:
 

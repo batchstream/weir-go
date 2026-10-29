@@ -28,11 +28,14 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: The SDK does not depend on the server
+      - name: The SDK uses a released protocol, replaces nothing and does not depend on the server
         run: |
-          server=$(go list -m -f '{{if eq .Path "github.com/batchstream/weir"}}{{.Path}}{{end}}' all)
-          echo "$server"
-          test -z "$server"
+          forbidden=$(go list -m -f '{{if or .Replace (eq .Path "github.com/batchstream/weir")}}{{.Path}}{{end}}' all)
+          echo "$forbidden"
+          test -z "$forbidden"
+          protocol=$(go list -m -f '{{.Version}}' github.com/batchstream/weir-protocol)
+          echo "$protocol"
+          [[ $protocol =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
       - name: Tests, vet and formatting
         run: |
           go mod tidy -diff

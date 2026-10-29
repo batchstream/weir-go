@@ -32,6 +32,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           [[ $VERSION =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          # Creating the tag fails when the version already exists.
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$VERSION" -f sha="$GITHUB_SHA" >/dev/null
+          # An existing tag is accepted only at this commit, so a rerun can finish a release.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$VERSION" -f sha="$GITHUB_SHA" >/dev/null; then
+            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$VERSION" --jq .sha)" = "$GITHUB_SHA"
+          fi
           gh release create "$VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$VERSION" --generate-notes
