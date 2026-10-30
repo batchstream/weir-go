@@ -6,7 +6,7 @@ the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.17.0
+go get github.com/batchstream/weir-go@v0.18.0
 ```
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.16.0`
@@ -293,6 +293,21 @@ err := client.ReadStream(ctx, options)
 
 Use streams for finite producer sequences. Consumers should commit or release
 each result promptly and avoid retaining unbounded events.
+
+The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
+`Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
+of the same Client, so many goroutines in one process pay for a few gRPC streams
+instead of one per call. Each Store and operation kind uses at most 32 streams
+of 32 outstanding records; another stream opens once every stream is half full,
+and calls beyond that capacity, or with a record over 1 MiB, use a stream of
+their own. A record the server rejects fails alone, and results return as each
+record completes, so a slow call does not hold back the others. A call's
+deadline travels with its record, so the server drops it if it is still queued
+when the deadline passes. Canceling a call stops waiting and asks the server to
+cancel only that record; as with any canceled call, a record already executing
+may still take effect. Streams retire after a minute so new ones reach newly
+added servers, and idle streams close after 10 seconds. Package operation
+functions keep one stream per call.
 
 Use caller deadlines. Business operations have no implicit retry or failover.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
