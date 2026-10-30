@@ -520,6 +520,33 @@ func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 	}
 }
 
+func TestOnlyServerRefusalsCoolAStream(t *testing.T) {
+	mutation := func(outcome pb.MutationOutcome, code pb.FailureCode) *pb.Event {
+		value := &pb.Event_MutationResult{MutationResult: protocol.Mutation(outcome, protocol.Fail(code, "refused"))}
+		event := &pb.Event{Value: value}
+		return event
+	}
+	read := func(code pb.FailureCode) *pb.Event {
+		value := &pb.Event_ReadResult{ReadResult: protocol.ReadFailure(protocol.Fail(code, "refused"))}
+		event := &pb.Event{Value: value}
+		return event
+	}
+	for name, want := range map[string]struct {
+		event   *pb.Event
+		refuses bool
+	}{
+		"draining mutation":   {mutation(pb.MutationOutcome_NOT_STARTED, pb.FailureCode_UNAVAILABLE), true},
+		"overloaded mutation": {mutation(pb.MutationOutcome_NOT_STARTED, pb.FailureCode_RESOURCE_EXHAUSTED), true},
+		"uncertain mutation":  {mutation(pb.MutationOutcome_UNKNOWN, pb.FailureCode_UNAVAILABLE), false},
+		"unavailable read":    {read(pb.FailureCode_UNAVAILABLE), true},
+		"oversized read":      {read(pb.FailureCode_RESOURCE_EXHAUSTED), false},
+	} {
+		if refusesWork(want.event) != want.refuses {
+			t.Error(name, "classified wrongly")
+		}
+	}
+}
+
 func TestSharedAndOwnStreamCallsReportTheirDeadlineAlike(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
