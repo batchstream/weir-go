@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 	"sync/atomic"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
@@ -37,8 +38,7 @@ func ReadStream(ctx context.Context, client pb.StoreServiceClient, options ReadS
 		if wire == nil {
 			return errors.New("unexpected event in Read stream")
 		}
-		result := &ReadResult{Document: wire.GetDocument(), Missing: wire.GetMissing() != nil, Failure: wire.GetFailure()}
-		return options.Consume(ctx, response.Index, result)
+		return options.Consume(ctx, response.Index, readResult(wire))
 	}
 	optionsInternal := recordStreamOptions{store: options.StoreName, next: next, consume: consume}
 	return recordStream(ctx, client, optionsInternal)
@@ -75,6 +75,11 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 	}
 	optionsInternal := recordStreamOptions{store: options.StoreName, next: next, consume: consume}
 	return recordStream(ctx, client, optionsInternal)
+}
+
+func readResult(wire *pb.ReadResult) *ReadResult {
+	result := &ReadResult{Document: wire.GetDocument(), Missing: wire.GetMissing() != nil, Failure: wire.GetFailure()}
+	return result
 }
 
 func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
@@ -123,10 +128,11 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 	}
 	// Calling Context commits this attempt, disabling transparent write replay.
 	_ = stream.Context()
-	sizes := make(chan int, recordWindowItems)
+	// Results arrive in completion order; each one returns its record's credit.
+	var mu sync.Mutex
+	sizes := make(map[uint64]int, recordWindowItems)
 	released := make(chan int, recordWindowItems)
 	done := make(chan recordSendResult, 1)
-	var submitted atomic.Uint64
 	var finishedInput atomic.Bool
 	go func() {
 		result := recordSendResult{}
@@ -195,11 +201,12 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			}
 			// Register before Send: Recv can observe the response before Send
 			// returns. Only the receiver publishes acknowledged byte credit.
-			sizes <- size
+			mu.Lock()
+			sizes[request.Index] = size
+			mu.Unlock()
 			inflight++
 			bytes += size
 			result.count = request.Index
-			submitted.Store(result.count)
 			if err := stream.Send(request); err != nil {
 				result.err = err
 				return
@@ -224,7 +231,11 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			receiveErr = err
 			break
 		}
-		if response.Index != received+1 || response.Index > submitted.Load() {
+		mu.Lock()
+		size, ok := sizes[response.Index]
+		delete(sizes, response.Index)
+		mu.Unlock()
+		if !ok {
 			receiveErr = errors.New("Execute response ordinal is missing, duplicated or unexpected")
 			break
 		}
@@ -233,7 +244,7 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			break
 		}
 		received++
-		released <- <-sizes
+		released <- size
 	}
 	if receiveErr != nil {
 		cancel()

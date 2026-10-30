@@ -145,7 +145,8 @@ type MutateOptions struct {
 // ReadStreamOptions produces a finite sequence without retaining every input or
 // result. Next returns io.EOF after its final item. Items are validated before
 // they are sent; an invalid later item does not undo earlier requests.
-// Consume receives each confirmed result in ordinal order, starting at 1.
+// Consume receives each confirmed result as its record completes; the index
+// identifies the input, starting at 1.
 // Next and Consume run concurrently; synchronize any shared application state.
 // Both callbacks must honor their context and return promptly. Keep yielded
 // requests and document bytes immutable until the corresponding Consume call.
@@ -156,9 +157,10 @@ type ReadStreamOptions struct {
 }
 
 // MutateStreamOptions incrementally produces mutations to one Store. Next
-// returns io.EOF after the final item. Consume receives confirmed results in
-// ordinal order; a later error does not revoke those acknowledgements. Items
-// not consumed remain unacknowledged and must never be automatically replayed.
+// returns io.EOF after the final item. Consume receives confirmed results as
+// their records complete, identified by input index; a later error does not
+// revoke those acknowledgements. Items not consumed remain unacknowledged and
+// must never be automatically replayed.
 // Next and Consume run concurrently; synchronize any shared application state.
 // Both callbacks must honor their context and return promptly. Keep yielded
 // requests, options and document bytes immutable until the corresponding

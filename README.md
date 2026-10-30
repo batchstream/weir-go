@@ -76,11 +76,12 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
-input order, including repeated resources. Individual backend failures stay in
-their result positions. A later RPC failure preserves every validated result
-already received; unconfirmed positions remain nil and any such mutation may
-have applied. Never automatically replay those mutations.
+one `StoreName`. Each input is sent immediately as one ExecuteRequest. Results
+arrive as records complete and are returned in input order, including repeated
+resources. Individual backend failures stay in their result positions. A later
+RPC failure preserves every validated result already received; unconfirmed
+positions remain nil and any such mutation may have applied. Never
+automatically replay those mutations.
 
 ```go
 firstDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
@@ -263,7 +264,8 @@ protocols govern representable messages and accepted data.
 
 `ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
 returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
-result)` receives confirmed results in input order, with indexes starting at 1.
+result)` receives each confirmed result as its record completes; the index,
+starting at 1, identifies the input.
 Inputs are validated as they are produced; an invalid later item does not undo
 earlier requests. Stream success requires one result per submitted input and
 final gRPC OK. Results delivered before a later producer, consumer or transport
