@@ -9,7 +9,7 @@ deployments.
 go get github.com/batchstream/weir-go@v0.17.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.15.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.16.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
