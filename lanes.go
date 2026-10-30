@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -29,7 +30,8 @@ const (
 	// maxLanes bounds the streams per Store and kind that take new records;
 	// calls beyond their capacity use a stream of their own.
 	maxLanes = 32
-	// laneRecordBytes keeps large records from delaying a shared stream's sends.
+	// laneRecordBytes keeps large records from delaying a shared stream's sends
+	// and bounds the records packed into one message.
 	laneRecordBytes = 1 << 20
 	// laneLifetime retires a stream well within the server's connection age
 	// so connection rebalancing still reaches long-running clients.
@@ -94,6 +96,7 @@ const (
 // state and index are guarded by the lane's mutex.
 type laneCall struct {
 	command  *pb.Command
+	size     int
 	deadline time.Time
 	done     chan laneOutcome
 	state    callState
@@ -113,7 +116,7 @@ type laneOutcome struct {
 type lane struct {
 	pool    *lanePool
 	key     laneKey
-	stream  grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse]
+	stream  grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
 	ctx     context.Context
 	cancel  context.CancelFunc
 	expires time.Time
@@ -132,9 +135,9 @@ type lane struct {
 	queued      []*laneCall
 	cancels     []uint64
 	outstanding map[uint64]*laneCall
-	// sending is the record whose Send is in progress; its outcome belongs
-	// to the writer even if the stream fails meanwhile.
-	sending    *laneCall
+	// sending holds the records whose Send is in progress; their outcomes
+	// belong to the writer even if the stream fails meanwhile.
+	sending    []*laneCall
 	index      uint64
 	closing    bool
 	halfClosed bool
@@ -146,7 +149,8 @@ type lane struct {
 // otherwise reports false so the caller can use a stream of its own. Callers
 // validate first because an invalid request ends the stream for every record.
 func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command) (*pb.Event, bool, error) {
-	if proto.Size(command) > laneRecordBytes {
+	size := proto.Size(command)
+	if size > laneRecordBytes {
 		return nil, false, nil
 	}
 	for range laneAttempts {
@@ -157,7 +161,7 @@ func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command
 		if chosen == nil {
 			return nil, false, nil
 		}
-		outcome := chosen.call(ctx, command)
+		outcome := chosen.call(ctx, command, size)
 		if !outcome.retry {
 			return outcome.event, true, outcome.err
 		}
@@ -287,8 +291,8 @@ func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup, prob
 }
 
 // call queues one record on a reserved stream and waits for its outcome.
-func (l *lane) call(ctx context.Context, command *pb.Command) laneOutcome {
-	pending := &laneCall{command: command, done: make(chan laneOutcome, 1)}
+func (l *lane) call(ctx context.Context, command *pb.Command, size int) laneOutcome {
+	pending := &laneCall{command: command, size: size, done: make(chan laneOutcome, 1)}
 	pending.deadline, _ = ctx.Deadline()
 	l.mu.Lock()
 	if l.closing || l.err != nil {
@@ -346,74 +350,85 @@ func (l *lane) write() {
 		case <-l.ctx.Done():
 			return
 		}
+		// Callers woken by one message of results queue their next records
+		// at about the same time; yielding once lets them share a message.
+		runtime.Gosched()
 		for l.writeNext() {
 		}
 	}
 }
 
-// writeNext sends one frame and reports whether more may be pending.
+// writeNext sends queued cancel requests and records in one message and
+// reports whether more may be pending.
 func (l *lane) writeNext() bool {
 	l.mu.Lock()
 	if l.err != nil {
 		l.mu.Unlock()
 		return false
 	}
-	if len(l.cancels) > 0 {
-		index := l.cancels[0]
-		l.cancels = slices.Delete(l.cancels, 0, 1)
-		_, outstanding := l.outstanding[index]
-		l.mu.Unlock()
-		if outstanding {
+	var requests []*pb.ExecuteRequest
+	for _, index := range l.cancels {
+		if _, outstanding := l.outstanding[index]; outstanding {
 			request := &pb.ExecuteRequest{StoreName: l.key.store, CancelIndex: index}
-			err := l.stream.Send(request)
-			l.sendFailed(err)
+			requests = append(requests, request)
 		}
-		return true
 	}
-	if len(l.queued) > 0 {
+	l.cancels = nil
+	var sending, returned []*laneCall
+	bytes := 0
+	for len(l.queued) > 0 {
 		call := l.queued[0]
+		if call.state != callAbandoned && len(sending) > 0 && bytes+call.size > laneRecordBytes {
+			break
+		}
 		l.queued = slices.Delete(l.queued, 0, 1)
 		if call.state == callAbandoned {
 			l.load.Add(-1)
 			l.quietLocked()
-			l.mu.Unlock()
-			return true
+			continue
 		}
 		l.index++
 		call.state, call.index = callSent, l.index
 		// Register before Send: the result can arrive before Send returns.
 		l.outstanding[call.index] = call
-		l.sending = call
-		var returned []*laneCall
+		sending = append(sending, call)
+		bytes += call.size
 		if l.index == math.MaxUint64-1 {
 			l.closing = true
 			returned = l.returnQueuedLocked()
 		}
+	}
+	l.sending = sending
+	if len(requests) == 0 && len(sending) == 0 {
+		if l.closing && len(l.outstanding) == 0 && !l.halfClosed {
+			l.halfClosed = true
+			unused := l.index == 0
+			l.mu.Unlock()
+			// A server rejects a stream that ends without a record.
+			if unused {
+				l.cancel()
+			} else if err := l.stream.CloseSend(); err != nil {
+				l.cancel()
+			}
+			return false
+		}
 		l.mu.Unlock()
-		l.handBack(returned)
+		return false
+	}
+	l.mu.Unlock()
+	l.handBack(returned)
+	for _, call := range sending {
 		request := &pb.ExecuteRequest{StoreName: l.key.store, Index: call.index, Command: call.command}
 		if !call.deadline.IsZero() {
 			request.TimeoutMicros = protocol.TimeoutMicros(time.Until(call.deadline))
 		}
-		err := l.stream.Send(request)
-		l.sendFailed(err)
-		l.sent(call, err)
-		return true
+		requests = append(requests, request)
 	}
-	if l.closing && len(l.outstanding) == 0 && !l.halfClosed {
-		l.halfClosed = true
-		unused := l.index == 0
-		l.mu.Unlock()
-		// A server rejects a stream that ends without a record.
-		if unused {
-			l.cancel()
-		} else if err := l.stream.CloseSend(); err != nil {
-			l.cancel()
-		}
-		return false
-	}
-	l.mu.Unlock()
-	return false
+	message := &pb.ExecuteRequests{Requests: requests}
+	err := l.stream.Send(message)
+	l.sendFailed(err)
+	l.sent(sending, err)
+	return true
 }
 
 // sendFailed ends the stream after a local send failure, which may never
@@ -424,44 +439,55 @@ func (l *lane) sendFailed(err error) {
 	}
 }
 
-// sent settles a record whose Send returned. A record whose Send failed never
-// reached the server, so after io.EOF it may use another stream.
-func (l *lane) sent(call *laneCall, err error) {
+// sent settles the records whose Send returned. A record whose Send failed
+// never reached the server, so after io.EOF it may use another stream.
+func (l *lane) sent(calls []*laneCall, err error) {
+	var settled []*laneCall
+	var outcome laneOutcome
 	l.mu.Lock()
 	l.sending = nil
-	if l.outstanding[call.index] != call {
-		// Its result already arrived.
-		l.mu.Unlock()
-		return
-	}
-	var outcome laneOutcome
 	switch {
 	case errors.Is(err, io.EOF):
 		outcome.retry = true
 	case err != nil:
 		outcome.err = err
 	case l.err != nil:
-		// The stream failed during Send and left this record to the writer.
+		// The stream failed during Send and left these records to the writer.
 		outcome.err = l.err
 	default:
 		l.mu.Unlock()
 		return
 	}
-	delete(l.outstanding, call.index)
-	l.load.Add(-1)
+	for _, call := range calls {
+		if l.outstanding[call.index] != call {
+			// Its result already arrived.
+			continue
+		}
+		delete(l.outstanding, call.index)
+		l.load.Add(-1)
+		settled = append(settled, call)
+	}
 	l.mu.Unlock()
-	call.done <- outcome
+	for _, call := range settled {
+		call.done <- outcome
+	}
 }
 
 func (l *lane) receive() {
 	var err error
 	for {
-		var response *pb.ExecuteResponse
-		response, err = l.stream.Recv()
+		var message *pb.ExecuteResponses
+		message, err = l.stream.Recv()
 		if err != nil {
 			break
 		}
-		err = l.deliver(response)
+		err = protocol.ValidateExecuteResponses(message)
+		for _, response := range message.GetResponses() {
+			if err != nil {
+				break
+			}
+			err = l.deliver(response)
+		}
 		if err != nil {
 			l.cancel()
 			break
@@ -594,9 +620,11 @@ func (l *lane) fail(err error) {
 	returned := l.returnQueuedLocked()
 	l.outstanding = make(map[uint64]*laneCall)
 	l.cancels = nil
-	if sending := l.sending; sending != nil && outstanding[sending.index] == sending {
-		delete(outstanding, sending.index)
-		l.outstanding[sending.index] = sending
+	for _, sending := range l.sending {
+		if outstanding[sending.index] == sending {
+			delete(outstanding, sending.index)
+			l.outstanding[sending.index] = sending
+		}
 	}
 	if l.idle != nil {
 		l.idle.Stop()

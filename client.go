@@ -35,9 +35,10 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 	_ = stream.Context()
 	done := make(chan struct{})
 	var sendErr error
+	message := &pb.ExecuteRequests{Requests: []*pb.ExecuteRequest{request}}
 	go func() {
 		defer close(done)
-		sendErr = stream.Send(request)
+		sendErr = stream.Send(message)
 		if sendErr == nil {
 			sendErr = stream.CloseSend()
 		}
@@ -58,7 +59,7 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 	}()
 	state := nativeStreamState{}
 	for {
-		response, err := stream.Recv()
+		message, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			if !state.terminal {
 				return errors.New("Execute ended without a terminal business event")
@@ -71,20 +72,13 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 		if err != nil {
 			return err
 		}
-		if state.terminal {
-			return errors.New("Execute event after terminal business event")
-		}
-		if err := protocol.ValidateExecuteResponse(response); err != nil {
+		if err := protocol.ValidateExecuteResponses(message); err != nil {
 			return err
 		}
-		if response.Index != 1 {
-			return errors.New("unexpected Native response ordinal")
-		}
-		if err := state.validate(response.Event); err != nil {
-			return err
-		}
-		if err := consume(ctx, response.Event); err != nil {
-			return err
+		for _, response := range message.Responses {
+			if err := state.consume(ctx, response, consume); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -92,6 +86,23 @@ func execute(ctx context.Context, client pb.StoreServiceClient, request *pb.Exec
 type nativeStreamState struct {
 	terminal bool
 	head     bool
+}
+
+// consume checks one Native response in stream order and passes its event on.
+func (s *nativeStreamState) consume(ctx context.Context, response *pb.ExecuteResponse, consume func(context.Context, *pb.Event) error) error {
+	if s.terminal {
+		return errors.New("Execute event after terminal business event")
+	}
+	if err := protocol.ValidateExecuteResponse(response); err != nil {
+		return err
+	}
+	if response.Index != 1 {
+		return errors.New("unexpected Native response ordinal")
+	}
+	if err := s.validate(response.Event); err != nil {
+		return err
+	}
+	return consume(ctx, response.Event)
 }
 
 func (s *nativeStreamState) validate(event *pb.Event) error {

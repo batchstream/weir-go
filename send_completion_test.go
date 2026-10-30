@@ -17,7 +17,7 @@ type completionClient struct {
 	stream *completionStream
 }
 
-func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequest, pb.ExecuteResponse], error) {
+func (client *completionClient) Execute(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses], error) {
 	client.stream.ctx = ctx
 	return client.stream, nil
 }
@@ -35,7 +35,7 @@ type completionStream struct {
 
 func (stream *completionStream) Context() context.Context { return stream.ctx }
 
-func (stream *completionStream) Send(*pb.ExecuteRequest) error {
+func (stream *completionStream) Send(*pb.ExecuteRequests) error {
 	close(stream.delivered)
 	if stream.sendErr != nil {
 		return stream.sendErr
@@ -53,7 +53,7 @@ func (stream *completionStream) CloseSend() error {
 	return nil
 }
 
-func (stream *completionStream) Recv() (*pb.ExecuteResponse, error) {
+func (stream *completionStream) Recv() (*pb.ExecuteResponses, error) {
 	<-stream.delivered
 	if stream.sendErr != nil {
 		<-stream.ctx.Done()
@@ -75,7 +75,8 @@ func (stream *completionStream) Recv() (*pb.ExecuteResponse, error) {
 		return nil, io.EOF
 	}
 	response := &pb.ExecuteResponse{Index: 1, Event: event}
-	return response, nil
+	message := &pb.ExecuteResponses{Responses: []*pb.ExecuteResponse{response}}
+	return message, nil
 }
 
 func TestNativeWaitsForSendAfterTerminalEOF(t *testing.T) {

@@ -207,7 +207,8 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			inflight++
 			bytes += size
 			result.count = request.Index
-			if err := stream.Send(request); err != nil {
+			message := &pb.ExecuteRequests{Requests: []*pb.ExecuteRequest{request}}
+			if err := stream.Send(message); err != nil {
 				result.err = err
 				return
 			}
@@ -215,8 +216,27 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 	}()
 	var received uint64
 	var receiveErr error
-	for {
-		response, err := stream.Recv()
+	// consume confirms one result and returns its record's credit.
+	consume := func(response *pb.ExecuteResponse) error {
+		if err := protocol.ValidateExecuteResponse(response); err != nil {
+			return err
+		}
+		mu.Lock()
+		size, ok := sizes[response.Index]
+		delete(sizes, response.Index)
+		mu.Unlock()
+		if !ok {
+			return errors.New("Execute response ordinal is missing, duplicated or unexpected")
+		}
+		if err := options.consume(ctx, response); err != nil {
+			return err
+		}
+		received++
+		released <- size
+		return nil
+	}
+	for receiveErr == nil {
+		message, err := stream.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				if !finishedInput.Load() {
@@ -227,24 +247,13 @@ func recordStream(ctx context.Context, client pb.StoreServiceClient, options rec
 			}
 			break
 		}
-		if err := protocol.ValidateExecuteResponse(response); err != nil {
-			receiveErr = err
-			break
+		receiveErr = protocol.ValidateExecuteResponses(message)
+		for _, response := range message.GetResponses() {
+			if receiveErr != nil {
+				break
+			}
+			receiveErr = consume(response)
 		}
-		mu.Lock()
-		size, ok := sizes[response.Index]
-		delete(sizes, response.Index)
-		mu.Unlock()
-		if !ok {
-			receiveErr = errors.New("Execute response ordinal is missing, duplicated or unexpected")
-			break
-		}
-		if err := options.consume(ctx, response); err != nil {
-			receiveErr = err
-			break
-		}
-		received++
-		released <- size
 	}
 	if receiveErr != nil {
 		cancel()

@@ -46,7 +46,8 @@ func newLaneTestPeer() *laneTestPeer {
 	return peer
 }
 
-func (p *laneTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	stream := &recordPeer{BidiStreamingServer: packed}
 	if p.rejecting.Load() {
 		return status.Error(codes.Unavailable, "draining")
 	}
@@ -579,5 +580,53 @@ func TestNewRecordsLeaveADrainingServer(t *testing.T) {
 			t.Fatal("streams to the draining server stayed open", draining.halfClose.Load(), draining.streams.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// packingStream records the requests of each message a lane sends.
+type packingStream struct {
+	grpc.ClientStream
+	sent [][]*pb.ExecuteRequest
+}
+
+func (s *packingStream) Send(message *pb.ExecuteRequests) error {
+	s.sent = append(s.sent, message.Requests)
+	return nil
+}
+
+func (s *packingStream) Recv() (*pb.ExecuteResponses, error) {
+	return nil, io.EOF
+}
+
+func TestLaneSendsWhatIsQueuedInOneMessageWithinItsByteBound(t *testing.T) {
+	stream := &packingStream{}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	l := &lane{key: laneKey{store: "records"}, stream: stream, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
+	write := &pb.MutateRequest{Resource: "records/s:packed"}
+	operation := &pb.Command_Mutate{Mutate: write}
+	command := &pb.Command{Operation: operation}
+	earlier := &laneCall{command: command, state: callSent, index: 1, done: make(chan laneOutcome, 1)}
+	l.index, l.outstanding[1], l.cancels = 1, earlier, []uint64{1}
+	abandoned := &laneCall{command: command, state: callAbandoned, size: laneRecordBytes, done: make(chan laneOutcome, 1)}
+	half := laneRecordBytes / 2
+	for _, call := range []*laneCall{{size: half}, abandoned, {size: half}, {size: 1}} {
+		if call.command == nil {
+			call.command, call.done = command, make(chan laneOutcome, 1)
+		}
+		l.queued = append(l.queued, call)
+		l.load.Add(1)
+	}
+	for l.writeNext() {
+	}
+	if len(stream.sent) != 2 || len(stream.sent[0]) != 3 || len(stream.sent[1]) != 1 {
+		t.Fatal("queued requests were not packed within the byte bound", stream.sent)
+	}
+	first := stream.sent[0]
+	if first[0].CancelIndex != 1 || first[1].Index != 2 || first[2].Index != 3 || stream.sent[1][0].Index != 4 {
+		t.Fatal("packed requests lost their order", stream.sent)
+	}
+	if l.load.Load() != 3 || len(l.outstanding) != 4 {
+		t.Fatal("packed records were not tracked", l.load.Load(), len(l.outstanding))
 	}
 }
