@@ -422,29 +422,20 @@ func TestStalledSharedStreamReleasesCallersAtTheirDeadline(t *testing.T) {
 	}
 }
 
-func TestRefusingStreamClosesOnceQuietAndRecordsMoveOn(t *testing.T) {
+func TestRefusingStreamKeepsCarryingCallsWhenNoOtherCan(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
-	refused, err := lanePut(t.Context(), client, "records/s:refused", 16)
-	if err != nil || refused.GetOutcome() != MutationNotStarted || refused.GetFailure().GetCode() != FailureUnavailable {
-		t.Fatal("refused record lost its evidence", refused, err)
-	}
-	// A draining server must not wait for the idle timeout.
-	deadline := time.Now().Add(2 * time.Second)
-	for peer.halfClose.Load() != 1 {
-		if time.Now().After(deadline) {
-			t.Fatal("quiet refusing stream stayed open")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	for range 5 {
-		result, err := lanePut(t.Context(), client, "records/s:after", 16)
-		if err != nil || result.GetOutcome() != MutationApplied {
-			t.Fatal(result, err)
+	peer.draining.Store(true)
+	// Without a healthy stream to move to, the refusing stream stays open
+	// rather than each call opening a stream of its own.
+	for range 20 {
+		refused, err := lanePut(t.Context(), client, "records/s:refused", 16)
+		if err != nil || refused.GetOutcome() != MutationNotStarted || refused.GetFailure().GetCode() != FailureUnavailable {
+			t.Fatal("refused record lost its evidence", refused, err)
 		}
 	}
-	if peer.streams.Load() != 2 {
-		t.Fatal("records did not move to one other stream", peer.streams.Load())
+	if peer.streams.Load() != 1 || peer.halfClose.Load() != 0 {
+		t.Fatal("refusals churned streams", peer.streams.Load(), peer.halfClose.Load())
 	}
 }
 

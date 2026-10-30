@@ -41,8 +41,9 @@ const (
 	laneAttempts = 3
 	// laneCooldown keeps a stream whose server refused a record from taking
 	// new records while any stream has not, so a draining server's stream
-	// goes quiet instead of attracting the records it refuses at once. When
-	// every stream is cooling, at most one new stream opens per cooldown.
+	// goes quiet instead of attracting the records it refuses at once, and
+	// closes once quiet. When every stream is cooling, they keep carrying
+	// records and at most one new stream opens per cooldown.
 	laneCooldown = 10 * time.Second
 )
 
@@ -185,12 +186,25 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 			}
 			live = append(live, candidate)
 			best := &chosen
-			if now.UnixNano()-candidate.refused.Load() < int64(laneCooldown) {
+			if candidate.cooling(now) {
 				best = &cooling
 			}
 			if *best == nil || candidate.load.Load() < (*best).load.Load() {
 				*best = candidate
 			}
+		}
+		// Once another stream is healthy, quiet cooling streams close. Only
+		// the pool, under its lock, increases load, so a quiet one stays quiet.
+		if chosen != nil {
+			healthy := live[:0]
+			for _, candidate := range live {
+				if candidate.cooling(now) && candidate.load.Load() == 0 {
+					expired = append(expired, candidate)
+					continue
+				}
+				healthy = append(healthy, candidate)
+			}
+			live = healthy
 		}
 		clear(group.lanes[len(live):])
 		group.lanes = live
@@ -498,8 +512,7 @@ func refusesWork(event *pb.Event) bool {
 }
 
 // quietLocked lets a closing stream half-close once nothing is queued or
-// outstanding, and schedules an idle one to retire: at once while it is
-// cooling, so a draining server need not wait for it.
+// outstanding, and schedules an idle one to retire.
 func (l *lane) quietLocked() {
 	if len(l.outstanding) != 0 || len(l.queued) != 0 {
 		return
@@ -508,15 +521,16 @@ func (l *lane) quietLocked() {
 		l.signal()
 		return
 	}
-	wait := laneIdle
-	if time.Now().UnixNano()-l.refused.Load() < int64(laneCooldown) {
-		wait = 0
-	}
 	if l.idle == nil {
-		l.idle = time.AfterFunc(wait, l.retire)
+		l.idle = time.AfterFunc(laneIdle, l.retire)
 		return
 	}
-	l.idle.Reset(wait)
+	l.idle.Reset(laneIdle)
+}
+
+// cooling reports whether the server refused a record within the cooldown.
+func (l *lane) cooling(now time.Time) bool {
+	return now.UnixNano()-l.refused.Load() < int64(laneCooldown)
 }
 
 // retire removes a stream from its pool and drains it.

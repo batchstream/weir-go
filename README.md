@@ -313,10 +313,10 @@ asks the server to cancel only that record; as with any canceled call, a record
 already executing may still take effect. When the server refuses a record
 without starting it, as a draining or overloaded server or an unavailable
 backend does, the refusal returns to the caller. For 10 seconds afterwards the
-stream takes new records only when no other stream can, and it closes as soon as
-it falls quiet, so a draining server's streams end within a round trip while new
-records move to other servers. When every stream of a Store has refused, one new
-stream opens per 10 seconds.
+stream takes new records only when no other stream can, and while another stream
+does, it closes as soon as it falls quiet, so new records move to other servers
+and a draining server's streams end. When every stream of a Store has refused,
+those streams keep carrying its calls and one new stream opens per 10 seconds.
 Streams retire after a minute, which lets the server's connection age rebalance
 long-running clients, and idle streams close after 10 seconds. Shared streams do
 not carry outgoing gRPC metadata from a call's context; package operation
