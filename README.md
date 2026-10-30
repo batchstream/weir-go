@@ -316,7 +316,9 @@ backend does, the refusal returns to the caller. For 10 seconds afterwards the
 stream takes new records only when no other stream can, and while another stream
 does, it closes as soon as it falls quiet, so new records move to other servers
 and a draining server's streams end. When every stream of a Store has refused,
-those streams keep carrying its calls and one new stream opens per 10 seconds.
+a fresh stream looks for a server that is not refusing; once that stream is
+refused too, as when the backend is unavailable everywhere, the refusing streams
+keep carrying calls and the next fresh stream opens 10 seconds later.
 Streams retire after a minute, which lets the server's connection age rebalance
 long-running clients, and idle streams close after 10 seconds. Shared streams do
 not carry outgoing gRPC metadata from a call's context; package operation

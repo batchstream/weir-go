@@ -42,8 +42,9 @@ const (
 	// laneCooldown keeps a stream whose server refused a record from taking
 	// new records while any stream has not, so a draining server's stream
 	// goes quiet instead of attracting the records it refuses at once, and
-	// closes once quiet. When every stream is cooling, they keep carrying
-	// records and at most one new stream opens per cooldown.
+	// closes once quiet. When every stream is cooling, a fresh stream probes
+	// for a server that is not refusing; once a probe is refused too, the
+	// cooling streams keep carrying records for the cooldown.
 	laneCooldown = 10 * time.Second
 )
 
@@ -67,8 +68,8 @@ type laneGroup struct {
 	lanes []*lane
 	// opening is closed when the stream being opened is ready or failed.
 	opening chan struct{}
-	// probed is when a stream last opened while every stream was cooling.
-	probed time.Time
+	// probeRefused is when a probing stream's server last refused a record.
+	probeRefused time.Time
 }
 
 func newLanePool(client pb.StoreServiceClient) *lanePool {
@@ -121,6 +122,9 @@ type lane struct {
 	load atomic.Int64
 	// refused holds when the server last refused a record without starting it.
 	refused atomic.Int64
+	// probing marks a stream opened while every stream was cooling, until it
+	// answers a record without refusing it. Only the receiver uses it.
+	probing bool
 	// wake asks the writer to send what is queued.
 	wake chan struct{}
 
@@ -213,20 +217,18 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 			load = chosen.load.Load()
 		}
 		opening := group.opening
-		// Without a healthy stream, a group opens a fresh one at once, but
-		// while every stream is cooling only one per cooldown; with a healthy
-		// stream, overflow uses streams of its own.
-		probe := chosen == nil && (cooling == nil || now.Sub(group.probed) >= laneCooldown)
-		open := (probe || chosen != nil && load >= laneOpenAt) && len(live) < maxLanes && opening == nil
+		// While every stream is cooling, a fresh stream probes unless a probe
+		// was refused within the cooldown. With a healthy stream, overflow
+		// uses streams of its own.
+		probe := chosen == nil && cooling != nil && now.Sub(group.probeRefused) >= laneCooldown
+		grow := chosen == nil && cooling == nil || chosen != nil && load >= laneOpenAt
+		open := (probe || grow) && len(live) < maxLanes && opening == nil
 		// Cooling streams take records only when no stream is healthy.
 		if !open && chosen == nil && cooling != nil {
 			chosen, load = cooling, cooling.load.Load()
 		}
 		if open {
 			group.opening = make(chan struct{})
-			if cooling != nil && chosen == nil {
-				group.probed = now
-			}
 		} else if load < laneRecords {
 			chosen.load.Add(1)
 		}
@@ -236,7 +238,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		}
 		switch {
 		case open:
-			return p.open(ctx, key, group)
+			return p.open(ctx, key, group, probe)
 		case load < laneRecords:
 			return chosen, nil
 		case opening == nil:
@@ -251,7 +253,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 }
 
 // open starts a stream for group and reserves its first record slot.
-func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup) (*lane, error) {
+func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup, probing bool) (*lane, error) {
 	laneCtx, cancel := context.WithCancel(p.ctx)
 	// The opening caller's cancellation bounds connection establishment only.
 	stop := context.AfterFunc(ctx, cancel)
@@ -264,7 +266,7 @@ func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup) (*la
 	var opened *lane
 	if stopped && err == nil {
 		now := time.Now()
-		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
+		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), probing: probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
 		opened.load.Store(1)
 		go opened.receive()
 		go opened.write()
@@ -483,6 +485,11 @@ func (l *lane) deliver(response *pb.ExecuteResponse) error {
 	// would look least loaded and attract more records.
 	if refusesWork(response.Event) {
 		l.refused.Store(time.Now().UnixNano())
+		if l.probing {
+			l.pool.refuseProbes(l.key)
+		}
+	} else {
+		l.probing = false
 	}
 	l.mu.Lock()
 	pending, ok := l.outstanding[response.Index]
@@ -601,6 +608,17 @@ func (l *lane) fail(err error) {
 		pending.done <- outcome
 	}
 	l.handBack(returned)
+}
+
+// refuseProbes stops probing for the cooldown once a probe's server refuses
+// too, as when every server's backend is unavailable. A probe that fails
+// without an answer, such as one a draining server rejects, does not.
+func (p *lanePool) refuseProbes(key laneKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if group := p.groups[key]; group != nil {
+		group.probeRefused = time.Now()
+	}
 }
 
 func (p *lanePool) remove(l *lane) {

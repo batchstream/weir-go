@@ -36,6 +36,9 @@ type laneTestPeer struct {
 	stall     sync.Once
 	// draining refuses every record, as a draining server does.
 	draining atomic.Bool
+	// rejecting refuses new streams, as a draining server does before its
+	// clients learn to stop opening them.
+	rejecting atomic.Bool
 }
 
 func newLaneTestPeer() *laneTestPeer {
@@ -44,6 +47,9 @@ func newLaneTestPeer() *laneTestPeer {
 }
 
 func (p *laneTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+	if p.rejecting.Load() {
+		return status.Error(codes.Unavailable, "draining")
+	}
 	p.streams.Add(1)
 	var send sync.Mutex
 	// Held results finish before a clean half-close; an error ends them.
@@ -471,6 +477,46 @@ func TestLoneStreamMovesOffADrainingServerAtOnce(t *testing.T) {
 			t.Fatal("stream to the draining server stayed open", draining.halfClose.Load(), draining.streams.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client := laneTestClient(t, first, second)
+	before := laneTestReady(t, client, first, second)
+	if _, err := lanePut(t.Context(), client, "records/s:first", 16); err != nil {
+		t.Fatal(err)
+	}
+	draining, healthy := first, second
+	if second.streams.Load() != before[1] {
+		draining, healthy = second, first
+	}
+	draining.draining.Store(true)
+	draining.rejecting.Store(true)
+	// A stream of its own moves round-robin so the first probe reaches the
+	// draining server.
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
+	request := &WriteRequest{Resource: "records/s:turn", Document: document}
+	options := WriteOptions{StoreName: "records", Request: request}
+	turned := healthy.streams.Load()
+	if _, err := Put(t.Context(), client.store, options); err != nil || healthy.streams.Load() != turned+1 {
+		t.Fatal("round-robin did not turn to the healthy server", err)
+	}
+	applied, refused, failed := 0, 0, 0
+	for range 20 {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		switch {
+		case err != nil:
+			failed++
+		case result.GetOutcome() == MutationApplied:
+			applied++
+		default:
+			refused++
+		}
+	}
+	// One record reveals the drain and at most one rides the rejected probe.
+	if refused != 1 || failed > 1 || applied < 18 {
+		t.Fatal("a rejected probe held calls on the draining server", applied, refused, failed)
 	}
 }
 
