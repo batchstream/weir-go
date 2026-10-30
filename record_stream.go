@@ -105,7 +105,7 @@ type recordStreamOptions struct {
 }
 
 // These backpressure windows permit a larger individual request to proceed alone.
-const recordWindowItems = 32
+const recordWindowItems = protocol.RecordWindow
 const recordWindowBytes = 8 << 20
 
 type recordSendResult struct {

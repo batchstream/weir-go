@@ -14,7 +14,9 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // ErrClosed reports a call started after Close. Calls already running when
@@ -37,7 +39,7 @@ type Client struct {
 // New returns a Client for a Weir application address such as "weir:7447".
 // The address is a host name or IP literal with an explicit port. The Client
 // connects on first use and reconnects after failures. A DNS name that
-// resolves to several servers spreads calls across them.
+// resolves to several servers spreads streams across them.
 func New(address string) (*Client, error) {
 	if err := validateAddress(address); err != nil {
 		return nil, err
@@ -117,7 +119,8 @@ func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResu
 	key := laneKey{store: options.StoreName, read: true}
 	event, shared, err := c.lanes.execute(ctx, key, command)
 	if !shared {
-		return ReadOne(ctx, client, options)
+		result, err := ReadOne(ctx, client, options)
+		return result, callError(ctx, err)
 	}
 	if err != nil {
 		return nil, err
@@ -168,12 +171,29 @@ func (c *Client) mutateOne(ctx context.Context, store string, request *MutateReq
 	key := laneKey{store: store}
 	event, shared, err := c.lanes.execute(ctx, key, command)
 	if !shared {
-		return mutateOne(ctx, client, batch)
+		result, err := mutateOne(ctx, client, batch)
+		return result, callError(ctx, err)
 	}
 	if err != nil {
 		return nil, err
 	}
 	return event.GetMutationResult(), nil
+}
+
+// callError reports a call that ended with its context as the context's error,
+// whether it used a shared stream or a stream of its own. The server enforces
+// the propagated deadline too, so its status can arrive before ctx expires.
+func callError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if _, bounded := ctx.Deadline(); bounded && status.Code(err) == codes.DeadlineExceeded {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
