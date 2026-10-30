@@ -1,6 +1,6 @@
 # Weir Go SDK
 
-Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.1.
+Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.3.
 Point a client at a Weir application address and send typed business requests to
 the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.

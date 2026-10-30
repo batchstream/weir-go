@@ -1,6 +1,6 @@
 module github.com/batchstream/weir-go
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/batchstream/weir-protocol v0.17.0
@@ -11,7 +11,7 @@ require (
 
 require (
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
