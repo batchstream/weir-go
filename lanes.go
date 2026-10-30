@@ -507,16 +507,18 @@ func (l *lane) deliver(response *pb.ExecuteResponse) error {
 }
 
 // refusesWork reports a record the server did not start because it, or its
-// backend, could not take work: a draining or overloaded server, or an
-// unavailable backend. A read failing RESOURCE_EXHAUSTED may be too large on
-// its own, so only UNAVAILABLE marks a refused read.
+// backend, could not take it: a draining or overloaded server, or an
+// unavailable backend.
 func refusesWork(event *pb.Event) bool {
-	result := event.GetMutationResult()
-	if result == nil {
-		return event.GetReadResult().GetFailure().GetCode() == pb.FailureCode_UNAVAILABLE
+	failure := event.GetReadResult().GetFailure()
+	if result := event.GetMutationResult(); result != nil {
+		if result.GetOutcome() != pb.MutationOutcome_NOT_STARTED {
+			return false
+		}
+		failure = result.GetFailure()
 	}
-	code := result.GetFailure().GetCode()
-	return result.GetOutcome() == pb.MutationOutcome_NOT_STARTED && (code == pb.FailureCode_UNAVAILABLE || code == pb.FailureCode_RESOURCE_EXHAUSTED)
+	code := failure.GetCode()
+	return code == pb.FailureCode_UNAVAILABLE || code == pb.FailureCode_RESOURCE_EXHAUSTED
 }
 
 // quietLocked lets a closing stream half-close once nothing is queued or
