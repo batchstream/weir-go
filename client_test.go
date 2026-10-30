@@ -28,7 +28,8 @@ type clientTestPeer struct {
 	canceled  chan struct{}
 }
 
-func (p *clientTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+func (p *clientTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	stream := &recordPeer{BidiStreamingServer: packed}
 	p.streams.Add(1)
 	for {
 		request, err := stream.Recv()

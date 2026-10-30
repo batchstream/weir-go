@@ -6,10 +6,10 @@ the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.18.0
+go get github.com/batchstream/weir-go@v0.19.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.16.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.17.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -300,7 +300,10 @@ each result promptly and avoid retaining unbounded events.
 The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
 `Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
 of the same Client, so many goroutines in one process pay for a few gRPC streams
-instead of one per call. Each Store and operation kind takes new records on at
+instead of one per call. A stream sends the records queued on it together in one
+message of up to 1 MiB, and the server returns results that complete together
+in one message, so a busy stream pays for a message per burst rather than per
+record. Each Store and operation kind takes new records on at
 most 32 streams of 32 outstanding records; another stream opens once every
 stream is half full, and calls beyond that capacity, or with a record over 1
 MiB, use a stream of their own. With fewer concurrent calls, one stream, and so
