@@ -28,30 +28,45 @@ func Replace(ctx context.Context, client pb.StoreServiceClient, options WriteOpt
 }
 
 func writeOne(ctx context.Context, client pb.StoreServiceClient, options WriteOptions, action MutationAction) (*MutationResult, error) {
-	var request *MutateRequest
-	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: action, Document: options.Request.Document, Options: options.Request.Options}
-	}
+	request := writeRequest(options.Request, action)
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
 }
 
 func Delete(ctx context.Context, client pb.StoreServiceClient, options DeleteOptions) (*MutationResult, error) {
-	var request *MutateRequest
-	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationDelete, Options: options.Request.Options}
-	}
+	request := deleteRequest(options.Request)
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
 }
 
 func AtomicTransform(ctx context.Context, client pb.StoreServiceClient, options AtomicTransformOptions) (*MutationResult, error) {
-	var request *MutateRequest
-	if options.Request != nil {
-		request = &MutateRequest{Resource: options.Request.Resource, Action: MutationAtomicTransform, Lua: options.Request.Lua, BackendExpression: options.Request.BackendExpression, Options: options.Request.Options}
-	}
+	request := transformRequest(options.Request)
 	batch := MutateOptions{StoreName: options.StoreName, Requests: []*MutateRequest{request}}
 	return mutateOne(ctx, client, batch)
+}
+
+func writeRequest(input *WriteRequest, action MutationAction) *MutateRequest {
+	if input == nil {
+		return nil
+	}
+	request := &MutateRequest{Resource: input.Resource, Action: action, Document: input.Document, Options: input.Options}
+	return request
+}
+
+func deleteRequest(input *DeleteRequest) *MutateRequest {
+	if input == nil {
+		return nil
+	}
+	request := &MutateRequest{Resource: input.Resource, Action: MutationDelete, Options: input.Options}
+	return request
+}
+
+func transformRequest(input *AtomicTransformRequest) *MutateRequest {
+	if input == nil {
+		return nil
+	}
+	request := &MutateRequest{Resource: input.Resource, Action: MutationAtomicTransform, Lua: input.Lua, BackendExpression: input.BackendExpression, Options: input.Options}
+	return request
 }
 
 func mutateOne(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) (*MutationResult, error) {

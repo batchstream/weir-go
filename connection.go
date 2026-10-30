@@ -14,7 +14,9 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	_ "google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // ErrClosed reports a call started after Close. Calls already running when
@@ -28,6 +30,7 @@ var ErrClosed = errors.New("Weir client is closed")
 type Client struct {
 	connection *grpc.ClientConn
 	store      pb.StoreServiceClient
+	lanes      *lanePool
 	closed     atomic.Bool
 	closeOnce  sync.Once
 	closeErr   error
@@ -36,7 +39,7 @@ type Client struct {
 // New returns a Client for a Weir application address such as "weir:7447".
 // The address is a host name or IP literal with an explicit port. The Client
 // connects on first use and reconnects after failures. A DNS name that
-// resolves to several servers spreads calls across them.
+// resolves to several servers spreads streams across them.
 func New(address string) (*Client, error) {
 	if err := validateAddress(address); err != nil {
 		return nil, err
@@ -45,7 +48,8 @@ func New(address string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := &Client{connection: connection, store: pb.NewStoreServiceClient(connection)}
+	store := pb.NewStoreServiceClient(connection)
+	client := &Client{connection: connection, store: store, lanes: newLanePool(store)}
 	return client, nil
 }
 
@@ -97,52 +101,99 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 	return c.store, nil
 }
 
+// ReadOne and the other single-record Client methods share a bounded set of
+// long-lived streams with concurrent calls of this Client. A canceled call
+// stops waiting and cancels only its own record, which may still take effect
+// if it is already executing.
 func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
 	client, err := c.storeClient()
 	if err != nil {
 		return nil, err
 	}
-	return ReadOne(ctx, client, options)
+	batch := ReadOptions{StoreName: options.StoreName, Requests: []*ReadRequest{options.Request}}
+	if err := validateReads(ctx, batch); err != nil {
+		return nil, err
+	}
+	operation := &pb.Command_Read{Read: options.Request}
+	command := &pb.Command{Operation: operation}
+	key := laneKey{store: options.StoreName, read: true}
+	event, shared, err := c.lanes.execute(ctx, key, command)
+	if !shared {
+		result, err := ReadOne(ctx, client, options)
+		return result, callError(ctx, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return readResult(event.GetReadResult()), nil
 }
 
 func (c *Client) Create(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
-		return nil, err
-	}
-	return Create(ctx, client, options)
+	request := writeRequest(options.Request, MutationCreate)
+	return c.mutateOne(ctx, options.StoreName, request)
 }
 
 func (c *Client) Put(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
-		return nil, err
-	}
-	return Put(ctx, client, options)
+	request := writeRequest(options.Request, MutationPut)
+	return c.mutateOne(ctx, options.StoreName, request)
 }
 
 func (c *Client) Replace(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
-		return nil, err
-	}
-	return Replace(ctx, client, options)
+	request := writeRequest(options.Request, MutationReplace)
+	return c.mutateOne(ctx, options.StoreName, request)
 }
 
 func (c *Client) Delete(ctx context.Context, options DeleteOptions) (*MutationResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
-		return nil, err
-	}
-	return Delete(ctx, client, options)
+	request := deleteRequest(options.Request)
+	return c.mutateOne(ctx, options.StoreName, request)
 }
 
 func (c *Client) AtomicTransform(ctx context.Context, options AtomicTransformOptions) (*MutationResult, error) {
+	request := transformRequest(options.Request)
+	return c.mutateOne(ctx, options.StoreName, request)
+}
+
+func (c *Client) mutateOne(ctx context.Context, store string, request *MutateRequest) (*MutationResult, error) {
 	client, err := c.storeClient()
 	if err != nil {
 		return nil, err
 	}
-	return AtomicTransform(ctx, client, options)
+	batch := MutateOptions{StoreName: store, Requests: []*MutateRequest{request}}
+	if err := validateMutations(ctx, batch); err != nil {
+		return nil, err
+	}
+	mutation, err := wireMutation(request)
+	if err != nil {
+		return nil, err
+	}
+	operation := &pb.Command_Mutate{Mutate: mutation}
+	command := &pb.Command{Operation: operation}
+	key := laneKey{store: store}
+	event, shared, err := c.lanes.execute(ctx, key, command)
+	if !shared {
+		result, err := mutateOne(ctx, client, batch)
+		return result, callError(ctx, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return event.GetMutationResult(), nil
+}
+
+// callError reports a call that ended with its context as the context's error,
+// whether it used a shared stream or a stream of its own. The server enforces
+// the propagated deadline too, so its status can arrive before ctx expires.
+func callError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if _, bounded := ctx.Deadline(); bounded && status.Code(err) == codes.DeadlineExceeded {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
@@ -158,6 +209,7 @@ func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResu
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		c.lanes.close()
 		c.closeErr = c.connection.Close()
 	})
 	return c.closeErr

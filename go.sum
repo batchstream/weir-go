@@ -1,5 +1,5 @@
-github.com/batchstream/weir-protocol v0.15.0 h1:my20gWtfdrecXk/7TvBYQOKXs/azk2IH/I9XQBc5wCk=
-github.com/batchstream/weir-protocol v0.15.0/go.mod h1:05pTsdu4nJkyZjvdz67jILOiuEicw0Vq88M0ucD4GVY=
+github.com/batchstream/weir-protocol v0.16.0 h1:5BNwdMNRmdYaNsinlpEuMiwfmQGxuLhtiffWZjfg7+Y=
+github.com/batchstream/weir-protocol v0.16.0/go.mod h1:05pTsdu4nJkyZjvdz67jILOiuEicw0Vq88M0ucD4GVY=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

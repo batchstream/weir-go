@@ -46,12 +46,13 @@ func TestConnectionSpreadsCallsAndIgnoresResolverServiceConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := &Client{connection: connection, store: pb.NewStoreServiceClient(connection)}
-	defer client.Close()
+	defer connection.Close()
+	// Package-level calls open one stream each, so every call is balanced.
+	store := pb.NewStoreServiceClient(connection)
 	for range 40 {
 		request := clientTestReadRequest()
 		readOptions := ReadOneOptions{StoreName: "records", Request: request}
-		if _, err := client.ReadOne(t.Context(), readOptions); err != nil {
+		if _, err := ReadOne(t.Context(), store, readOptions); err != nil {
 			t.Fatal(err)
 		}
 	}

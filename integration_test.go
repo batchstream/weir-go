@@ -201,7 +201,9 @@ func testStreaming(t *testing.T, backend string) {
 	createSecond := &weir.MutateRequest{Resource: second.Resource, Action: weir.MutationCreate, Document: second.Document}
 	createThird := &weir.MutateRequest{Resource: third.Resource, Action: weir.MutationCreate, Document: third.Document}
 	mutations := []*weir.MutateRequest{create, create, put, createSecond, createThird}
+	// Results arrive as records complete; each index appears once.
 	position, confirmed := 0, 0
+	seen := make(map[uint64]bool)
 	mutate := weir.MutateStreamOptions{StoreName: target.store}
 	mutate.Next = func(context.Context) (*weir.MutateRequest, error) {
 		if position == len(mutations) {
@@ -213,9 +215,10 @@ func testStreaming(t *testing.T, backend string) {
 	}
 	mutate.Consume = func(_ context.Context, index uint64, result *weir.MutationResult) error {
 		confirmed++
-		if index != uint64(confirmed) {
-			return fmt.Errorf("mutation ordinal %d, expected %d", index, confirmed)
+		if index == 0 || index > uint64(len(mutations)) || seen[index] {
+			return fmt.Errorf("unexpected mutation ordinal %d", index)
 		}
+		seen[index] = true
 		if index == 2 {
 			if result.GetOutcome() != weir.MutationNotApplied || result.GetFailure().GetCode() != weir.FailurePreconditionFailed {
 				return fmt.Errorf("duplicate create evidence: %v", result)
@@ -241,6 +244,7 @@ end`)}
 	resources := []string{third.Resource, first.Resource, target.collection + "/s:" + idPrefix + "-missing", second.Resource, first.Resource}
 	expected := []int64{2, 17, -1, 1, 17}
 	position, confirmed = 0, 0
+	clear(seen)
 	read := weir.ReadStreamOptions{StoreName: target.store}
 	read.Next = func(context.Context) (*weir.ReadRequest, error) {
 		if position == len(resources) {
@@ -252,9 +256,10 @@ end`)}
 	}
 	read.Consume = func(_ context.Context, index uint64, result *weir.ReadResult) error {
 		confirmed++
-		if index != uint64(confirmed) || result == nil || result.Failure != nil {
+		if index == 0 || index > uint64(len(resources)) || seen[index] || result == nil || result.Failure != nil {
 			return fmt.Errorf("read %d: %v", index, result)
 		}
+		seen[index] = true
 		if expected[index-1] == -1 {
 			if !result.Missing || result.Document != nil {
 				return fmt.Errorf("read %d did not confirm missing: %v", index, result)

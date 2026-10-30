@@ -6,10 +6,10 @@ the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.17.0
+go get github.com/batchstream/weir-go@v0.18.0
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.15.0`
+The SDK depends on the stable `github.com/batchstream/weir-protocol v0.16.0`
 release. The independent protocol repository owns public schemas, generated
 protobuf types and shared validation. Both Weir and this SDK consume
 it; neither the protocol nor SDK module depends on the server. The SDK does not
@@ -39,15 +39,18 @@ for index, result := range results {
 
 `New` takes a `host:port` address and rejects anything else. It connects on
 first use and reconnects after failures. When a DNS name resolves to several
-Weir servers, calls are spread round-robin across them, so every server behind
-the address must host the Stores the client uses. Use a name that lists every
-server, such as a Kubernetes headless Service; a ClusterIP Service resolves to
-one virtual IP. The client re-resolves the name only after a connection fails,
-so servers added later receive calls once existing connections reconnect. A
-server that does not host the requested Store fails the call with NotFound.
-Reuse the client across goroutines and close it after callers finish. Calls
-started after `Close` return `ErrClosed`; calls still running end with a gRPC
-cancellation error. Business requests are never replayed.
+Weir servers, streams are spread round-robin across them, so every server behind
+the address must host the Stores the client uses. Each Read, Mutate, stream or
+Native call opens its own stream; single-record calls share streams, as
+described under [Streaming and deadlines](#streaming-and-deadlines). Use a name
+that lists every server, such as a Kubernetes headless Service; a ClusterIP
+Service resolves to one virtual IP. The client re-resolves the name only after a
+connection fails, so servers added later receive calls once existing connections
+reconnect. A server that does not host the requested Store fails the call with
+NotFound. Reuse the client across goroutines and close it after callers finish.
+Calls started after `Close` return `ErrClosed`; calls still running end with a
+gRPC cancellation error. A single-record call whose context ends returns the
+context's error. Business requests are never replayed.
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
@@ -76,11 +79,12 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 Execute RPC. An empty input, nil request,
 malformed resource, unsupported action or invalid document envelope rejects the
 entire call without sending earlier valid items. Every resource is relative to
-one `StoreName`. Each input is sent immediately as one ExecuteRequest, and results preserve
-input order, including repeated resources. Individual backend failures stay in
-their result positions. A later RPC failure preserves every validated result
-already received; unconfirmed positions remain nil and any such mutation may
-have applied. Never automatically replay those mutations.
+one `StoreName`. Each input is sent immediately as one ExecuteRequest. Results
+arrive as records complete and are returned in input order, including repeated
+resources. Individual backend failures stay in their result positions. A later
+RPC failure preserves every validated result already received; unconfirmed
+positions remain nil and any such mutation may have applied. Never
+automatically replay those mutations.
 
 ```go
 firstDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
@@ -263,7 +267,8 @@ protocols govern representable messages and accepted data.
 
 `ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
 returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
-result)` receives confirmed results in input order, with indexes starting at 1.
+result)` receives each confirmed result as its record completes; the index,
+starting at 1, identifies the input.
 Inputs are validated as they are produced; an invalid later item does not undo
 earlier requests. Stream success requires one result per submitted input and
 final gRPC OK. Results delivered before a later producer, consumer or transport
@@ -292,7 +297,36 @@ err := client.ReadStream(ctx, options)
 Use streams for finite producer sequences. Consumers should commit or release
 each result promptly and avoid retaining unbounded events.
 
-Use caller deadlines. Business operations have no implicit retry or failover.
+The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
+`Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
+of the same Client, so many goroutines in one process pay for a few gRPC streams
+instead of one per call. Each Store and operation kind takes new records on at
+most 32 streams of 32 outstanding records; another stream opens once every
+stream is half full, and calls beyond that capacity, or with a record over 1
+MiB, use a stream of their own. With fewer concurrent calls, one stream, and so
+one server, carries a Store's calls until it retires. Results return as each
+record completes, so a slow call does not hold back the others. A record the
+server rejects fails alone, but a broken stream fails every record outstanding
+on it. A call's deadline travels with its record, so the server drops it if it
+is still queued when the deadline passes. Canceling a call stops waiting and
+asks the server to cancel only that record; as with any canceled call, a record
+already executing may still take effect. When the server refuses a record
+without starting it, as a draining or overloaded server or an unavailable
+backend does, the refusal returns to the caller. For 10 seconds afterwards the
+stream takes new records only when no other stream can, and while another stream
+does, it closes as soon as it falls quiet, so new records move to other servers
+and a draining server's streams end. When every stream of a Store has refused,
+a fresh stream looks for a server that is not refusing; once that stream is
+refused too, as when the backend is unavailable everywhere, the refusing streams
+keep carrying calls and the next fresh stream opens 10 seconds later.
+Streams retire after a minute, which lets the server's connection age rebalance
+long-running clients, and idle streams close after 10 seconds. Shared streams do
+not carry outgoing gRPC metadata from a call's context; package operation
+functions keep one stream per call and send it.
+
+Use caller deadlines. Business operations have no implicit retry or failover;
+a caller may send a `MutationNotStarted` record again, such as one a rolling
+restart refused, because it never began.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
 operation functions accept a generated StoreService client for custom
 connections and protocol fixtures; ordinary applications use New and typed Client
