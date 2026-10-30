@@ -426,16 +426,51 @@ func TestRefusingStreamKeepsCarryingCallsWhenNoOtherCan(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
 	peer.draining.Store(true)
-	// Without a healthy stream to move to, the refusing stream stays open
-	// rather than each call opening a stream of its own.
+	// The first refusal opens one fresh stream; once it refuses too, both
+	// stay open rather than each call opening a stream of its own.
 	for range 20 {
 		refused, err := lanePut(t.Context(), client, "records/s:refused", 16)
 		if err != nil || refused.GetOutcome() != MutationNotStarted || refused.GetFailure().GetCode() != FailureUnavailable {
 			t.Fatal("refused record lost its evidence", refused, err)
 		}
 	}
-	if peer.streams.Load() != 1 || peer.halfClose.Load() != 0 {
+	if peer.streams.Load() != 2 || peer.halfClose.Load() != 0 {
 		t.Fatal("refusals churned streams", peer.streams.Load(), peer.halfClose.Load())
+	}
+}
+
+func TestLoneStreamMovesOffADrainingServerAtOnce(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client := laneTestClient(t, first, second)
+	before := laneTestReady(t, client, first, second)
+	if _, err := lanePut(t.Context(), client, "records/s:first", 16); err != nil {
+		t.Fatal(err)
+	}
+	draining := first
+	if second.streams.Load() != before[1] {
+		draining = second
+	}
+	draining.draining.Store(true)
+	refused := 0
+	for range 20 {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.GetOutcome() != MutationApplied {
+			refused++
+		}
+	}
+	// Only the record that revealed the drain is refused.
+	if refused != 1 {
+		t.Fatal("calls stayed on the draining server", refused)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for draining.halfClose.Load() != draining.streams.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("stream to the draining server stayed open", draining.halfClose.Load(), draining.streams.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

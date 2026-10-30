@@ -67,8 +67,8 @@ type laneGroup struct {
 	lanes []*lane
 	// opening is closed when the stream being opened is ready or failed.
 	opening chan struct{}
-	// opened is when the newest stream opened.
-	opened time.Time
+	// probed is when a stream last opened while every stream was cooling.
+	probed time.Time
 }
 
 func newLanePool(client pb.StoreServiceClient) *lanePool {
@@ -213,9 +213,10 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 			load = chosen.load.Load()
 		}
 		opening := group.opening
-		// Without a healthy stream, a group opens one fresh stream per
-		// cooldown; with one, overflow uses streams of its own.
-		probe := chosen == nil && (cooling == nil || now.Sub(group.opened) >= laneCooldown)
+		// Without a healthy stream, a group opens a fresh one at once, but
+		// while every stream is cooling only one per cooldown; with a healthy
+		// stream, overflow uses streams of its own.
+		probe := chosen == nil && (cooling == nil || now.Sub(group.probed) >= laneCooldown)
 		open := (probe || chosen != nil && load >= laneOpenAt) && len(live) < maxLanes && opening == nil
 		// Cooling streams take records only when no stream is healthy.
 		if !open && chosen == nil && cooling != nil {
@@ -223,6 +224,9 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		}
 		if open {
 			group.opening = make(chan struct{})
+			if cooling != nil && chosen == nil {
+				group.probed = now
+			}
 		} else if load < laneRecords {
 			chosen.load.Add(1)
 		}
@@ -273,7 +277,6 @@ func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup) (*la
 	p.mu.Lock()
 	if opened != nil {
 		group.lanes = append(group.lanes, opened)
-		group.opened = time.Now()
 	}
 	close(group.opening)
 	group.opening = nil
