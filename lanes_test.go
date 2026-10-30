@@ -22,8 +22,9 @@ import (
 )
 
 // laneTestPeer applies every mutation at once except the held resource, whose
-// result waits for release or cancellation, and ends the stream on the broken
-// resource.
+// result waits for release or cancellation. It ends the stream on the broken
+// resource, stops reading it on the stalled one and refuses the refused one as
+// a draining server does.
 type laneTestPeer struct {
 	streams   atomic.Int64
 	halfClose atomic.Int64
@@ -31,10 +32,14 @@ type laneTestPeer struct {
 	arrived   chan string
 	canceled  chan uint64
 	release   chan struct{}
+	stalled   chan struct{}
+	stall     sync.Once
+	// draining refuses every record, as a draining server does.
+	draining atomic.Bool
 }
 
 func newLaneTestPeer() *laneTestPeer {
-	peer := &laneTestPeer{timeouts: make(chan uint64, 64), arrived: make(chan string, 64), canceled: make(chan uint64, 64), release: make(chan struct{})}
+	peer := &laneTestPeer{timeouts: make(chan uint64, 64), arrived: make(chan string, 64), canceled: make(chan uint64, 64), release: make(chan struct{}), stalled: make(chan struct{})}
 	return peer
 }
 
@@ -86,9 +91,19 @@ func (p *laneTestPeer) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequest
 		case p.arrived <- resource:
 		default:
 		}
+		if p.draining.Load() {
+			resource = "records/s:refused"
+		}
 		switch resource {
 		case "records/s:broken":
 			return status.Error(codes.Unavailable, "stream broke")
+		case "records/s:stalled":
+			p.stall.Do(func() { close(p.stalled) })
+			<-stream.Context().Done()
+			return stream.Context().Err()
+		case "records/s:refused":
+			failure := protocol.Fail(pb.FailureCode_UNAVAILABLE, "store draining")
+			respond(request.Index, protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure))
 		case "records/s:held":
 			index := request.Index
 			canceled := make(chan struct{})
@@ -148,6 +163,33 @@ func laneTestListen(t *testing.T, peer *laneTestPeer) string {
 	return listener.Addr().String()
 }
 
+// laneTestReady waits until calls on streams of their own reach every peer,
+// so shared streams opened afterwards can use every connection. It returns
+// each peer's stream count at that point.
+func laneTestReady(t *testing.T, client *Client, peers ...*laneTestPeer) []int64 {
+	t.Helper()
+	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
+	request := &WriteRequest{Resource: "records/s:ready", Document: document}
+	options := WriteOptions{StoreName: "records", Request: request}
+	for range 200 {
+		if _, err := Put(t.Context(), client.store, options); err != nil {
+			t.Fatal(err)
+		}
+		counts := make([]int64, len(peers))
+		ready := true
+		for i, peer := range peers {
+			counts[i] = peer.streams.Load()
+			ready = ready && counts[i] != 0
+		}
+		if ready {
+			return counts
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("not every server became reachable")
+	return nil
+}
+
 func lanePut(ctx context.Context, client *Client, resource string, size int) (*MutationResult, error) {
 	document := &Document{ContentType: "application/json", Data: []byte(`{"padding":"` + strings.Repeat("x", size) + `"}`)}
 	request := &WriteRequest{Resource: resource, Document: document}
@@ -182,11 +224,13 @@ func TestConcurrentSingleRecordCallsShareABoundedSetOfStreams(t *testing.T) {
 func TestSharedStreamsSpreadConcurrentCallsAcrossServers(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client := laneTestClient(t, first, second)
+	before := laneTestReady(t, client, first, second)
 	var calls sync.WaitGroup
 	for worker := range 128 {
 		calls.Go(func() {
 			for range 10 {
-				if _, err := lanePut(t.Context(), client, fmt.Sprintf("records/s:%d", worker), 16); err != nil {
+				_, err := lanePut(t.Context(), client, fmt.Sprintf("records/s:%d", worker), 16)
+				if err != nil {
 					t.Error(err)
 					return
 				}
@@ -194,7 +238,7 @@ func TestSharedStreamsSpreadConcurrentCallsAcrossServers(t *testing.T) {
 		})
 	}
 	calls.Wait()
-	if first.streams.Load() == 0 || second.streams.Load() == 0 {
+	if first.streams.Load() == before[0] || second.streams.Load() == before[1] {
 		t.Fatal("shared streams stayed on one server", first.streams.Load(), second.streams.Load())
 	}
 }
@@ -249,13 +293,15 @@ func TestSharedCallsCarryTheirDeadline(t *testing.T) {
 	client := laneTestClient(t, peer)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	if _, err := lanePut(ctx, client, "records/s:bounded", 16); err != nil {
+	_, err := lanePut(ctx, client, "records/s:bounded", 16)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if timeout := <-peer.timeouts; timeout == 0 || timeout > uint64(time.Second/time.Microsecond) {
 		t.Fatal("record did not carry its caller's remaining time", timeout)
 	}
-	if _, err := lanePut(t.Context(), client, "records/s:unbounded", 16); err != nil {
+	_, err = lanePut(t.Context(), client, "records/s:unbounded", 16)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if timeout := <-peer.timeouts; timeout != 0 {
@@ -267,7 +313,8 @@ func TestLargeRecordsUseAStreamOfTheirOwn(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
 	for _, size := range []int{16, laneRecordBytes, 16} {
-		if _, err := lanePut(t.Context(), client, "records/s:sized", size); err != nil {
+		_, err := lanePut(t.Context(), client, "records/s:sized", size)
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -285,7 +332,8 @@ func TestBrokenSharedStreamFailsItsRecordsAndTheNextCallReconnects(t *testing.T)
 		held <- err
 	}()
 	<-peer.arrived
-	if _, err := lanePut(t.Context(), client, "records/s:broken", 16); status.Code(err) != codes.Unavailable {
+	_, err := lanePut(t.Context(), client, "records/s:broken", 16)
+	if status.Code(err) != codes.Unavailable {
 		t.Fatal("broken stream did not fail its record", err)
 	}
 	if err := <-held; status.Code(err) != codes.Unavailable {
@@ -300,7 +348,8 @@ func TestBrokenSharedStreamFailsItsRecordsAndTheNextCallReconnects(t *testing.T)
 func TestExpiredSharedStreamDrainsAndHalfCloses(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
-	if _, err := lanePut(t.Context(), client, "records/s:first", 16); err != nil {
+	_, err := lanePut(t.Context(), client, "records/s:first", 16)
+	if err != nil {
 		t.Fatal(err)
 	}
 	client.lanes.mu.Lock()
@@ -310,7 +359,8 @@ func TestExpiredSharedStreamDrainsAndHalfCloses(t *testing.T) {
 		}
 	}
 	client.lanes.mu.Unlock()
-	if _, err := lanePut(t.Context(), client, "records/s:second", 16); err != nil {
+	_, err = lanePut(t.Context(), client, "records/s:second", 16)
+	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -339,5 +389,123 @@ func TestCloseEndsSharedCalls(t *testing.T) {
 	}
 	if err := <-held; status.Code(err) != codes.Canceled {
 		t.Fatal("Close left a shared call waiting", err)
+	}
+}
+
+func TestStalledSharedStreamReleasesCallersAtTheirDeadline(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	stalled, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	_, err := lanePut(stalled, client, "records/s:stalled", 16)
+	stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("stalled record outlived its deadline", err)
+	}
+	// A large record fills the flow-control window of the unread stream.
+	var calls sync.WaitGroup
+	late := make(chan time.Duration, 8)
+	for _, size := range []int{900 << 10, 16, 16, 16, 16} {
+		calls.Go(func() {
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			_, err := lanePut(ctx, client, "records/s:behind", size)
+			if elapsed := time.Since(started); elapsed > time.Second || !errors.Is(err, context.DeadlineExceeded) {
+				late <- elapsed
+			}
+		})
+	}
+	calls.Wait()
+	close(late)
+	for elapsed := range late {
+		t.Fatal("a call behind a stalled stream outlived its deadline", elapsed)
+	}
+}
+
+func TestRefusingStreamClosesOnceQuietAndRecordsMoveOn(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	refused, err := lanePut(t.Context(), client, "records/s:refused", 16)
+	if err != nil || refused.GetOutcome() != MutationNotStarted || refused.GetFailure().GetCode() != FailureUnavailable {
+		t.Fatal("refused record lost its evidence", refused, err)
+	}
+	// A draining server must not wait for the idle timeout.
+	deadline := time.Now().Add(2 * time.Second)
+	for peer.halfClose.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("quiet refusing stream stayed open")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for range 5 {
+		result, err := lanePut(t.Context(), client, "records/s:after", 16)
+		if err != nil || result.GetOutcome() != MutationApplied {
+			t.Fatal(result, err)
+		}
+	}
+	if peer.streams.Load() != 2 {
+		t.Fatal("records did not move to one other stream", peer.streams.Load())
+	}
+}
+
+func TestSharedAndOwnStreamCallsReportTheirDeadlineAlike(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	defer close(peer.release)
+	// The large record uses a stream of its own.
+	for _, size := range []int{16, laneRecordBytes} {
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		_, err := lanePut(ctx, client, "records/s:held", size)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal("deadline reported differently by stream path", size, err)
+		}
+	}
+}
+
+func TestNewRecordsLeaveADrainingServer(t *testing.T) {
+	draining, healthy := newLaneTestPeer(), newLaneTestPeer()
+	client := laneTestClient(t, draining, healthy)
+	run := func(workers, calls int) (applied, refused int64) {
+		var running sync.WaitGroup
+		var appliedCount, refusedCount atomic.Int64
+		for worker := range workers {
+			running.Go(func() {
+				for range calls {
+					result, err := lanePut(t.Context(), client, fmt.Sprintf("records/s:%d", worker), 16)
+					switch {
+					case err != nil:
+						t.Error(err)
+						return
+					case result.GetOutcome() == MutationApplied:
+						appliedCount.Add(1)
+					default:
+						refusedCount.Add(1)
+					}
+				}
+			})
+		}
+		running.Wait()
+		return appliedCount.Load(), refusedCount.Load()
+	}
+	before := laneTestReady(t, client, draining, healthy)
+	run(64, 10)
+	if draining.streams.Load() == before[0] || healthy.streams.Load() == before[1] {
+		t.Fatal("shared streams did not reach both servers", draining.streams.Load(), healthy.streams.Load())
+	}
+	// Few enough callers that the open streams have room for every record.
+	draining.draining.Store(true)
+	if applied, refused := run(8, 20); applied+refused != 8*20 {
+		t.Fatal("records were lost or resent", applied, refused)
+	}
+	if applied, refused := run(8, 20); refused != 0 || applied != 8*20 {
+		t.Fatal("new records still reached the draining server", applied, refused)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for draining.halfClose.Load() != draining.streams.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("streams to the draining server stayed open", draining.halfClose.Load(), draining.streams.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
