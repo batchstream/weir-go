@@ -31,6 +31,8 @@ func Mutate(ctx context.Context, client pb.StoreServiceClient, options MutateOpt
 	return mutateRecords(ctx, client, options)
 }
 
+// Read sends the reads a server refused before they began again, in a new
+// stream, once the first one completes without an error.
 func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, error) {
 	if err := validateReads(ctx, options); err != nil {
 		return nil, err
@@ -39,9 +41,31 @@ func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, 
 	if err != nil {
 		return nil, err
 	}
-	return readRecords(ctx, client, options)
+	c.earn(len(options.Requests))
+	results, err := readRecords(ctx, client, options)
+	if err != nil {
+		return results, err
+	}
+	refused := func() []int { return resendableReads(results) }
+	send := func(positions []int) error {
+		again := ReadOptions{StoreName: options.StoreName, Requests: make([]*ReadRequest, len(positions))}
+		for i, position := range positions {
+			again.Requests[i] = options.Requests[position]
+		}
+		resent, err := readRecords(ctx, client, again)
+		for i, position := range positions {
+			results[position] = resent[i]
+		}
+		return err
+	}
+	err = c.resendBatch(ctx, refused, send)
+	return results, err
 }
 
+// Mutate sends the mutations a server refused before they began again, in a
+// new stream, once the first one completes without an error. A refused
+// mutation is sent again only when every later request for its resource was
+// refused too, so each resource's mutations still apply in input order.
 func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*MutationResult, error) {
 	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
@@ -50,7 +74,25 @@ func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*Mutation
 	if err != nil {
 		return nil, err
 	}
-	return mutateRecords(ctx, client, options)
+	c.earn(len(options.Requests))
+	results, err := mutateRecords(ctx, client, options)
+	if err != nil {
+		return results, err
+	}
+	refused := func() []int { return resendableMutations(options.Requests, results) }
+	send := func(positions []int) error {
+		again := MutateOptions{StoreName: options.StoreName, Requests: make([]*MutateRequest, len(positions))}
+		for i, position := range positions {
+			again.Requests[i] = options.Requests[position]
+		}
+		resent, err := mutateRecords(ctx, client, again)
+		for i, position := range positions {
+			results[position] = resent[i]
+		}
+		return err
+	}
+	err = c.resendBatch(ctx, refused, send)
+	return results, err
 }
 
 func validateReads(ctx context.Context, options ReadOptions) error {

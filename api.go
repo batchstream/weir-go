@@ -13,7 +13,8 @@ type Document = pb.Document
 type Failure = pb.Failure
 
 // FailureCode identifies a declared operation failure. Only known nonzero codes
-// are accepted; a failure never authorizes automatic mutation or Native replay.
+// are accepted. A Client sends a record again only for FailureUnavailable on
+// a record that never began.
 type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome
