@@ -26,11 +26,13 @@ var ErrClosed = errors.New("Weir client is closed")
 // Client sends business requests to the Weir servers behind one application
 // address. Every server behind the address must host the Stores the client
 // uses. Reuse a Client across goroutines and close it after callers finish.
-// It never replays a business request.
+// It sends a record again only when a server refused it before it began, and
+// never one that may have taken effect; streams are never resent.
 type Client struct {
 	connection *grpc.ClientConn
 	store      pb.StoreServiceClient
 	lanes      *lanePool
+	resends    *resendBudget
 	closed     atomic.Bool
 	closeOnce  sync.Once
 	closeErr   error
@@ -49,7 +51,7 @@ func New(address string) (*Client, error) {
 		return nil, err
 	}
 	store := pb.NewStoreServiceClient(connection)
-	client := &Client{connection: connection, store: store, lanes: newLanePool(store)}
+	client := &Client{connection: connection, store: store, lanes: newLanePool(store), resends: newResendBudget()}
 	return client, nil
 }
 
@@ -104,7 +106,8 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 // ReadOne and the other single-record Client methods share a bounded set of
 // long-lived streams with concurrent calls of this Client. A canceled call
 // stops waiting and cancels only its own record, which may still take effect
-// if it is already executing.
+// if it is already executing. A record a server refused before it began is
+// sent again, up to four sends within the caller's deadline.
 func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
 	client, err := c.storeClient()
 	if err != nil {
@@ -117,15 +120,18 @@ func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResu
 	operation := &pb.Command_Read{Read: options.Request}
 	command := &pb.Command{Operation: operation}
 	key := laneKey{store: options.StoreName, read: true}
-	event, shared, err := c.lanes.execute(ctx, key, command)
-	if !shared {
-		result, err := ReadOne(ctx, client, options)
-		return result, callError(ctx, err)
+	send := func() (*ReadResult, error) {
+		event, shared, err := c.lanes.execute(ctx, key, command)
+		if !shared {
+			result, err := ReadOne(ctx, client, options)
+			return result, callError(ctx, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return readResult(event.GetReadResult()), nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return readResult(event.GetReadResult()), nil
+	return resendRefused(ctx, c, readRefused, send)
 }
 
 func (c *Client) Create(ctx context.Context, options WriteOptions) (*MutationResult, error) {
@@ -169,15 +175,18 @@ func (c *Client) mutateOne(ctx context.Context, store string, request *MutateReq
 	operation := &pb.Command_Mutate{Mutate: mutation}
 	command := &pb.Command{Operation: operation}
 	key := laneKey{store: store}
-	event, shared, err := c.lanes.execute(ctx, key, command)
-	if !shared {
-		result, err := mutateOne(ctx, client, batch)
-		return result, callError(ctx, err)
+	send := func() (*MutationResult, error) {
+		event, shared, err := c.lanes.execute(ctx, key, command)
+		if !shared {
+			result, err := mutateOne(ctx, client, batch)
+			return result, callError(ctx, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return event.GetMutationResult(), nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return event.GetMutationResult(), nil
+	return resendRefused(ctx, c, mutationRefused, send)
 }
 
 // callError reports a call that ended with its context as the context's error,
@@ -196,12 +205,15 @@ func callError(ctx context.Context, err error) error {
 	return err
 }
 
+// Native sends the request again only when a server refused it with
+// NativeNotStarted before any response.
 func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
 	client, err := c.storeClient()
 	if err != nil {
 		return nil, err
 	}
-	return Native(ctx, client, options)
+	send := func() (*NativeResult, error) { return Native(ctx, client, options) }
+	return resendRefused(ctx, c, nativeRefused, send)
 }
 
 // Close cancels active requests and closes the connection. Concurrent and

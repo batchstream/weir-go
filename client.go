@@ -1,5 +1,6 @@
 // Package weir sends typed business requests to the Stores hosted behind one
-// Weir application address. Business RPCs are never automatically replayed.
+// Weir application address. A Client sends a record again only when a server
+// refused it before it began; nothing that may have taken effect is resent.
 package weir
 
 import (

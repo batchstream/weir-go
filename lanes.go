@@ -536,15 +536,10 @@ func (l *lane) deliver(response *pb.ExecuteResponse) error {
 // backend, could not take it: a draining or overloaded server, or an
 // unavailable backend.
 func refusesWork(event *pb.Event) bool {
-	failure := event.GetReadResult().GetFailure()
 	if result := event.GetMutationResult(); result != nil {
-		if result.GetOutcome() != pb.MutationOutcome_NOT_STARTED {
-			return false
-		}
-		failure = result.GetFailure()
+		return mutationRefused(result)
 	}
-	code := failure.GetCode()
-	return code == pb.FailureCode_UNAVAILABLE || code == pb.FailureCode_RESOURCE_EXHAUSTED
+	return refusal(event.GetReadResult().GetFailure())
 }
 
 // quietLocked lets a closing stream half-close once nothing is queued or
