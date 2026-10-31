@@ -13,9 +13,9 @@ import (
 // A Client sends a record again when a server refused it before it began, as
 // a draining or memory-pressured server or an unavailable backend does: a
 // mutation NOT_STARTED, a failed read or a Native NOT_STARTED whose Failure is
-// UNAVAILABLE or RESOURCE_EXHAUSTED. Such a record took no effect, so sending
-// it again cannot apply it twice. Every other result reaches the caller as it
-// came.
+// UNAVAILABLE. Such a record took no effect, so sending it again cannot apply
+// it twice. RESOURCE_EXHAUSTED reports a budget of the request itself, which a
+// resend would exceed again. Every other result reaches the caller as it came.
 const (
 	// resendAttempts bounds the sends of one record, the first included.
 	resendAttempts = 4
@@ -64,7 +64,9 @@ func (b *resendBudget) spend(records int) int {
 
 // resend reports how many of records refused records may be sent as the
 // given attempt, after waiting its backoff. It covers none once the attempts
-// or the budget run out, or when the caller's context would end first.
+// or the budget run out, or when the caller's deadline would not leave the
+// longest wait again for the send, which could otherwise turn a refusal into
+// a deadline error that may have taken effect.
 func (c *Client) resend(ctx context.Context, attempt, records int) int {
 	if c.resends == nil || attempt > resendAttempts || records == 0 {
 		return 0
@@ -75,7 +77,7 @@ func (c *Client) resend(ctx context.Context, attempt, records int) int {
 	}
 	longest := resendBackoff << (attempt - 2)
 	wait := longest/2 + rand.N(longest/2+1)
-	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) <= wait {
+	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) <= wait+longest {
 		c.resends.earn(covered * resendShare)
 		return 0
 	}
@@ -125,11 +127,10 @@ func (c *Client) resendBatch(ctx context.Context, refused func() []int, send fun
 	}
 }
 
-// refusal reports a Failure with which a server turns away work before it
-// begins.
+// refusal reports a Failure with which a server turns away work it may take
+// later.
 func refusal(failure *pb.Failure) bool {
-	code := failure.GetCode()
-	return code == pb.FailureCode_UNAVAILABLE || code == pb.FailureCode_RESOURCE_EXHAUSTED
+	return failure.GetCode() == pb.FailureCode_UNAVAILABLE
 }
 
 func mutationRefused(result *MutationResult) bool {

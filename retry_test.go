@@ -181,16 +181,16 @@ func TestResendsNeverOutlastTheCallerDeadline(t *testing.T) {
 	if _, err := refusingPut(t.Context(), client, "records/s:warm"); err != nil {
 		t.Fatal(err)
 	}
-	// Four sends wait up to 350ms between them; the deadline leaves room for
-	// at most three.
+	// The second send waits at most 50ms and leaves at least 50ms for itself;
+	// a third would need 150ms.
 	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Millisecond)
 	defer cancel()
 	result, err := refusingPut(ctx, client, "records/s:write")
 	if err != nil || result.GetOutcome() != MutationNotStarted {
 		t.Fatal("refusal within the deadline was not returned", result, err)
 	}
-	if ctx.Err() != nil || peer.sent("records/s:write") >= resendAttempts {
-		t.Fatal("resends waited past the deadline", ctx.Err(), peer.sent("records/s:write"))
+	if ctx.Err() != nil || peer.sent("records/s:write") != 2 {
+		t.Fatal("resends did not fit the deadline", ctx.Err(), peer.sent("records/s:write"))
 	}
 }
 
@@ -280,9 +280,10 @@ func TestResendBudgetAllowsATenthOfFirstSendsPlusABurst(t *testing.T) {
 
 func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 	unavailable := protocol.Fail(pb.FailureCode_UNAVAILABLE, "store draining")
-	exhausted := protocol.Fail(pb.FailureCode_RESOURCE_EXHAUSTED, "process overloaded")
+	exhausted := protocol.Fail(pb.FailureCode_RESOURCE_EXHAUSTED, "result exceeds the message size limit")
 	invalid := protocol.Fail(pb.FailureCode_INVALID_ARGUMENT, "invalid record")
-	refusedRead := &ReadResult{Failure: exhausted}
+	refusedRead := &ReadResult{Failure: unavailable}
+	exhaustedRead := &ReadResult{Failure: exhausted}
 	invalidRead := &ReadResult{Failure: invalid}
 	missingRead := &ReadResult{Missing: true}
 	refusedNative := &NativeResult{Completion: NativeNotStarted, Failure: unavailable}
@@ -294,11 +295,12 @@ func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 		want    bool
 	}{
 		{"draining mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, unavailable)), true},
-		{"overloaded mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, exhausted)), true},
+		{"exhausted mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, exhausted)), false},
 		{"invalid mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, invalid)), false},
 		{"unknown mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_UNKNOWN, unavailable)), false},
 		{"missing mutation result", mutationRefused(nil), false},
 		{"refused read", readRefused(refusedRead), true},
+		{"exhausted read", readRefused(exhaustedRead), false},
 		{"invalid read", readRefused(invalidRead), false},
 		{"missing read", readRefused(missingRead), false},
 		{"refused Native", nativeRefused(refusedNative), true},
