@@ -353,7 +353,8 @@ Failure and nil positions, and every Go error reach the caller unchanged.
 A record is sent at most four times. The wait before each resend is jittered
 between half and all of 50 ms, 100 ms and then 200 ms. A resend is made only
 when the context deadline leaves that longest wait again for the send after
-it, so a refusal is not turned into a deadline error. Resends across a Client stay
+it. A resend that still outlasts the deadline ends with the deadline error,
+and that record may have taken effect. Resends across a Client stay
 within one per ten first sends plus a burst of 100, so a server that refuses
 everything never receives several times its normal traffic. `Read` and `Mutate`
 resend refused positions in a new stream only after the first stream ended
