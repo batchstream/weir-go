@@ -342,23 +342,27 @@ connection lifetime.
 
 A Client sends a record again when a server refused it before it began: a
 `MutationNotStarted` mutation, a read Failure, or a `NativeNotStarted` without a
-Response, whose Failure code is `FailureUnavailable` or
-`FailureResourceExhausted`. A replica draining for a rolling restart, a replica
-under memory pressure and an unavailable backend refuse this way. Such a record
-took no effect, so sending it again cannot apply it twice. Every other result,
-including UNKNOWN, NOT_APPLIED, APPLIED with a Failure and nil positions, and
-every Go error reach the caller unchanged.
+Response, whose Failure code is `FailureUnavailable`. A replica draining for a
+rolling restart, a replica under memory pressure and an unavailable backend
+refuse this way. Such a record took no effect, so sending it again cannot apply
+it twice. `FailureResourceExhausted` reports that the request exceeded a budget
+of its own, such as a result over the message size limit, which a resend would
+exceed again. Every other result, including UNKNOWN, NOT_APPLIED, APPLIED with a
+Failure and nil positions, and every Go error reach the caller unchanged.
 
 A record is sent at most four times. The wait before each resend is jittered
-between half and all of 50 ms, 100 ms and then 200 ms, and a resend whose wait
-would pass the context deadline is not made. Resends across a Client stay
+between half and all of 50 ms, 100 ms and then 200 ms. A resend is made only
+when the context deadline leaves that longest wait again for the send after
+it, so a refusal is not turned into a deadline error. Resends across a Client stay
 within one per ten first sends plus a burst of 100, so a server that refuses
 everything never receives several times its normal traffic. `Read` and `Mutate`
 resend refused positions in a new stream only after the first stream ended
 without an error. `Mutate` resends a refused mutation only when every later
 request for the same resource was refused too, so each resource's mutations
 still apply in input order. A record still refused at the end keeps its
-NOT_STARTED evidence, and the caller may send it again. `ReadStream`,
+NOT_STARTED evidence. The caller may send it again, unless a later request for
+the same resource in that call did not end NOT_STARTED; sending it then would
+apply it after that request. `ReadStream`,
 `MutateStream` and the package operation functions never resend. Use caller
 deadlines; they bound resends as well as calls.
 
