@@ -50,7 +50,9 @@ reconnect. A server that does not host the requested Store fails the call with
 NotFound. Reuse the client across goroutines and close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A single-record call whose context ends returns the
-context's error. Business requests are never replayed.
+context's error. A Client sends a record again only when a server refused it
+before it began, as described under
+[Resending refused records](#resending-refused-records).
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
@@ -154,8 +156,10 @@ application knowledge and never automatically replay writes.
 
 Requests and responses reject unknown protobuf fields recursively. FailureCode
 accepts only declared nonzero values. The SDK validates required result variants,
-completion evidence, document envelopes and indexes. A known Failure never
-authorizes a retry or changes confirmed MutationApplied evidence.
+completion evidence, document envelopes and indexes. A Failure leads to a
+resend only as described under
+[Resending refused records](#resending-refused-records), and never changes
+confirmed MutationApplied evidence.
 A malformed later response preserves previously confirmed results.
 
 ### Lua transforms
@@ -255,8 +259,9 @@ means it started without a complete response and establishes no write outcome.
 NativeCompletionUnconfirmed means no terminal was received; Response may still be
 available. NativeResponseComplete means all response bytes arrived. Its status/body
 can report a backend error such as HTTP 404 with no Go error; interpret that data
-separately. A validated terminal is retained alongside a later RPC error. No Native
-request is automatically replayed.
+separately. A validated terminal is retained alongside a later RPC error. A
+Client sends a Native request again only after a refused NativeNotStarted without
+a Response.
 
 ## Streaming and deadlines
 
@@ -327,14 +332,35 @@ long-running clients, and idle streams close after 10 seconds. Shared streams do
 not carry outgoing gRPC metadata from a call's context; package operation
 functions keep one stream per call and send it.
 
-Use caller deadlines. Business operations have no implicit retry or failover;
-a caller may send a `MutationNotStarted` record again, such as one a rolling
-restart refused, because it never began.
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
 operation functions accept a generated StoreService client for custom
 connections and protocol fixtures; ordinary applications use New and typed Client
 methods. `Dial` accepts any gRPC target; the caller owns its validation and the
 connection lifetime.
+
+### Resending refused records
+
+A Client sends a record again when a server refused it before it began: a
+`MutationNotStarted` mutation, a read Failure, or a `NativeNotStarted` without a
+Response, whose Failure code is `FailureUnavailable` or
+`FailureResourceExhausted`. A replica draining for a rolling restart, a replica
+under memory pressure and an unavailable backend refuse this way. Such a record
+took no effect, so sending it again cannot apply it twice. Every other result,
+including UNKNOWN, NOT_APPLIED, APPLIED with a Failure and nil positions, and
+every Go error reach the caller unchanged.
+
+A record is sent at most four times. The wait before each resend is jittered
+between half and all of 50 ms, 100 ms and then 200 ms, and a resend whose wait
+would pass the context deadline is not made. Resends across a Client stay
+within one per ten first sends plus a burst of 100, so a server that refuses
+everything never receives several times its normal traffic. `Read` and `Mutate`
+resend refused positions in a new stream only after the first stream ended
+without an error. `Mutate` resends a refused mutation only when every later
+request for the same resource was refused too, so each resource's mutations
+still apply in input order. A record still refused at the end keeps its
+NOT_STARTED evidence, and the caller may send it again. `ReadStream`,
+`MutateStream` and the package operation functions never resend. Use caller
+deadlines; they bound resends as well as calls.
 
 ## Examples and validation
 
@@ -351,7 +377,7 @@ go vet ./...
 Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption,
-completion/cancellation, no replay and deadline admission. It also checks that
+completion/cancellation, refusal-only resends and deadline admission. It also checks that
 the module graph does not contain the Weir server, that `go.mod` replaces no
 module and that the protocol is a released `vMAJOR.MINOR.PATCH` version.
 
