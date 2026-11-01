@@ -6,7 +6,7 @@ the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.19.0
+go get github.com/batchstream/weir-go@v0.22.0
 ```
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.17.0`
@@ -54,6 +54,19 @@ stops resolving at least a few seconds before it stops taking records, as the
 Weir chart's preStop delay arranges. A server that does not host the requested
 Store fails the call with NotFound. Reuse the client across goroutines and
 close it after callers finish.
+
+In Kubernetes, give the Service's full name with a trailing dot, such as
+`weir.application.svc.cluster.local.:7447`. Without the dot, a name with fewer
+than five dots is first tried under each of the Pod's DNS search domains, so
+every lookup sends several more queries before the real one; with many Clients
+looking up every 5 seconds, that load lands on the cluster DNS.
+
+A Client pings a server it has heard nothing from for 10 seconds and drops the
+connection if no answer comes within 5 seconds, so calls leave a server they
+can no longer reach, such as one behind a broken network path or a hung
+process, even while its name still resolves. Calls waiting on that connection
+end with an error, and a mutation sent on it has an unknown outcome. Weir
+servers accept these pings.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A single-record call whose context ends returns the
 context's error. A Client sends a record again only when a server refused it
