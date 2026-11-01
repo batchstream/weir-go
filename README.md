@@ -44,10 +44,16 @@ the address must host the Stores the client uses. Each Read, Mutate, stream or
 Native call opens its own stream; single-record calls share streams, as
 described under [Streaming and deadlines](#streaming-and-deadlines). Use a name
 that lists every server, such as a Kubernetes headless Service; a ClusterIP
-Service resolves to one virtual IP. The client re-resolves the name only after a
-connection fails, so servers added later receive calls once existing connections
-reconnect. A server that does not host the requested Store fails the call with
-NotFound. Reuse the client across goroutines and close it after callers finish.
+Service resolves to one virtual IP. The Client looks the name up again every 5
+seconds. A server that joins receives new calls once connected, and shared
+streams move to it until every server carries about the same number. A server
+that stops resolving, as a Kubernetes Pod does once it starts terminating,
+receives no new calls; its streams finish the records they carry and close. So
+scaling a headless Service up or down does not fail calls, provided a server
+stops resolving at least a few seconds before it stops taking records, as the
+Weir chart's preStop delay arranges. A server that does not host the requested
+Store fails the call with NotFound. Reuse the client across goroutines and
+close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A single-record call whose context ends returns the
 context's error. A Client sends a record again only when a server refused it
@@ -327,10 +333,11 @@ and a draining server's streams end. When every stream of a Store has refused,
 a fresh stream looks for a server that is not refusing; once that stream is
 refused too, as when the backend is unavailable everywhere, the refusing streams
 keep carrying calls and the next fresh stream opens 10 seconds later.
-Streams retire after a minute, which lets the server's connection age rebalance
-long-running clients, and idle streams close after 10 seconds. Shared streams do
-not carry outgoing gRPC metadata from a call's context; package operation
-functions keep one stream per call and send it.
+Shared streams do not move to a server that refused a record within those 10
+seconds. Streams retire after a minute, which lets the server's connection age
+rebalance clients behind one virtual IP, and idle streams close after 10
+seconds. Shared streams do not carry outgoing gRPC metadata from a call's
+context; package operation functions keep one stream per call and send it.
 
 `Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
 operation functions accept a generated StoreService client for custom
