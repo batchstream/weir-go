@@ -38,20 +38,34 @@ type Client struct {
 	closeErr   error
 }
 
+// Service configs of a Client's own connection and of Dial's.
+const (
+	endpointConfig   = `{"loadBalancingConfig":[{"weir_endpoints":{}}]}`
+	roundRobinConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
+)
+
 // New returns a Client for a Weir application address such as "weir:7447".
 // The address is a host name or IP literal with an explicit port. The Client
 // connects on first use and reconnects after failures. A DNS name that
-// resolves to several servers spreads streams across them.
+// resolves to several servers, such as a headless Service, spreads streams
+// across them. The Client looks the name up every five seconds: a server
+// that joins takes its share of streams, and one that stops resolving gets
+// no new records while its streams finish the ones they carry.
 func New(address string) (*Client, error) {
 	if err := validateAddress(address); err != nil {
 		return nil, err
 	}
-	connection, err := Dial(address)
+	servers := &endpoints{}
+	builder := &endpointResolverBuilder{endpoints: servers, lookup: net.DefaultResolver.LookupHost, interval: resolveInterval, spacing: resolveSpacing}
+	options := append(connectionOptions(endpointConfig), grpc.WithResolvers(builder))
+	connection, err := grpc.NewClient(endpointScheme+":///"+address, options...)
 	if err != nil {
 		return nil, err
 	}
 	store := pb.NewStoreServiceClient(connection)
-	client := &Client{connection: connection, store: store, lanes: newLanePool(store), resends: newResendBudget()}
+	lanes := newLanePool(store, servers)
+	servers.onLeave(lanes.leave)
+	client := &Client{connection: connection, store: store, lanes: lanes, resends: newResendBudget()}
 	return client, nil
 }
 
@@ -59,7 +73,7 @@ func New(address string) (*Client, error) {
 // package-level operation functions. The caller owns target validation and
 // the connection's lifetime.
 func Dial(target string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(target, connectionOptions()...)
+	return grpc.NewClient(target, connectionOptions(roundRobinConfig)...)
 }
 
 func validateAddress(address string) error {
@@ -85,11 +99,11 @@ func validHostname(host string) bool {
 	return true
 }
 
-func connectionOptions() []grpc.DialOption {
+func connectionOptions(serviceConfig string) []grpc.DialOption {
 	options := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
 		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
-		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
+		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithMaxHeaderListSize(^uint32(0)),
 		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes)),
 	}

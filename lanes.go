@@ -14,6 +14,7 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -61,6 +62,15 @@ type lanePool struct {
 	client pb.StoreServiceClient
 	ctx    context.Context
 	cancel context.CancelFunc
+	// endpoints is the Client's view of its servers; nil spreads streams by
+	// turns alone.
+	endpoints *endpoints
+	// turn rotates which of equally used servers a new stream asks for.
+	turn atomic.Uint32
+	// refusals holds when each server last refused a record, so streams do
+	// not move to a server that is shedding records.
+	refusalsMu sync.Mutex
+	refusals   map[string]time.Time
 
 	mu     sync.Mutex
 	groups map[laneKey]*laneGroup
@@ -74,9 +84,9 @@ type laneGroup struct {
 	probeRefused time.Time
 }
 
-func newLanePool(client pb.StoreServiceClient) *lanePool {
+func newLanePool(client pb.StoreServiceClient, servers *endpoints) *lanePool {
 	ctx, cancel := context.WithCancel(context.Background())
-	pool := &lanePool{client: client, ctx: ctx, cancel: cancel, groups: make(map[laneKey]*laneGroup)}
+	pool := &lanePool{client: client, ctx: ctx, cancel: cancel, endpoints: servers, refusals: make(map[string]time.Time), groups: make(map[laneKey]*laneGroup)}
 	return pool
 }
 
@@ -120,6 +130,8 @@ type lane struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	expires time.Time
+	// address is the server the stream reached, when the connection reports it.
+	address string
 	// load counts reserved, queued and outstanding records. Only open, before
 	// the stream is shared, and the pool, under its lock, increase it.
 	load atomic.Int64
@@ -188,7 +200,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		var expired []*lane
 		live := group.lanes[:0]
 		for _, candidate := range group.lanes {
-			if now.After(candidate.expires) {
+			if now.After(candidate.expires) || !p.endpoints.resolves(candidate.address) {
 				expired = append(expired, candidate)
 				continue
 			}
@@ -214,19 +226,28 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 			}
 			live = healthy
 		}
+		opening := group.opening
+		// A new stream asks for the server with the fewest. While another
+		// server has two more, one of its streams moves there, so a replica
+		// that joins takes its share without waiting for streams to expire.
+		target, crowded := spread(live, p.calm(now), p.turn.Add(1))
+		move := chosen != nil && crowded != nil && opening == nil
+		if move {
+			live = slices.DeleteFunc(live, func(candidate *lane) bool { return candidate == crowded })
+			expired = append(expired, crowded)
+		}
 		clear(group.lanes[len(live):])
 		group.lanes = live
 		load := int64(laneRecords)
 		if chosen != nil {
 			load = chosen.load.Load()
 		}
-		opening := group.opening
 		// While every stream is cooling, a fresh stream probes unless a probe
 		// was refused within the cooldown. With a healthy stream, overflow
 		// uses streams of its own.
 		probe := chosen == nil && cooling != nil && now.Sub(group.probeRefused) >= laneCooldown
 		grow := chosen == nil && cooling == nil || chosen != nil && load >= laneOpenAt
-		open := (probe || grow) && len(live) < maxLanes && opening == nil
+		open := move || (probe || grow) && len(live) < maxLanes && opening == nil
 		// Cooling streams take records only when no stream is healthy.
 		if !open && chosen == nil && cooling != nil {
 			chosen, load = cooling, cooling.load.Load()
@@ -242,7 +263,8 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		}
 		switch {
 		case open:
-			return p.open(ctx, key, group, probe)
+			opening := laneOpening{key: key, group: group, probing: probe, target: target}
+			return p.open(ctx, opening)
 		case load < laneRecords:
 			return chosen, nil
 		case opening == nil:
@@ -256,12 +278,26 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 	}
 }
 
-// open starts a stream for group and reserves its first record slot.
-func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup, probing bool) (*lane, error) {
+// laneOpening describes the stream reserve decided to open.
+type laneOpening struct {
+	key     laneKey
+	group   *laneGroup
+	probing bool
+	// target is the server to ask for; empty takes servers in turn.
+	target string
+}
+
+// open starts a stream for a group and reserves its first record slot.
+func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error) {
+	key, group := opening.key, opening.group
 	laneCtx, cancel := context.WithCancel(p.ctx)
+	streamCtx := laneCtx
+	if opening.target != "" {
+		streamCtx = context.WithValue(laneCtx, endpointPreference, opening.target)
+	}
 	// The opening caller's cancellation bounds connection establishment only.
 	stop := context.AfterFunc(ctx, cancel)
-	stream, err := p.client.Execute(laneCtx, grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxRetryRPCBufferSize(0))
+	stream, err := p.client.Execute(streamCtx, grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxRetryRPCBufferSize(0))
 	if err == nil {
 		// Calling Context commits this attempt, disabling transparent write replay.
 		_ = stream.Context()
@@ -270,7 +306,11 @@ func (p *lanePool) open(ctx context.Context, key laneKey, group *laneGroup, prob
 	var opened *lane
 	if stopped && err == nil {
 		now := time.Now()
-		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), probing: probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
+		address := ""
+		if reached, ok := peer.FromContext(stream.Context()); ok && reached.Addr != nil {
+			address = reached.Addr.String()
+		}
+		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), address: address, probing: opening.probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
 		opened.load.Store(1)
 		go opened.receive()
 		go opened.write()
@@ -511,6 +551,7 @@ func (l *lane) deliver(response *pb.ExecuteResponse) error {
 	// would look least loaded and attract more records.
 	if refusesWork(response.Event) {
 		l.refused.Store(time.Now().UnixNano())
+		l.pool.refusedBy(l.address)
 		if l.probing {
 			l.pool.refuseProbes(l.key)
 		}
@@ -642,6 +683,97 @@ func (p *lanePool) refuseProbes(key laneKey) {
 	if group := p.groups[key]; group != nil {
 		group.probeRefused = time.Now()
 	}
+}
+
+// leave drains the streams to servers that stopped resolving. A scaled-down
+// replica stops resolving before it begins refusing records, so its streams
+// finish what they carry and no record is refused.
+func (p *lanePool) leave(gone []string) {
+	p.mu.Lock()
+	var leaving []*lane
+	for _, group := range p.groups {
+		group.lanes = slices.DeleteFunc(group.lanes, func(candidate *lane) bool {
+			if !slices.Contains(gone, candidate.address) {
+				return false
+			}
+			leaving = append(leaving, candidate)
+			return true
+		})
+	}
+	p.mu.Unlock()
+	for _, retired := range leaving {
+		retired.drain()
+	}
+}
+
+// refusedBy records that a server refused a record.
+func (p *lanePool) refusedBy(address string) {
+	if address == "" {
+		return
+	}
+	now := time.Now()
+	p.refusalsMu.Lock()
+	defer p.refusalsMu.Unlock()
+	p.refusals[address] = now
+	for server, refused := range p.refusals {
+		if now.Sub(refused) >= laneCooldown {
+			delete(p.refusals, server)
+		}
+	}
+}
+
+// calm returns the usable servers that have not refused a record within the
+// cooldown.
+func (p *lanePool) calm(now time.Time) []string {
+	servers := p.endpoints.usable()
+	p.refusalsMu.Lock()
+	defer p.refusalsMu.Unlock()
+	return slices.DeleteFunc(servers, func(address string) bool {
+		refused, ok := p.refusals[address]
+		return ok && now.Sub(refused) < laneCooldown
+	})
+}
+
+// spread returns the server with the fewest streams, starting the search at
+// turn so ties rotate. While the server with the most has two more, it also
+// returns that server's least loaded stream to move.
+func spread(live []*lane, servers []string, turn uint32) (string, *lane) {
+	if len(servers) == 0 {
+		return "", nil
+	}
+	counts := make(map[string]int, len(servers))
+	for _, address := range servers {
+		counts[address] = 0
+	}
+	for _, candidate := range live {
+		if _, ok := counts[candidate.address]; ok {
+			counts[candidate.address]++
+		}
+	}
+	start := int(turn % uint32(len(servers)))
+	emptiest, busiest := servers[start], servers[start]
+	for i := range servers {
+		address := servers[(start+i)%len(servers)]
+		if counts[address] < counts[emptiest] {
+			emptiest = address
+		}
+		if counts[address] > counts[busiest] {
+			busiest = address
+		}
+	}
+	if counts[busiest]-counts[emptiest] < 2 {
+		return emptiest, nil
+	}
+	var crowded *lane
+	for _, candidate := range live {
+		if candidate.address != busiest {
+			continue
+		}
+		if crowded == nil || candidate.load.Load() < crowded.load.Load() {
+			crowded = candidate
+		}
+	}
+	return emptiest, crowded
 }
 
 func (p *lanePool) remove(l *lane) {

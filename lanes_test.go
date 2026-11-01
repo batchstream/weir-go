@@ -15,6 +15,7 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
@@ -137,23 +138,82 @@ func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequest
 
 func laneTestClient(t *testing.T, peers ...*laneTestPeer) *Client {
 	t.Helper()
-	builder := manual.NewBuilderWithScheme("weirlanes")
-	addresses := make([]resolver.Address, len(peers))
-	for i, peer := range peers {
-		address := laneTestListen(t, peer)
-		addresses[i] = resolver.Address{Addr: address}
+	client, _ := laneTestResolved(t, peers...)
+	return client
+}
+
+// laneTestServers resolves a lane test Client's address to chosen servers.
+type laneTestServers struct {
+	resolver  *manual.Resolver
+	endpoints *endpoints
+	addresses []string
+}
+
+func (s *laneTestServers) state(addresses ...string) resolver.State {
+	state := resolver.State{Addresses: make([]resolver.Address, len(addresses))}
+	if s.endpoints != nil {
+		state.Attributes = attributes.New(endpointsAttribute, s.endpoints)
 	}
-	state := resolver.State{Addresses: addresses}
-	builder.InitialState(state)
-	options := append(connectionOptions(), grpc.WithResolvers(builder))
+	for i, address := range addresses {
+		state.Addresses[i] = resolver.Address{Addr: address}
+	}
+	return state
+}
+
+func (s *laneTestServers) resolve(addresses ...string) {
+	s.resolver.UpdateState(s.state(addresses...))
+}
+
+// laneTestResolved returns a Client whose address resolves to every peer.
+func laneTestResolved(t *testing.T, peers ...*laneTestPeer) (*Client, *laneTestServers) {
+	t.Helper()
+	servers := &laneTestServers{resolver: manual.NewBuilderWithScheme("weirlanes"), endpoints: &endpoints{}}
+	client := laneTestDial(t, servers, peers)
+	return client, servers
+}
+
+// laneTestInTurn returns a Client that takes the peers in turn without knowing
+// which one a stream reached, as when they share one load-balanced address.
+func laneTestInTurn(t *testing.T, peers ...*laneTestPeer) *Client {
+	t.Helper()
+	servers := &laneTestServers{resolver: manual.NewBuilderWithScheme("weirlanes")}
+	return laneTestDial(t, servers, peers)
+}
+
+func laneTestDial(t *testing.T, servers *laneTestServers, peers []*laneTestPeer) *Client {
+	t.Helper()
+	for _, peer := range peers {
+		servers.addresses = append(servers.addresses, laneTestListen(t, peer))
+	}
+	servers.resolver.InitialState(servers.state(servers.addresses...))
+	options := append(connectionOptions(endpointConfig), grpc.WithResolvers(servers.resolver))
 	connection, err := grpc.NewClient("weirlanes:///records", options...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := pb.NewStoreServiceClient(connection)
-	client := &Client{connection: connection, store: store, lanes: newLanePool(store)}
+	lanes := newLanePool(store, servers.endpoints)
+	if servers.endpoints != nil {
+		servers.endpoints.onLeave(lanes.leave)
+	}
+	client := &Client{connection: connection, store: store, lanes: lanes}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+// laneTestStreams counts the write streams taking records on each server.
+func laneTestStreams(client *Client) map[string]int {
+	pool := client.lanes
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	counts := make(map[string]int)
+	key := laneKey{store: "records"}
+	if group := pool.groups[key]; group != nil {
+		for _, open := range group.lanes {
+			counts[open.address]++
+		}
+	}
+	return counts
 }
 
 func laneTestListen(t *testing.T, peer *laneTestPeer) string {
@@ -481,9 +541,11 @@ func TestLoneStreamMovesOffADrainingServerAtOnce(t *testing.T) {
 	}
 }
 
+// A Client that knows its servers probes one that has not refused; behind one
+// address, a probe can still reach the draining server.
 func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
-	client := laneTestClient(t, first, second)
+	client := laneTestInTurn(t, first, second)
 	before := laneTestReady(t, client, first, second)
 	if _, err := lanePut(t.Context(), client, "records/s:first", 16); err != nil {
 		t.Fatal(err)
@@ -628,5 +690,161 @@ func TestLaneSendsWhatIsQueuedInOneMessageWithinItsByteBound(t *testing.T) {
 	}
 	if l.load.Load() != 3 || len(l.outstanding) != 4 {
 		t.Fatal("packed records were not tracked", l.load.Load(), len(l.outstanding))
+	}
+}
+
+// laneTestHold starts calls whose records the peers hold until released, one
+// at a time so that every laneOpenAt records open one stream, and returns a
+// channel of each call's error.
+func laneTestHold(t *testing.T, client *Client, calls int) <-chan error {
+	t.Helper()
+	results := make(chan error, calls)
+	for i := range calls {
+		go func() {
+			result, err := lanePut(t.Context(), client, "records/s:held", 16)
+			if err == nil && result.GetOutcome() != MutationApplied {
+				err = fmt.Errorf("held record was not applied: %v", result)
+			}
+			results <- err
+		}()
+		deadline := time.Now().Add(2 * time.Second)
+		for laneTestHeld(client) <= i {
+			if time.Now().After(deadline) {
+				t.Fatal("held record did not reach a shared stream", i)
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
+	return results
+}
+
+// laneTestHeld counts the records the write streams carry.
+func laneTestHeld(client *Client) int {
+	pool := client.lanes
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	held := 0
+	key := laneKey{store: "records"}
+	if group := pool.groups[key]; group != nil {
+		for _, open := range group.lanes {
+			held += int(open.load.Load())
+		}
+	}
+	return held
+}
+
+func TestStreamsLeaveAServerThatStopsResolving(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client, servers := laneTestResolved(t, first, second)
+	laneTestReady(t, client, first, second)
+	held := laneTestHold(t, client, 3*laneOpenAt)
+	if streams := laneTestStreams(client); streams[servers.addresses[1]] == 0 {
+		t.Fatal("held records did not spread across both servers", streams)
+	}
+	servers.resolve(servers.addresses[0])
+	if streams := laneTestStreams(client); streams[servers.addresses[1]] != 0 {
+		t.Fatal("streams to a server that stopped resolving still take records", streams)
+	}
+	reached := second.streams.Load()
+	for range 20 {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		if err != nil || result.GetOutcome() != MutationApplied {
+			t.Fatal("a call failed while a server left", result, err)
+		}
+	}
+	if second.streams.Load() != reached {
+		t.Fatal("a stream opened on a server that stopped resolving")
+	}
+	// Records the leaving streams carry still complete there.
+	close(first.release)
+	close(second.release)
+	for range 3 * laneOpenAt {
+		if err := <-held; err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for second.halfClose.Load() != second.streams.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("streams to the server that left did not half-close", second.halfClose.Load(), second.streams.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStreamsMoveToAServerThatJoins(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client, servers := laneTestResolved(t, first, second)
+	servers.resolve(servers.addresses[0])
+	held := laneTestHold(t, client, 4*laneOpenAt)
+	if streams := laneTestStreams(client); streams[servers.addresses[0]] != 4 {
+		t.Fatal("held records did not open four streams on the first server", streams)
+	}
+	servers.resolve(servers.addresses...)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		if err != nil || result.GetOutcome() != MutationApplied {
+			t.Fatal("a call failed while a server joined", result, err)
+		}
+		// A call before the server is ready may open one more stream on the
+		// first server, so the streams settle within one of each other.
+		streams := laneTestStreams(client)
+		moved, kept := streams[servers.addresses[1]], streams[servers.addresses[0]]
+		if moved >= 2 && kept-moved <= 1 && moved-kept <= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("streams did not move to the server that joined", streams)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Records on the streams that moved still complete on the first server.
+	close(first.release)
+	close(second.release)
+	for range 4 * laneOpenAt {
+		if err := <-held; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStreamsDoNotMoveToARefusingServer(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client, servers := laneTestResolved(t, first, second)
+	laneTestReady(t, client, first, second)
+	// Held records leave three streams, two on one server.
+	held := laneTestHold(t, client, 3*laneOpenAt)
+	refusing, address := first, servers.addresses[0]
+	if streams := laneTestStreams(client); streams[address] != 1 {
+		refusing, address = second, servers.addresses[1]
+	}
+	refusing.draining.Store(true)
+	opened := refusing.streams.Load()
+	refused := 0
+	for range 200 {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.GetOutcome() != MutationApplied {
+			refused++
+		}
+	}
+	// The server keeps resolving and has the fewest streams, so the next
+	// stream goes there once. After its refusal no stream moves back.
+	if refused != 1 || refusing.streams.Load() != opened+1 {
+		t.Fatal("streams kept moving to a refusing server", refused, refusing.streams.Load()-opened)
+	}
+	if streams := laneTestStreams(client); streams[address] != 1 {
+		t.Fatal("a refusing server gained streams", streams)
+	}
+	refusing.draining.Store(false)
+	close(first.release)
+	close(second.release)
+	for range 3 * laneOpenAt {
+		if err := <-held; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
