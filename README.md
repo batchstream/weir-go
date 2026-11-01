@@ -54,24 +54,27 @@ stops resolving at least a few seconds before it stops taking records, as the
 Weir chart's preStop delay arranges. A server that does not host the requested
 Store fails the call with NotFound. Reuse the client across goroutines and
 close it after callers finish.
-
-In Kubernetes, give the Service's full name with a trailing dot, such as
-`weir.application.svc.cluster.local.:7447`. Without the dot, a name with fewer
-than five dots is first tried under each of the Pod's DNS search domains, so
-every lookup sends several more queries before the real one; with many Clients
-looking up every 5 seconds, that load lands on the cluster DNS.
-
-A Client pings a server it has heard nothing from for 10 seconds and drops the
-connection if no answer comes within 5 seconds, so calls leave a server they
-can no longer reach, such as one behind a broken network path or a hung
-process, even while its name still resolves. Calls waiting on that connection
-end with an error, and a mutation sent on it has an unknown outcome. Weir
-servers accept these pings.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A single-record call whose context ends returns the
 context's error. A Client sends a record again only when a server refused it
 before it began, as described under
 [Resending refused records](#resending-refused-records).
+
+In Kubernetes, give the Service's full name with a trailing dot, such as
+`weir.application.svc.cluster.local.:7447`. Without the dot, a name with fewer
+than five dots is first tried under each of the Pod's DNS search domains. In a
+Pod with four search domains, one lookup of `weir.application.svc` sends 6
+queries and `weir.application.svc.cluster.local` sends 10, against 2 with the
+dot; every Client repeats its lookup every 5 seconds.
+
+A Client pings a server it has heard nothing from for 10 seconds and drops the
+connection if no answer comes within 5 seconds, so calls leave a server they
+can no longer reach, such as one behind a broken network path or a hung
+process, even while its name still resolves. Calls waiting on that connection
+end with an error, and a mutation sent on it has an unknown outcome. Servers
+must accept pings this often, as those of the Weir chart 0.15.0-rc.1 and later
+do; an older server ends such connections, after which the Client pings less
+often for the rest of its life. Upgrade servers before Clients.
 
 Resources are canonical paths relative to `StoreName`.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
