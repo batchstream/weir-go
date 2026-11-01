@@ -45,7 +45,8 @@ func TestResolverReportsChangedServersAndKeepsThemWhenLookupsFail(t *testing.T) 
 	servers := &endpoints{}
 	builder := &endpointResolverBuilder{endpoints: servers, lookup: lookup, interval: time.Hour, spacing: time.Millisecond}
 	conn := &resolverTestConn{states: make(chan resolver.State, 8), errs: make(chan error, 8)}
-	target, err := url.Parse("weir:///weir.test:7447")
+	// The port takes the canonical form a stream's peer address has.
+	target, err := url.Parse("weir:///weir.test:07447")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -219,6 +220,12 @@ func (b *endpointResolverBuilder) Build(target resolver.Target, cc resolver.Clie
 	if err != nil {
 		return nil, err
 	}
+	// A stream's peer address has a canonical port, so the port must be too.
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	port = strconv.FormatUint(number, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	built := &endpointResolver{builder: b, cc: cc, host: host, port: port, ctx: ctx, cancel: cancel, now: make(chan struct{}, 1), done: make(chan struct{})}
 	go built.run()

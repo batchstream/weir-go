@@ -359,7 +359,8 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	for _, stream := range retired {
 		stream.drain()
 	}
-	if err != nil {
+	// The opening caller's cancellation says nothing about the server.
+	if status.Code(err) == codes.Unavailable {
 		p.refusedBy(opening.target)
 	}
 	return opened, err

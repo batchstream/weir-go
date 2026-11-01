@@ -40,6 +40,8 @@ type laneTestPeer struct {
 	// rejecting refuses new streams, as a draining server does before its
 	// clients learn to stop opening them.
 	rejecting atomic.Bool
+	// held counts the held records that arrived.
+	held atomic.Int64
 }
 
 func newLaneTestPeer() *laneTestPeer {
@@ -113,6 +115,7 @@ func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequest
 			failure := protocol.Fail(pb.FailureCode_UNAVAILABLE, "store draining")
 			respond(request.Index, protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure))
 		case "records/s:held":
+			p.held.Add(1)
 			index := request.Index
 			canceled := make(chan struct{})
 			mu.Lock()
@@ -695,10 +698,18 @@ func TestLaneSendsWhatIsQueuedInOneMessageWithinItsByteBound(t *testing.T) {
 
 // laneTestHold starts calls whose records the peers hold until released, one
 // at a time so that every laneOpenAt records open one stream, and returns a
-// channel of each call's error.
-func laneTestHold(t *testing.T, client *Client, calls int) <-chan error {
+// channel of each call's error. It returns once every record reached a peer.
+func laneTestHold(t *testing.T, client *Client, calls int, peers ...*laneTestPeer) <-chan error {
 	t.Helper()
 	results := make(chan error, calls)
+	arrived := func() int64 {
+		total := int64(0)
+		for _, peer := range peers {
+			total += peer.held.Load()
+		}
+		return total
+	}
+	start := arrived()
 	for i := range calls {
 		go func() {
 			result, err := lanePut(t.Context(), client, "records/s:held", 16)
@@ -708,9 +719,9 @@ func laneTestHold(t *testing.T, client *Client, calls int) <-chan error {
 			results <- err
 		}()
 		deadline := time.Now().Add(2 * time.Second)
-		for laneTestHeld(client) <= i {
+		for laneTestHeld(client) <= i || arrived()-start <= int64(i) {
 			if time.Now().After(deadline) {
-				t.Fatal("held record did not reach a shared stream", i)
+				t.Fatal("held record did not reach a peer on a shared stream", i)
 			}
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -737,7 +748,7 @@ func TestStreamsLeaveAServerThatStopsResolving(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client, servers := laneTestResolved(t, first, second)
 	laneTestReady(t, client, first, second)
-	held := laneTestHold(t, client, 3*laneOpenAt)
+	held := laneTestHold(t, client, 3*laneOpenAt, first, second)
 	if streams := laneTestStreams(client); streams[servers.addresses[1]] == 0 {
 		t.Fatal("held records did not spread across both servers", streams)
 	}
@@ -776,7 +787,7 @@ func TestStreamsMoveToAServerThatJoins(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client, servers := laneTestResolved(t, first, second)
 	servers.resolve(servers.addresses[0])
-	held := laneTestHold(t, client, 4*laneOpenAt)
+	held := laneTestHold(t, client, 4*laneOpenAt, first, second)
 	if streams := laneTestStreams(client); streams[servers.addresses[0]] != 4 {
 		t.Fatal("held records did not open four streams on the first server", streams)
 	}
@@ -814,7 +825,7 @@ func TestStreamsDoNotMoveToARefusingServer(t *testing.T) {
 	client, servers := laneTestResolved(t, first, second)
 	laneTestReady(t, client, first, second)
 	// Held records leave three streams, two on one server.
-	held := laneTestHold(t, client, 3*laneOpenAt)
+	held := laneTestHold(t, client, 3*laneOpenAt, first, second)
 	refusing, address := first, servers.addresses[0]
 	if streams := laneTestStreams(client); streams[address] != 1 {
 		refusing, address = second, servers.addresses[1]
@@ -853,7 +864,7 @@ func TestStreamsDoNotKeepMovingToAServerThatRejectsThem(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client, servers := laneTestResolved(t, first, second)
 	servers.resolve(servers.addresses[0])
-	held := laneTestHold(t, client, 4*laneOpenAt)
+	held := laneTestHold(t, client, 4*laneOpenAt, first, second)
 	// The joining server rejects new streams, as an overloaded one does.
 	second.rejecting.Store(true)
 	servers.resolve(servers.addresses...)
