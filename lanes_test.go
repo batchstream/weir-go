@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
@@ -225,7 +226,9 @@ func laneTestListen(t *testing.T, peer *laneTestPeer) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.MaxRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxSendMsgSize(protocol.MaxTransportMessageBytes))
+	// Like Weir, accept the Client's keepalive pings.
+	pings := keepalive.EnforcementPolicy{MinTime: keepaliveTime / 2, PermitWithoutStream: true}
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxSendMsgSize(protocol.MaxTransportMessageBytes), grpc.KeepaliveEnforcementPolicy(pings))
 	pb.RegisterStoreServiceServer(server, peer)
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
@@ -16,6 +17,7 @@ import (
 	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
@@ -42,6 +44,15 @@ type Client struct {
 const (
 	endpointConfig   = `{"loadBalancingConfig":[{"weir_endpoints":{}}]}`
 	roundRobinConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
+)
+
+// A connection pings a server it has heard nothing from for keepaliveTime and
+// closes when keepaliveTimeout passes without an answer, so calls leave a
+// server they can no longer reach even while its address still resolves and
+// its connection looked ready. Weir servers accept pings this often.
+const (
+	keepaliveTime    = 10 * time.Second
+	keepaliveTimeout = 5 * time.Second
 )
 
 // New returns a Client for a Weir application address such as "weir:7447".
@@ -100,8 +111,10 @@ func validHostname(host string) bool {
 }
 
 func connectionOptions(serviceConfig string) []grpc.DialOption {
+	pings := keepalive.ClientParameters{Time: keepaliveTime, Timeout: keepaliveTimeout, PermitWithoutStream: true}
 	options := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
+		grpc.WithKeepaliveParams(pings),
 		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
 		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithMaxHeaderListSize(^uint32(0)),
