@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -285,6 +286,10 @@ func (r *endpointResolver) lookup() ([]string, error) {
 	}
 	addresses := make([]string, len(hosts))
 	for i, host := range hosts {
+		// A stream's peer address is canonical, so IP literals must be too.
+		if ip, err := netip.ParseAddr(host); err == nil {
+			host = ip.Unmap().String()
+		}
 		addresses[i] = net.JoinHostPort(host, r.port)
 	}
 	slices.Sort(addresses)

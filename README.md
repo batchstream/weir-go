@@ -333,8 +333,8 @@ and a draining server's streams end. When every stream of a Store has refused,
 a fresh stream looks for a server that is not refusing; once that stream is
 refused too, as when the backend is unavailable everywhere, the refusing streams
 keep carrying calls and the next fresh stream opens 10 seconds later.
-Shared streams do not move to a server that refused a record within those 10
-seconds. Streams retire after a minute, which lets the server's connection age
+Shared streams do not move to a server that refused a record, or rejected a
+stream before answering one, within those 10 seconds. Streams retire after a minute, which lets the server's connection age
 rebalance clients behind one virtual IP, and idle streams close after 10
 seconds. Shared streams do not carry outgoing gRPC metadata from a call's
 context; package operation functions keep one stream per call and send it.

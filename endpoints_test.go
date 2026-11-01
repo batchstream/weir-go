@@ -50,15 +50,17 @@ func TestResolverReportsChangedServersAndKeepsThemWhenLookupsFail(t *testing.T) 
 		t.Fatal(err)
 	}
 	resolverTarget := resolver.Target{URL: *target}
-	built, err := builder.Build(resolverTarget, conn, resolver.BuildOptions{})
+	buildOptions := resolver.BuildOptions{}
+	built, err := builder.Build(resolverTarget, conn, buildOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer built.Close()
+	now := resolver.ResolveNowOptions{}
 	answer := func(hosts []string, err error) {
 		reply := resolverTestAnswer{hosts: hosts, err: err}
 		answers <- reply
-		built.ResolveNow(resolver.ResolveNowOptions{})
+		built.ResolveNow(now)
 	}
 	failed := errors.New("lookup failed")
 	// A failure before any servers resolve is reported.
@@ -79,10 +81,15 @@ func TestResolverReportsChangedServersAndKeepsThemWhenLookupsFail(t *testing.T) 
 	answer([]string{"10.0.0.1", "10.0.0.2"}, nil)
 	answer(nil, failed)
 	answer(nil, nil)
-	answer([]string{"10.0.0.3"}, nil)
+	// IP literals take the canonical form a stream's peer address has.
+	answer([]string{"::ffff:10.0.0.3", "2001:DB8:0::1"}, nil)
 	state = <-conn.states
-	if len(state.Addresses) != 1 || state.Addresses[0].Addr != "10.0.0.3:7447" {
-		t.Fatal("changed servers were not reported", state.Addresses)
+	addresses = addresses[:0]
+	for _, address := range state.Addresses {
+		addresses = append(addresses, address.Addr)
+	}
+	if !slices.Equal(addresses, []string{"10.0.0.3:7447", "[2001:db8::1]:7447"}) {
+		t.Fatal("changed servers were not reported in canonical form", addresses)
 	}
 	if len(conn.errs) != 0 {
 		t.Fatal("a failed lookup was reported after servers resolved", <-conn.errs)

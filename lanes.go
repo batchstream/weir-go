@@ -14,7 +14,9 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -49,6 +51,9 @@ const (
 	// for a server that is not refusing; once a probe is refused too, the
 	// cooling streams keep carrying records for the cooldown.
 	laneCooldown = 10 * time.Second
+	// laneSpreadEvery is how often a Store's streams are compared across
+	// servers, so that one moves to a server that joined.
+	laneSpreadEvery = 100 * time.Millisecond
 )
 
 var errLaneClosed = errors.New("shared Execute stream closed")
@@ -82,6 +87,8 @@ type laneGroup struct {
 	opening chan struct{}
 	// probeRefused is when a probing stream's server last refused a record.
 	probeRefused time.Time
+	// spread is when the streams were last compared across servers.
+	spread time.Time
 }
 
 func newLanePool(client pb.StoreServiceClient, servers *endpoints) *lanePool {
@@ -140,6 +147,9 @@ type lane struct {
 	// probing marks a stream opened while every stream was cooling, until it
 	// answers a record without refusing it. Only the receiver uses it.
 	probing bool
+	// answered reports that the server answered a record. Only the receiver
+	// uses it.
+	answered bool
 	// wake asks the writer to send what is queued.
 	wake chan struct{}
 
@@ -200,7 +210,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		var expired []*lane
 		live := group.lanes[:0]
 		for _, candidate := range group.lanes {
-			if now.After(candidate.expires) || !p.endpoints.resolves(candidate.address) {
+			if now.After(candidate.expires) {
 				expired = append(expired, candidate)
 				continue
 			}
@@ -227,15 +237,6 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 			live = healthy
 		}
 		opening := group.opening
-		// A new stream asks for the server with the fewest. While another
-		// server has two more, one of its streams moves there, so a replica
-		// that joins takes its share without waiting for streams to expire.
-		target, crowded := spread(live, p.calm(now), p.turn.Add(1))
-		move := chosen != nil && crowded != nil && opening == nil
-		if move {
-			live = slices.DeleteFunc(live, func(candidate *lane) bool { return candidate == crowded })
-			expired = append(expired, crowded)
-		}
 		clear(group.lanes[len(live):])
 		group.lanes = live
 		load := int64(laneRecords)
@@ -247,7 +248,21 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		// uses streams of its own.
 		probe := chosen == nil && cooling != nil && now.Sub(group.probeRefused) >= laneCooldown
 		grow := chosen == nil && cooling == nil || chosen != nil && load >= laneOpenAt
-		open := move || (probe || grow) && len(live) < maxLanes && opening == nil
+		open := (probe || grow) && len(live) < maxLanes && opening == nil
+		// A new stream asks for the server with the fewest. While another
+		// server has two more, one of its streams moves there, so a replica
+		// that joins takes its share without waiting for streams to expire.
+		var target string
+		var crowded *lane
+		if opening == nil && (open || now.Sub(group.spread) >= laneSpreadEvery) {
+			group.spread = now
+			target, crowded = spread(live, p.calm(now), p.turn.Add(1))
+		}
+		move := !open && chosen != nil && crowded != nil
+		open = open || move
+		if !move {
+			crowded = nil
+		}
 		// Cooling streams take records only when no stream is healthy.
 		if !open && chosen == nil && cooling != nil {
 			chosen, load = cooling, cooling.load.Load()
@@ -263,7 +278,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		}
 		switch {
 		case open:
-			opening := laneOpening{key: key, group: group, probing: probe, target: target}
+			opening := laneOpening{key: key, group: group, probing: probe, target: target, replaces: crowded}
 			return p.open(ctx, opening)
 		case load < laneRecords:
 			return chosen, nil
@@ -285,6 +300,9 @@ type laneOpening struct {
 	probing bool
 	// target is the server to ask for; empty takes servers in turn.
 	target string
+	// replaces is the stream that moves to target; it drains once the new
+	// stream opens.
+	replaces *lane
 }
 
 // open starts a stream for a group and reserves its first record slot.
@@ -320,13 +338,30 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 			err = ctxErr
 		}
 	}
+	var retired []*lane
 	p.mu.Lock()
-	if opened != nil {
+	// A server that stopped resolving while the stream opened gets no
+	// records; leave has already drained its other streams.
+	switch {
+	case opened == nil:
+	case !p.endpoints.resolves(opened.address):
+		retired = append(retired, opened)
+	default:
 		group.lanes = append(group.lanes, opened)
+		if replaced := opening.replaces; replaced != nil && slices.Contains(group.lanes, replaced) {
+			group.lanes = slices.DeleteFunc(group.lanes, func(candidate *lane) bool { return candidate == replaced })
+			retired = append(retired, replaced)
+		}
 	}
 	close(group.opening)
 	group.opening = nil
 	p.mu.Unlock()
+	for _, stream := range retired {
+		stream.drain()
+	}
+	if err != nil {
+		p.refusedBy(opening.target)
+	}
 	return opened, err
 }
 
@@ -536,6 +571,11 @@ func (l *lane) receive() {
 	if errors.Is(err, io.EOF) {
 		err = errLaneClosed
 	}
+	// A server that rejects a stream before answering, as a draining or
+	// overloaded one does, counts as refusing, so no stream moves there.
+	if !l.answered && status.Code(err) == codes.Unavailable {
+		l.pool.refusedBy(l.address)
+	}
 	l.fail(err)
 }
 
@@ -543,6 +583,7 @@ func (l *lane) deliver(response *pb.ExecuteResponse) error {
 	if err := protocol.ValidateExecuteResponse(response); err != nil {
 		return err
 	}
+	l.answered = true
 	read := response.Event.GetReadResult() != nil
 	if read != l.key.read || !read && response.Event.GetMutationResult() == nil {
 		return errors.New("unexpected event on shared Execute stream")
@@ -706,7 +747,7 @@ func (p *lanePool) leave(gone []string) {
 	}
 }
 
-// refusedBy records that a server refused a record.
+// refusedBy records that a server refused a record or a stream.
 func (p *lanePool) refusedBy(address string) {
 	if address == "" {
 		return

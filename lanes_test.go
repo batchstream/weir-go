@@ -848,3 +848,38 @@ func TestStreamsDoNotMoveToARefusingServer(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamsDoNotKeepMovingToAServerThatRejectsThem(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client, servers := laneTestResolved(t, first, second)
+	servers.resolve(servers.addresses[0])
+	held := laneTestHold(t, client, 4*laneOpenAt)
+	// The joining server rejects new streams, as an overloaded one does.
+	second.rejecting.Store(true)
+	servers.resolve(servers.addresses...)
+	failed := 0
+	for range 100 {
+		result, err := lanePut(t.Context(), client, "records/s:next", 16)
+		if err == nil && result.GetOutcome() != MutationApplied {
+			t.Fatal("record was not applied", result)
+		}
+		if err != nil {
+			failed++
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Only a record on the first stream the server rejected fails.
+	if failed > 1 {
+		t.Fatal("streams kept moving to a server that rejects them", failed)
+	}
+	if streams := laneTestStreams(client); streams[servers.addresses[0]] < 3 {
+		t.Fatal("rejected moves drained the first server's streams", streams)
+	}
+	close(first.release)
+	close(second.release)
+	for range 4 * laneOpenAt {
+		if err := <-held; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
