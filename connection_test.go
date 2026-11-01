@@ -41,7 +41,7 @@ func TestConnectionSpreadsCallsAndIgnoresResolverServiceConfig(t *testing.T) {
 		state := resolver.State{Addresses: addresses, ServiceConfig: config}
 		builder.InitialState(state)
 	}
-	options := append(connectionOptions(), grpc.WithResolvers(builder))
+	options := append(connectionOptions(roundRobinConfig), grpc.WithResolvers(builder))
 	connection, err := grpc.NewClient("weirtest:///records", options...)
 	if err != nil {
 		t.Fatal(err)
