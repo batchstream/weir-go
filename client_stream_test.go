@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/batchstream/weir-protocol/api/protocol"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -169,17 +174,7 @@ func TestClientStreamMovesWhenItsStreamRetires(t *testing.T) {
 	held := openHeldStream(t.Context(), client)
 	held.input <- "records/s:a"
 	held.confirmed(t, 1)
-	pool := client.lanes
-	pool.mu.Lock()
-	for key, group := range pool.groups {
-		if key.owner == 0 {
-			continue
-		}
-		for _, stream := range group.lanes {
-			stream.expires = time.Now().Add(-time.Second)
-		}
-	}
-	pool.mu.Unlock()
+	expireOwnStreams(client)
 	held.input <- "records/s:b"
 	held.confirmed(t, 2)
 	if opened := peer.streams.Load() - before; opened != 2 {
@@ -465,5 +460,308 @@ func TestClientStreamSendsALargeRecordAlone(t *testing.T) {
 	}
 	if opened := peer.streams.Load() - before; opened != 2 {
 		t.Fatal("two large records opened", opened, "streams")
+	}
+}
+
+// expireOwnStreams makes every record stream's gRPC stream retire at its next record.
+func expireOwnStreams(client *Client) {
+	pool := client.lanes
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	for key, group := range pool.groups {
+		if key.owner == 0 {
+			continue
+		}
+		for _, stream := range group.lanes {
+			stream.expires = time.Now().Add(-time.Second)
+		}
+	}
+}
+
+func TestRefusedStreamNeedsTheServersDetail(t *testing.T) {
+	if failure := refusedStream(refusedStreamError("draining")); failure.GetCode() != FailureUnavailable || failure.GetMessage() != "draining" {
+		t.Fatal(failure)
+	}
+	for _, err := range []error{nil, errors.New("local"), status.Error(codes.Unavailable, "draining"), status.Error(codes.Internal, "other")} {
+		if failure := refusedStream(err); failure != nil {
+			t.Fatal(err, failure)
+		}
+	}
+}
+
+func TestClientStreamMovesOnWhenAServerRefusesItsNewStream(t *testing.T) {
+	first, second := newLaneTestPeer(), newLaneTestPeer()
+	client, _ := laneTestResolved(t, first, second)
+	client.resends = newResendBudget()
+	before := laneTestReady(t, client, first, second)
+	held := openHeldStream(t.Context(), client)
+	held.input <- "records/s:a"
+	held.confirmed(t, 1)
+	_, other, _ := laneTestHolder(t, before, first, second)
+	other.rejecting.Store(true)
+	const rotations = 32
+	for rotation := range rotations {
+		expireOwnStreams(client)
+		held.input <- "records/s:next"
+		if refused := held.confirmed(t, rotation+2); refused != 0 {
+			t.Fatal("a refused stream's record reached the consumer", refused)
+		}
+	}
+	if err := held.finish(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoneServerRefusingStreamsReportsItsRecordsNotStarted(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	client.resends = newResendBudget()
+	peer.rejecting.Store(true)
+	held := openHeldStream(t.Context(), client)
+	held.input <- "records/s:a"
+	if refused := held.confirmed(t, 1); refused != 1 {
+		t.Fatal("the refusal did not reach the consumer", refused)
+	}
+	held.mu.Lock()
+	result := held.results[1]
+	held.mu.Unlock()
+	if result.GetOutcome() != MutationNotStarted || result.GetFailure().GetCode() != FailureUnavailable {
+		t.Fatal(result)
+	}
+	peer.rejecting.Store(false)
+	held.input <- "records/s:b"
+	held.confirmed(t, 2)
+	if err := held.finish(t); err != nil {
+		t.Fatal(err)
+	}
+	peer.rejecting.Store(true)
+	put, err := lanePut(t.Context(), client, "records/s:c", 16)
+	if err != nil || put.GetOutcome() != MutationNotStarted {
+		t.Fatal(put, err)
+	}
+	large, err := lanePut(t.Context(), client, "records/s:large", laneRecordBytes)
+	if err != nil || large.GetOutcome() != MutationNotStarted {
+		t.Fatal("a refused stream of a large record's own", large, err)
+	}
+}
+
+// endsUnmarked ends each stream with UNAVAILABLE alone, as a lost connection does.
+type endsUnmarked struct{}
+
+func (endsUnmarked) Execute(grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	return status.Error(codes.Unavailable, "connection lost")
+}
+
+func TestUnavailableWithoutTheDetailStaysAnError(t *testing.T) {
+	client, err := New(serveForTest(t, endsUnmarked{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	result, err := lanePut(t.Context(), client, "records/s:a", 16)
+	if status.Code(err) != codes.Unavailable || result != nil {
+		t.Fatal(result, err)
+	}
+	large, err := lanePut(t.Context(), client, "records/s:large", laneRecordBytes)
+	if status.Code(err) != codes.Unavailable || large != nil {
+		t.Fatal(large, err)
+	}
+}
+
+// answerThenBreak answers records without one of them and ends its stream.
+type answerThenBreak struct {
+	want    int
+	dropped int
+}
+
+func (p *answerThenBreak) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	var indexes []uint64
+	for len(indexes) < p.want {
+		message, err := packed.Recv()
+		if err != nil {
+			return err
+		}
+		for _, request := range message.Requests {
+			if request.CancelIndex == 0 {
+				indexes = append(indexes, request.Index)
+			}
+		}
+	}
+	applied := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
+	response := &pb.ExecuteResponses{}
+	for _, index := range indexes[:len(indexes)-p.dropped] {
+		value := &pb.Event_MutationResult{MutationResult: applied}
+		event := &pb.Event{Value: value}
+		answer := &pb.ExecuteResponse{Index: index, Event: event}
+		response.Responses = append(response.Responses, answer)
+	}
+	if err := packed.Send(response); err != nil {
+		return err
+	}
+	return status.Error(codes.Unavailable, "server stopped")
+}
+
+func serveForTest(t *testing.T, peer pb.StoreServiceServer) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	pb.RegisterStoreServiceServer(server, peer)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	return listener.Addr().String()
+}
+
+func TestClientMutateKeepsResultsReceivedBeforeTheStreamBroke(t *testing.T) {
+	const count = 16
+	peer := &answerThenBreak{want: count, dropped: 1}
+	client, err := New(serveForTest(t, peer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	options := MutateOptions{StoreName: "records"}
+	for index := range count {
+		options.Requests = append(options.Requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
+	}
+	for range 50 {
+		results, err := client.Mutate(t.Context(), options)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatal(err)
+		}
+		kept := 0
+		for _, result := range results {
+			if result != nil {
+				kept++
+			}
+		}
+		if kept != count-1 {
+			t.Fatal("results the server confirmed were lost", kept)
+		}
+	}
+}
+
+func TestClientStreamConsumesAResultWaitingWhenTheStreamBreaks(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	input := make(chan string)
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	seen := make(map[uint64]bool)
+	options := MutateStreamOptions{StoreName: "records"}
+	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+		select {
+		case resource := <-input:
+			return putRequest(resource, `{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	options.Consume = func(ctx context.Context, index uint64, _ *MutationResult) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		mu.Lock()
+		seen[index] = true
+		mu.Unlock()
+		entered <- struct{}{}
+		<-release
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- client.MutateStream(t.Context(), options) }()
+	input <- "records/s:one"
+	<-entered
+	input <- "records/s:two"
+	time.Sleep(50 * time.Millisecond)
+	input <- "records/s:broken"
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if err := <-done; status.Code(err) != codes.Unavailable {
+		t.Fatal(err)
+	}
+	if !seen[1] || !seen[2] {
+		t.Fatal("a result received before the break did not reach Consume", seen)
+	}
+}
+
+func TestClientStreamStopsConsumingOnceConsumeFails(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	failure := errors.New("application failure")
+	sent := 0
+	calls := 0
+	options := MutateStreamOptions{StoreName: "records"}
+	options.Next = func(context.Context) (*MutateRequest, error) {
+		if sent == recordWindowItems {
+			return nil, io.EOF
+		}
+		sent++
+		return putRequest(fmt.Sprintf("records/s:%d", sent), `{}`), nil
+	}
+	options.Consume = func(context.Context, uint64, *MutationResult) error {
+		calls++
+		return failure
+	}
+	if err := client.MutateStream(t.Context(), options); !errors.Is(err, failure) || calls != 1 {
+		t.Fatal(err, calls)
+	}
+}
+
+// answerThenFail confirms each record and ends the stream with an error.
+type answerThenFail struct{}
+
+func (answerThenFail) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	message, err := packed.Recv()
+	if err != nil {
+		return err
+	}
+	applied := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
+	value := &pb.Event_MutationResult{MutationResult: applied}
+	event := &pb.Event{Value: value}
+	answer := &pb.ExecuteResponse{Index: message.Requests[0].Index, Event: event}
+	response := &pb.ExecuteResponses{Responses: []*pb.ExecuteResponse{answer}}
+	if err := packed.Send(response); err != nil {
+		return err
+	}
+	return status.Error(codes.Internal, "final status")
+}
+
+func TestLargeRecordKeepsItsResultWhenItsStreamEndsWithAnError(t *testing.T) {
+	client, err := New(serveForTest(t, answerThenFail{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	large := putRequest("records/s:large", `{"padding":"`+strings.Repeat("x", laneRecordBytes+1)+`"}`)
+	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{large}}
+	results, err := client.Mutate(t.Context(), options)
+	if status.Code(err) != codes.Internal || results[0].GetOutcome() != MutationApplied {
+		t.Fatal(results, err)
+	}
+}
+
+// Under the race detector this shows that a canceled call stops reading its
+// request before returning, as a caller may then reuse its bytes.
+func TestCanceledMutateReturnsAfterItsWriterStoppedReading(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	buffer := []byte(`{"padding":"` + strings.Repeat("x", 256<<10) + `"}`)
+	document := &Document{ContentType: "application/json", Data: buffer}
+	request := &MutateRequest{Resource: "records/s:reuse", Action: MutationPut, Document: document}
+	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request}}
+	deadline := time.Now().Add(time.Second)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		ctx, cancel := context.WithCancel(t.Context())
+		timer := time.AfterFunc(time.Duration(rand.N(60))*time.Microsecond, cancel)
+		_, _ = client.Mutate(ctx, options)
+		timer.Stop()
+		cancel()
+		for index := 12; index < len(buffer)-2; index += 4096 {
+			buffer[index] = byte('a' + attempt%26)
+		}
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -90,6 +92,42 @@ func mutateCommand(input *MutateRequest) (*pb.Command, error) {
 func readResult(wire *pb.ReadResult) *ReadResult {
 	result := &ReadResult{Document: wire.GetDocument(), Missing: wire.GetMissing() != nil, Failure: wire.GetFailure()}
 	return result
+}
+
+// refusedStream returns the Failure a server sends when it turns a stream away
+// before reading any of it, which proves that nothing on the stream took
+// effect. A lost connection is UNAVAILABLE too, but has no such Failure.
+func refusedStream(err error) *pb.Failure {
+	if status.Code(err) != codes.Unavailable {
+		return nil
+	}
+	for _, detail := range status.Convert(err).Details() {
+		if failure, ok := detail.(*pb.Failure); ok {
+			return failure
+		}
+	}
+	return nil
+}
+
+// mutateAlone sends one mutation on a stream of its own. A refused stream is
+// the record's refusal, like one on a shared stream.
+func (c *Client) mutateAlone(ctx context.Context, store string, command *pb.Command) (*MutationResult, error) {
+	result, err := sendMutationAlone(ctx, c.store, store, command)
+	if failure := refusedStream(err); failure != nil && result == nil {
+		return protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure), nil
+	}
+	return result, callError(ctx, err)
+}
+
+// readAlone sends one read on a stream of its own, as mutateAlone does.
+func (c *Client) readAlone(ctx context.Context, store string, request *ReadRequest) (*ReadResult, error) {
+	alone := ReadOneOptions{StoreName: store, Request: request}
+	result, err := ReadOne(ctx, c.store, alone)
+	if failure := refusedStream(err); failure != nil && result == nil {
+		refused := &ReadResult{Failure: failure}
+		return refused, nil
+	}
+	return result, callError(ctx, err)
 }
 
 // sendMutationAlone sends one wire mutation on a stream of its own.

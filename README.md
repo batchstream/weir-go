@@ -56,8 +56,9 @@ arranges. A server that does not host the requested
 Store fails the call with NotFound. Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
-gRPC cancellation error. A single-record call whose context ends returns the
-context's error. A Client sends a record again only when a server refused it
+gRPC cancellation error. A call of a Client whose context ends returns the
+context's error, so test it with `errors.Is` rather than its gRPC status; the
+package operation functions return the gRPC status. A Client sends a record again only when a server refused it
 before it began, as described under
 [Resending refused records](#resending-refused-records).
 
@@ -100,13 +101,13 @@ Each method takes named options with `StoreName`. `Read` and `Mutate` accept
 | `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
 | `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
 
-`Read` and `Mutate` validate the complete input before opening one bidirectional
-Execute RPC. An empty input, nil request,
-malformed resource, unsupported action or invalid document envelope rejects the
-entire call without sending earlier valid items. Every resource is relative to
-one `StoreName`. Each input is sent immediately as one ExecuteRequest. Results
-arrive as records complete and are returned in input order, including repeated
-resources. Individual backend failures stay in their result positions. A later
+`Read` and `Mutate` validate the complete input before sending anything. An empty
+input, nil request, malformed resource, unsupported action or invalid document
+envelope rejects the entire call without sending earlier valid items. Every
+resource is relative to one `StoreName`. Each input is sent as one
+ExecuteRequest as soon as the window and an earlier mutation of its resource allow.
+Results arrive as records complete and are returned in input order, including
+repeated resources. Individual backend failures stay in their result positions. A later
 RPC failure preserves every validated result already received; unconfirmed
 positions remain nil and any such mutation may have applied. Never
 automatically replay those mutations.
@@ -298,9 +299,11 @@ returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
 result)` receives each confirmed result as its record completes; the index,
 starting at 1, identifies the input.
 Inputs are validated as they are produced; an invalid later item does not undo
-earlier requests. Stream success requires one result per submitted input and
-final gRPC OK. Results delivered before a later producer, consumer or transport
-error remain evidence. Next and Consume run concurrently; synchronize shared
+earlier requests. A Client's stream succeeds with one result per submitted input;
+a package function's also requires a final gRPC OK. Results delivered before a
+later producer, consumer or transport error remain evidence, and a Client's stream
+goes on delivering results it already received after such an error, unless
+Consume itself failed. Next and Consume run concurrently; synchronize shared
 application state. Callbacks must honor their context and return promptly;
 the SDK cancels and joins its sender before returning. Keep yielded requests and
 document bytes immutable until the corresponding Consume callback begins.
@@ -326,10 +329,11 @@ Consumers should commit or release each result promptly and avoid retaining
 unbounded events.
 
 A Client's `Read`, `Mutate`, `ReadStream` and `MutateStream` each send their
-records over one gRPC stream, and replace it with one to another server when its
-server stops resolving or refuses a record, and every minute, so a stream may
-stay open for as long as its producer has records, and an idle one holds no gRPC
-stream after 10 seconds. A stream's mutations of one resource run in input order,
+records over a gRPC stream of their own, and replace it with one to another server
+when its server stops resolving or refuses a record, and every minute, so a
+call may stay open for as long as its producer has records, and an idle one holds
+no gRPC stream after 10 seconds. A record over 1 MiB uses a further gRPC stream of
+its own. A stream's mutations of one resource run in input order,
 each after the previous one's result, including after a failure; records of
 different resources may arrive at the server in any order. A broken gRPC stream
 ends the call with its error, and mutations without a result may have applied.
@@ -355,7 +359,9 @@ is still queued when the deadline passes. Canceling a call stops waiting and
 asks the server to cancel only that record; as with any canceled call, a record
 already executing may still take effect. When the server refuses a record
 without starting it, as a draining or overloaded server or an unavailable
-backend does, the refusal returns to the caller. For 10 seconds afterwards the
+backend does, the refusal returns to the caller. A server that turns a new gRPC
+stream away before reading it, as a draining or overloaded one does, says so with
+a status detail, and that refuses the stream's records alike. For 10 seconds afterwards the
 stream takes new records only when no other stream can, and while another stream
 does, it closes as soon as it falls quiet, so new records move to other servers
 and a draining server's streams end. When every stream of a Store has refused,

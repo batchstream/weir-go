@@ -12,11 +12,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ReadStream sends each produced read as soon as there is room and consumes
-// results as they complete, over a stream of the Client that follows its
+// ReadStream sends each produced read once there is room and consumes results
+// as they complete, over a gRPC stream of its own that follows the Client's
 // servers: it moves to another server when its server stops resolving, refuses
 // a read or reaches the stream lifetime. A read a server refused is sent again;
-// nothing else is. Results delivered before a later error remain evidence.
+// nothing else is. Every result received before a later error is consumed.
 func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
 	if _, err := c.storeClient(); err != nil {
 		return err
@@ -34,12 +34,9 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 	}
 	key := c.lanes.ownKey(options.StoreName, true)
 	send := func(ctx context.Context, command *pb.Command) (*ReadResult, error) {
-		request := command.GetRead()
 		event, shared, err := c.lanes.execute(ctx, key, command)
 		if !shared {
-			alone := ReadOneOptions{StoreName: options.StoreName, Request: request}
-			result, err := ReadOne(ctx, c.store, alone)
-			return result, callError(ctx, err)
+			return c.readAlone(ctx, options.StoreName, command.GetRead())
 		}
 		if err != nil {
 			return nil, err
@@ -50,13 +47,13 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 	return runClientStream(ctx, c, stream)
 }
 
-// MutateStream sends each produced mutation as soon as there is room and
-// consumes results as they complete, over a stream of the Client that follows
-// its servers, as ReadStream does. Mutations of one resource run in input
+// MutateStream sends each produced mutation once there is room and consumes
+// results as they complete, over a gRPC stream of its own that follows the
+// Client's servers, as ReadStream does. Mutations of one resource run in input
 // order, each after the previous one's result, including after a failure. A
 // mutation a server refused is sent again; nothing else is. Each consumed result
-// is an individual acknowledgement; an error leaves other mutations
-// unacknowledged, and they may have applied.
+// is an individual acknowledgement, and every result received before a later
+// error is consumed; other mutations stay unacknowledged and may have applied.
 func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) error {
 	if _, err := c.storeClient(); err != nil {
 		return err
@@ -76,8 +73,7 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 	send := func(ctx context.Context, command *pb.Command) (*MutationResult, error) {
 		event, shared, err := c.lanes.execute(ctx, key, command)
 		if !shared {
-			result, err := sendMutationAlone(ctx, c.store, options.StoreName, command)
-			return result, callError(ctx, err)
+			return c.mutateAlone(ctx, options.StoreName, command)
 		}
 		if err != nil {
 			return nil, err
@@ -89,7 +85,7 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 }
 
 // clientStreamOptions describes one record stream of a Client.
-type clientStreamOptions[R any] struct {
+type clientStreamOptions[R comparable] struct {
 	// key names the shared-stream group only this record stream uses.
 	key laneKey
 	// next returns a validated command and, when it must keep input order, its
@@ -109,21 +105,25 @@ type streamRecord struct {
 	command  *pb.Command
 }
 
-type streamOutcome[R any] struct {
+// streamOutcome holds a record's result, or nil without one.
+type streamOutcome[R comparable] struct {
 	record *streamRecord
 	result R
-	err    error
 }
 
 // clientStream sends records over lanes and hands their results to its caller.
 // It holds at most recordWindowItems records, sent or waiting for an earlier
 // record of their resource, from the moment they are produced until they are
 // consumed, so a slow consumer stops the producer.
-type clientStream[R any] struct {
+type clientStream[R comparable] struct {
 	client  *Client
 	options clientStreamOptions[R]
-	ctx     context.Context
-	cancel  context.CancelFunc
+	// caller is the caller's context, which Consume receives: an error that
+	// stops sending does not stop the delivery of results already received.
+	caller context.Context
+	// ctx ends with the first error and stops sending.
+	ctx    context.Context
+	cancel context.CancelFunc
 	// outcomes has room for every record the window allows.
 	outcomes chan streamOutcome[R]
 	// released returns consumed records' sizes to the producer.
@@ -136,20 +136,20 @@ type clientStream[R any] struct {
 	failure error
 }
 
-func runClientStream[R any](ctx context.Context, c *Client, options clientStreamOptions[R]) error {
+func runClientStream[R comparable](ctx context.Context, c *Client, options clientStreamOptions[R]) error {
 	if !protocol.ValidStoreName(options.key.store) {
 		return errors.New("Execute requires a client and valid Store")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer c.lanes.forget(options.key)
-	ctx, cancel := context.WithCancel(ctx)
+	sending, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream := &clientStream[R]{
 		client:   c,
 		options:  options,
-		ctx:      ctx,
+		caller:   ctx,
+		ctx:      sending,
 		cancel:   cancel,
 		outcomes: make(chan streamOutcome[R], recordWindowItems),
 		released: make(chan int, recordWindowItems),
@@ -158,8 +158,12 @@ func runClientStream[R any](ctx context.Context, c *Client, options clientStream
 	go stream.produce()
 	stream.consume()
 	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	return stream.failure
+	failure := stream.failure
+	stream.mu.Unlock()
+	// A failed stream may have left a record in Send, reading its caller's
+	// document; only joining the writer lets the caller reuse it.
+	c.lanes.forget(options.key, failure != nil)
+	return failure
 }
 
 // fail keeps the stream's first error and stops sending. A record that fails
@@ -171,12 +175,6 @@ func (s *clientStream[R]) fail(err error) {
 	}
 	s.mu.Unlock()
 	s.cancel()
-}
-
-func (s *clientStream[R]) failed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.failure != nil
 }
 
 // produce admits records until the input ends or fails, then closes outcomes
@@ -262,7 +260,7 @@ func (s *clientStream[R]) run(record *streamRecord) {
 		if err != nil {
 			s.fail(err)
 		}
-		outcome := streamOutcome[R]{record: record, result: result, err: err}
+		outcome := streamOutcome[R]{record: record, result: result}
 		s.outcomes <- outcome
 		record = s.following(record.resource)
 	}
@@ -284,14 +282,20 @@ func (s *clientStream[R]) following(resource string) *streamRecord {
 	return waiting[0]
 }
 
-// consume hands results to the caller until a failure, then discards the rest.
+// consume hands every received result to the caller, also after an error ended
+// the sending, until Consume itself fails. A result can accompany the error that
+// ended its own stream. The producer never holds more unread credit than its
+// window, so released does not block.
 func (s *clientStream[R]) consume() {
+	var none R
+	consuming := true
 	for outcome := range s.outcomes {
-		if outcome.err != nil || s.failed() {
+		if !consuming || outcome.result == none {
 			continue
 		}
-		if err := s.options.consume(s.ctx, outcome.record.index, outcome.result); err != nil {
+		if err := s.options.consume(s.caller, outcome.record.index, outcome.result); err != nil {
 			s.fail(err)
+			consuming = false
 			continue
 		}
 		s.released <- outcome.record.size
