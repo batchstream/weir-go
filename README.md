@@ -333,7 +333,8 @@ records over a gRPC stream of their own, and replace it with one to another serv
 when its server stops resolving or refuses a record, and every minute, so a
 call may stay open for as long as its producer has records, and an idle one holds
 no gRPC stream after 10 seconds. A record over 1 MiB uses a further gRPC stream of
-its own. A stream's mutations of one resource run in input order,
+its own. `Read` and `Mutate` send the records that fit their window, 32 records
+or 8 MiB, in one message. A stream's mutations of one resource run in input order,
 each after the previous one's result, including after a failure; records of
 different resources may arrive at the server in any order. A broken gRPC stream
 ends the call with its error, and mutations without a result may have applied.

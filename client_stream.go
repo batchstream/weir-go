@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
@@ -18,6 +19,10 @@ import (
 // a read or reaches the stream lifetime. A read a server refused is sent again;
 // nothing else is. Every result received before a later error is consumed.
 func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
+	return c.readStream(ctx, options, false)
+}
+
+func (c *Client) readStream(ctx context.Context, options ReadStreamOptions, known bool) error {
 	if _, err := c.storeClient(); err != nil {
 		return err
 	}
@@ -33,8 +38,8 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 		return command, "", err
 	}
 	key := c.lanes.ownKey(options.StoreName, true)
-	send := func(ctx context.Context, command *pb.Command) (*ReadResult, error) {
-		event, shared, err := c.lanes.execute(ctx, key, command)
+	send := func(ctx context.Context, command *pb.Command, queued *queuedRecord) (*ReadResult, error) {
+		event, shared, err := c.lanes.finish(ctx, key, command, queued)
 		if !shared {
 			return c.readAlone(ctx, options.StoreName, command.GetRead())
 		}
@@ -43,7 +48,7 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 		}
 		return readResult(event.GetReadResult()), nil
 	}
-	stream := clientStreamOptions[*ReadResult]{key: key, next: next, send: send, refused: readRefused, consume: options.Consume}
+	stream := clientStreamOptions[*ReadResult]{key: key, known: known, next: next, send: send, refused: readRefused, consume: options.Consume}
 	return runClientStream(ctx, c, stream)
 }
 
@@ -55,6 +60,10 @@ func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) erro
 // is an individual acknowledgement, and every result received before a later
 // error is consumed; other mutations stay unacknowledged and may have applied.
 func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) error {
+	return c.mutateStream(ctx, options, false)
+}
+
+func (c *Client) mutateStream(ctx context.Context, options MutateStreamOptions, known bool) error {
 	if _, err := c.storeClient(); err != nil {
 		return err
 	}
@@ -70,8 +79,8 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 		return command, command.GetMutate().GetResource(), err
 	}
 	key := c.lanes.ownKey(options.StoreName, false)
-	send := func(ctx context.Context, command *pb.Command) (*MutationResult, error) {
-		event, shared, err := c.lanes.execute(ctx, key, command)
+	send := func(ctx context.Context, command *pb.Command, queued *queuedRecord) (*MutationResult, error) {
+		event, shared, err := c.lanes.finish(ctx, key, command, queued)
 		if !shared {
 			return c.mutateAlone(ctx, options.StoreName, command)
 		}
@@ -80,7 +89,7 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 		}
 		return event.GetMutationResult(), nil
 	}
-	stream := clientStreamOptions[*MutationResult]{key: key, next: next, send: send, refused: mutationRefused, consume: options.Consume}
+	stream := clientStreamOptions[*MutationResult]{key: key, known: known, next: next, send: send, refused: mutationRefused, consume: options.Consume}
 	return runClientStream(ctx, c, stream)
 }
 
@@ -88,11 +97,15 @@ func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) 
 type clientStreamOptions[R comparable] struct {
 	// key names the shared-stream group only this record stream uses.
 	key laneKey
+	// known says next never blocks, as all its records already exist, so those
+	// that fit the window leave in one message.
+	known bool
 	// next returns a validated command and, when it must keep input order, its
 	// resource.
 	next func(context.Context) (*pb.Command, string, error)
-	// send sends one command once and returns its result.
-	send    func(context.Context, *pb.Command) (R, error)
+	// send returns the result of one command, sending it once unless it is
+	// already queued.
+	send    func(context.Context, *pb.Command, *queuedRecord) (R, error)
 	refused func(R) bool
 	consume func(context.Context, uint64, R) error
 }
@@ -129,6 +142,8 @@ type clientStream[R comparable] struct {
 	// released returns consumed records' sizes to the producer.
 	released chan int
 	sends    sync.WaitGroup
+	// unsent holds the streams with records the producer has not woken yet.
+	unsent []*lane
 
 	mu sync.Mutex
 	// running holds the records waiting behind each resource's running record.
@@ -181,6 +196,7 @@ func (s *clientStream[R]) fail(err error) {
 // once every admitted record has one.
 func (s *clientStream[R]) produce() {
 	defer func() {
+		s.wakeWriters()
 		s.sends.Wait()
 		close(s.outcomes)
 	}()
@@ -188,6 +204,7 @@ func (s *clientStream[R]) produce() {
 	inflight, bytes := 0, 0
 	// wait returns one consumed record's credit.
 	wait := func() bool {
+		s.wakeWriters()
 		select {
 		case size := <-s.released:
 			inflight--
@@ -247,15 +264,37 @@ func (s *clientStream[R]) admit(record *streamRecord) {
 		s.running[record.resource] = nil
 		s.mu.Unlock()
 	}
+	queued := s.client.lanes.enqueue(s.ctx, s.options.key, record.command)
+	if queued.lane != nil && !slices.Contains(s.unsent, queued.lane) {
+		s.unsent = append(s.unsent, queued.lane)
+	}
+	if !s.options.known {
+		s.wakeWriters()
+	}
 	s.sends.Add(1)
-	go s.run(record)
+	go s.run(record, queued)
+}
+
+// wakeWriters lets the streams send what the producer queued on them. Only the
+// producer calls it.
+func (s *clientStream[R]) wakeWriters() {
+	for _, stream := range s.unsent {
+		stream.signal()
+	}
+	s.unsent = s.unsent[:0]
 }
 
 // run sends a record and then those waiting behind it, in order.
-func (s *clientStream[R]) run(record *streamRecord) {
+// run sends a resource's records in input order, the first of them already
+// queued.
+func (s *clientStream[R]) run(record *streamRecord, queued *queuedRecord) {
 	defer s.sends.Done()
 	for record != nil {
-		send := func() (R, error) { return s.options.send(s.ctx, record.command) }
+		send := func() (R, error) {
+			current := queued
+			queued = nil
+			return s.options.send(s.ctx, record.command, current)
+		}
 		result, err := resendRefused(s.ctx, s.client, s.options.refused, send)
 		if err != nil {
 			s.fail(err)

@@ -47,7 +47,10 @@ func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, 
 	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
-	return readRecords(ctx, options, c.ReadStream)
+	stream := func(ctx context.Context, options ReadStreamOptions) error {
+		return c.readStream(ctx, options, true)
+	}
+	return readRecords(ctx, options, stream)
 }
 
 // Mutate sends its mutations over a stream of the Client, so it moves between
@@ -61,7 +64,10 @@ func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*Mutation
 	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
-	return mutateRecords(ctx, options, c.MutateStream)
+	stream := func(ctx context.Context, options MutateStreamOptions) error {
+		return c.mutateStream(ctx, options, true)
+	}
+	return mutateRecords(ctx, options, stream)
 }
 
 func validateReads(ctx context.Context, options ReadOptions) error {

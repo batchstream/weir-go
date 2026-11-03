@@ -765,3 +765,140 @@ func TestCanceledMutateReturnsAfterItsWriterStoppedReading(t *testing.T) {
 		}
 	}
 }
+
+// countsMessages answers every record at once and records each message's size.
+type countsMessages struct {
+	mu       sync.Mutex
+	messages []int
+}
+
+func (p *countsMessages) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	for {
+		message, err := packed.Recv()
+		if err != nil {
+			return nil
+		}
+		p.mu.Lock()
+		p.messages = append(p.messages, len(message.Requests))
+		p.mu.Unlock()
+		response := &pb.ExecuteResponses{}
+		for _, request := range message.Requests {
+			event := &pb.Event{}
+			if request.GetCommand().GetRead() != nil {
+				document := &pb.Document{ContentType: "application/json", Data: []byte(`{}`)}
+				event.Value = &pb.Event_ReadResult{ReadResult: protocol.ReadDocument(document)}
+			} else {
+				applied := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
+				event.Value = &pb.Event_MutationResult{MutationResult: applied}
+			}
+			answer := &pb.ExecuteResponse{Index: request.Index, Event: event}
+			response.Responses = append(response.Responses, answer)
+		}
+		if err := packed.Send(response); err != nil {
+			return err
+		}
+	}
+}
+
+func (p *countsMessages) take() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	taken := p.messages
+	p.messages = nil
+	return taken
+}
+
+func TestClientBatchLeavesInOneMessage(t *testing.T) {
+	peer := &countsMessages{}
+	client, err := New(serveForTest(t, peer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	mutations := MutateOptions{StoreName: "records"}
+	reads := ReadOptions{StoreName: "records"}
+	for index := range recordWindowItems {
+		resource := fmt.Sprintf("records/s:%d", index)
+		mutations.Requests = append(mutations.Requests, putRequest(resource, `{}`))
+		reads.Requests = append(reads.Requests, &ReadRequest{Resource: resource})
+	}
+	for range 200 {
+		if _, err := client.Mutate(t.Context(), mutations); err != nil {
+			t.Fatal(err)
+		}
+		if messages := peer.take(); len(messages) != 1 || messages[0] != recordWindowItems {
+			t.Fatal("a batch of mutations was split", messages)
+		}
+		if _, err := client.Read(t.Context(), reads); err != nil {
+			t.Fatal(err)
+		}
+		if messages := peer.take(); len(messages) != 1 || messages[0] != recordWindowItems {
+			t.Fatal("a batch of reads was split", messages)
+		}
+	}
+}
+
+func TestClientBatchBeyondItsWindowSendsTheRestAsResultsArrive(t *testing.T) {
+	peer := &countsMessages{}
+	client, err := New(serveForTest(t, peer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	const count = 3*recordWindowItems + 1
+	options := MutateOptions{StoreName: "records"}
+	for index := range count {
+		options.Requests = append(options.Requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
+	}
+	results, err := client.Mutate(t.Context(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, result := range results {
+		if result.GetOutcome() != MutationApplied {
+			t.Fatal(index, result)
+		}
+	}
+	messages := peer.take()
+	total := 0
+	for _, size := range messages {
+		total += size
+	}
+	if messages[0] != recordWindowItems || total != count {
+		t.Fatal(messages)
+	}
+}
+
+func TestClientBatchOfOneResourceKeepsItsOrder(t *testing.T) {
+	peer := newLaneTestPeer()
+	client := laneTestClient(t, peer)
+	const count = 8
+	options := MutateOptions{StoreName: "records"}
+	for range count {
+		options.Requests = append(options.Requests, putRequest("records/s:same", `{}`))
+	}
+	results, err := client.Mutate(t.Context(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, result := range results {
+		if result.GetOutcome() != MutationApplied {
+			t.Fatal(index, result)
+		}
+	}
+}
+
+func TestCanceledBatchEndsWithItsRecordsUnsent(t *testing.T) {
+	peer := &countsMessages{}
+	client, err := New(serveForTest(t, peer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{putRequest("records/s:a", `{}`)}}
+	if _, err := client.Mutate(ctx, options); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}

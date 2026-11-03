@@ -211,22 +211,64 @@ type lane struct {
 // otherwise reports false so the caller can use a stream of its own. Callers
 // validate first because an invalid request ends the stream for every record.
 func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command) (*pb.Event, bool, error) {
+	return p.finish(ctx, key, command, nil)
+}
+
+// queuedRecord is a record enqueue placed on a stream, or why it did not: an
+// error, or neither for a record that needs a stream of its own.
+type queuedRecord struct {
+	lane *lane
+	call *laneCall
+	err  error
+}
+
+// enqueue queues one validated command on a stream without waking the stream's
+// writer, so that records known together leave in one message.
+func (p *lanePool) enqueue(ctx context.Context, key laneKey, command *pb.Command) *queuedRecord {
+	queued := &queuedRecord{}
 	size := proto.Size(command)
 	if size > laneRecordBytes {
-		return nil, false, nil
+		return queued
 	}
 	for range laneAttempts {
 		chosen, err := p.reserve(ctx, key)
 		if err != nil {
-			return nil, true, err
+			queued.err = err
+			return queued
 		}
 		if chosen == nil {
+			return queued
+		}
+		queued.call = chosen.enqueue(ctx, command, size)
+		if queued.call != nil {
+			queued.lane = chosen
+			return queued
+		}
+	}
+	return queued
+}
+
+// finish waits for the outcome of a record enqueue placed, or sends it now when
+// queued is nil, and sends it again when its stream closed before sending it.
+func (p *lanePool) finish(ctx context.Context, key laneKey, command *pb.Command, queued *queuedRecord) (*pb.Event, bool, error) {
+	for range laneAttempts {
+		if queued == nil {
+			queued = p.enqueue(ctx, key, command)
+			if queued.lane != nil {
+				queued.lane.signal()
+			}
+		}
+		if queued.err != nil {
+			return nil, true, queued.err
+		}
+		if queued.lane == nil {
 			return nil, false, nil
 		}
-		outcome := chosen.call(ctx, command, size)
+		outcome := queued.lane.wait(ctx, queued.call)
 		if !outcome.retry {
 			return outcome.event, true, outcome.err
 		}
+		queued = nil
 	}
 	return nil, false, nil
 }
@@ -422,23 +464,26 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	return opened, err
 }
 
-// call queues one record on a reserved stream and waits for its outcome.
-func (l *lane) call(ctx context.Context, command *pb.Command, size int) laneOutcome {
+// enqueue queues one record on a reserved stream, or returns nil and frees its
+// slot when the stream no longer takes records.
+func (l *lane) enqueue(ctx context.Context, command *pb.Command, size int) *laneCall {
 	pending := &laneCall{command: command, size: size, done: make(chan laneOutcome, 1)}
 	pending.deadline, _ = ctx.Deadline()
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closing || l.err != nil {
-		l.mu.Unlock()
 		l.load.Add(-1)
-		retry := laneOutcome{retry: true}
-		return retry
+		return nil
 	}
 	l.queued = append(l.queued, pending)
 	if l.idle != nil {
 		l.idle.Stop()
 	}
-	l.mu.Unlock()
-	l.signal()
+	return pending
+}
+
+// wait returns the outcome of a queued record.
+func (l *lane) wait(ctx context.Context, pending *laneCall) laneOutcome {
 	select {
 	case outcome := <-pending.done:
 		return outcome
