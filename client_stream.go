@@ -10,6 +10,8 @@ import (
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -170,6 +172,10 @@ func runClientStream[R comparable](ctx context.Context, c *Client, options clien
 		released: make(chan int, recordWindowItems),
 		running:  make(map[string][]*streamRecord),
 	}
+	stopWatching := context.AfterFunc(c.lanes.ctx, func() {
+		stream.fail(status.Error(codes.Canceled, "client closed"))
+	})
+	defer stopWatching()
 	go stream.produce()
 	stream.consume()
 	stream.mu.Lock()

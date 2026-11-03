@@ -488,6 +488,12 @@ func (l *lane) wait(ctx context.Context, pending *laneCall) laneOutcome {
 	case outcome := <-pending.done:
 		return outcome
 	case <-ctx.Done():
+		// A result that already arrived counts, whichever case select chose.
+		select {
+		case outcome := <-pending.done:
+			return outcome
+		default:
+		}
 		l.abandon(pending)
 		abandoned := laneOutcome{err: ctx.Err()}
 		return abandoned

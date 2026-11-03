@@ -902,3 +902,45 @@ func TestCanceledBatchEndsWithItsRecordsUnsent(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCloseEndsAStreamWaitingForItsProducer(t *testing.T) {
+	client, err := New(serveForTest(t, &countsMessages{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	producing := make(chan struct{})
+	options := MutateStreamOptions{StoreName: "records"}
+	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+		close(producing)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	options.Consume = func(context.Context, uint64, *MutationResult) error { return nil }
+	done := make(chan error, 1)
+	go func() { done <- client.MutateStream(t.Context(), options) }()
+	<-producing
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if status.Code(err) != codes.Canceled {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close left the stream running")
+	}
+}
+
+func TestWaitReturnsAResultThatAlreadyArrived(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	stream := &lane{wake: make(chan struct{}, 1)}
+	for range 200 {
+		pending := &laneCall{done: make(chan laneOutcome, 1)}
+		pending.done <- laneOutcome{event: &pb.Event{}}
+		if outcome := stream.wait(ctx, pending); outcome.event == nil {
+			t.Fatal("a result that already arrived was dropped", outcome)
+		}
+	}
+}
