@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
@@ -43,6 +44,8 @@ type laneTestPeer struct {
 	rejecting atomic.Bool
 	// held counts the held records that arrived.
 	held atomic.Int64
+	// outgoing holds the metadata of the last stream that opened.
+	outgoing atomic.Value
 }
 
 func newLaneTestPeer() *laneTestPeer {
@@ -56,6 +59,9 @@ func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequest
 		return status.Error(codes.Unavailable, "draining")
 	}
 	p.streams.Add(1)
+	if incoming, ok := metadata.FromIncomingContext(stream.Context()); ok {
+		p.outgoing.Store(incoming)
+	}
 	var send sync.Mutex
 	// Held results finish before a clean half-close; an error ends them.
 	var held sync.WaitGroup
@@ -104,6 +110,9 @@ func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequest
 		}
 		if p.draining.Load() {
 			resource = "records/s:refused"
+		}
+		if strings.HasPrefix(resource, "records/s:held") {
+			resource = "records/s:held"
 		}
 		switch resource {
 		case "records/s:broken":

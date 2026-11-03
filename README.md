@@ -40,18 +40,19 @@ for index, result := range results {
 `New` takes a `host:port` address and rejects anything else. It connects on
 first use and reconnects after failures. When a DNS name resolves to several
 Weir servers, streams are spread round-robin across them, so every server behind
-the address must host the Stores the client uses. Each Read, Mutate, stream or
-Native call opens its own stream; single-record calls share streams, as
-described under [Streaming and deadlines](#streaming-and-deadlines). Use a name
+the address must host the Stores the client uses. Each Read, Mutate, record
+stream or Native call uses a gRPC stream of its own; single-record calls share
+streams, as described under [Streaming and deadlines](#streaming-and-deadlines). Use a name
 that lists every server, such as a Kubernetes headless Service; a ClusterIP
 Service resolves to one virtual IP. The Client looks the name up again every 5
 seconds. A server that joins receives new calls once connected, and shared
 streams move to it until every server carries about the same number. A server
 that stops resolving, as a Kubernetes Pod does once it starts terminating,
-receives no new calls; its streams finish the records they carry and close. So
-scaling a headless Service up or down does not fail calls, provided a server
-stops resolving at least a few seconds before it stops taking records, as the
-Weir chart's preStop delay arranges. A server that does not host the requested
+receives no new records; its streams finish the records they carry and close.
+So scaling a headless Service up or down, or rolling out a new version, does not
+fail calls, however long they run, provided a server stops resolving at least a
+few seconds before it stops taking records, as the Weir chart's preStop delay
+arranges. A server that does not host the requested
 Store fails the call with NotFound. Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
@@ -321,8 +322,20 @@ options.Consume = func(ctx context.Context, index uint64, result *weir.ReadResul
 err := client.ReadStream(ctx, options)
 ```
 
-Use streams for finite producer sequences. Consumers should commit or release
-each result promptly and avoid retaining unbounded events.
+Consumers should commit or release each result promptly and avoid retaining
+unbounded events.
+
+A Client's `Read`, `Mutate`, `ReadStream` and `MutateStream` each send their
+records over one gRPC stream, and replace it with one to another server when its
+server stops resolving or refuses a record, and every minute, so a stream may
+stay open for as long as its producer has records, and an idle one holds no gRPC
+stream after 10 seconds. A stream's mutations of one resource run in input order,
+each after the previous one's result, including after a failure; records of
+different resources may arrive at the server in any order. A broken gRPC stream
+ends the call with its error, and mutations without a result may have applied.
+The package operation functions keep one gRPC stream for the whole call, end
+with an error when its server goes away and leave following servers to their
+caller.
 
 The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
 `Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
@@ -375,20 +388,16 @@ Failure and nil positions, and every Go error reach the caller unchanged.
 
 A record is sent at most four times. The wait before each resend is jittered
 between half and all of 50 ms, 100 ms and then 200 ms. A resend is made only
-when the context deadline leaves that longest wait again for the send after
-it. A resend that still outlasts the deadline ends with the deadline error,
-and that record may have taken effect. Resends across a Client stay
-within one per ten first sends plus a burst of 100, so a server that refuses
-everything never receives several times its normal traffic. `Read` and `Mutate`
-resend refused positions in a new stream only after the first stream ended
-without an error. `Mutate` resends a refused mutation only when every later
-request for the same resource was refused too, so each resource's mutations
-still apply in input order. A record still refused at the end keeps its
-NOT_STARTED evidence. The caller may send it again, unless a later request for
-the same resource in that call did not end NOT_STARTED; sending it then would
-apply it after that request. `ReadStream`,
-`MutateStream` and the package operation functions never resend. Use caller
-deadlines; they bound resends as well as calls.
+when the context deadline leaves that longest wait again for the send after it.
+A resend that still outlasts the deadline ends with the deadline error, and that
+record may have taken effect. Resends across a Client stay within one per ten
+first sends plus a burst of 100, so a server that refuses everything never
+receives several times its normal traffic. A record still refused at the end
+keeps its NOT_STARTED evidence, and later mutations of its resource in the same
+call still run after it. The caller may send it again, unless such a mutation
+did not end NOT_STARTED; sending it then would apply it after that mutation. The
+package operation functions never resend. Use caller deadlines; they bound
+resends as well as calls.
 
 ## Examples and validation
 

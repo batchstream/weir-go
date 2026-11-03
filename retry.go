@@ -3,7 +3,6 @@ package weir
 import (
 	"context"
 	"math/rand/v2"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -41,88 +40,70 @@ func newResendBudget() *resendBudget {
 	return budget
 }
 
-func (b *resendBudget) earn(records int) {
+func (b *resendBudget) earn(credits int64) {
 	for {
 		credit := b.credit.Load()
-		next := min(credit+int64(records), resendShare*resendBurst)
+		next := min(credit+credits, resendShare*resendBurst)
 		if next == credit || b.credit.CompareAndSwap(credit, next) {
 			return
 		}
 	}
 }
 
-// spend takes credit for up to records resends and returns how many it covers.
-func (b *resendBudget) spend(records int) int {
+// spend takes the credit for one resend and reports whether there was enough.
+func (b *resendBudget) spend() bool {
 	for {
 		credit := b.credit.Load()
-		covered := min(int64(records), credit/resendShare)
-		if covered == 0 || b.credit.CompareAndSwap(credit, credit-covered*resendShare) {
-			return int(covered)
+		if credit < resendShare {
+			return false
+		}
+		if b.credit.CompareAndSwap(credit, credit-resendShare) {
+			return true
 		}
 	}
 }
 
-// resend reports how many of records refused records may be sent as the
-// given attempt, after waiting its backoff. It covers none once the attempts
-// or the budget run out, or when the caller's deadline would not leave the
-// longest wait again for the send, which could otherwise turn a refusal into
-// a deadline error that may have taken effect.
-func (c *Client) resend(ctx context.Context, attempt, records int) int {
-	if c.resends == nil || attempt > resendAttempts || records == 0 {
-		return 0
-	}
-	covered := c.resends.spend(records)
-	if covered == 0 {
-		return 0
+// resend reports whether a refused record may be sent as the given attempt,
+// after waiting its backoff. It may not once the attempts or the budget run
+// out, or when the caller's deadline would not leave the longest wait again
+// for the send, which could otherwise turn a refusal into a deadline error
+// that may have taken effect.
+func (c *Client) resend(ctx context.Context, attempt int) bool {
+	if c.resends == nil || attempt > resendAttempts || !c.resends.spend() {
+		return false
 	}
 	longest := resendBackoff << (attempt - 2)
 	wait := longest/2 + rand.N(longest/2+1)
 	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) <= wait+longest {
-		c.resends.earn(covered * resendShare)
-		return 0
+		c.resends.earn(resendShare)
+		return false
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return covered
+		return true
 	case <-ctx.Done():
-		c.resends.earn(covered * resendShare)
-		return 0
+		c.resends.earn(resendShare)
+		return false
 	}
 }
 
 // earn credits the budget for records sent for the first time.
-func (c *Client) earn(records int) {
+func (c *Client) earn() {
 	if c.resends != nil {
-		c.resends.earn(records)
+		c.resends.earn(1)
 	}
 }
 
 // resendRefused sends one record until a server does not refuse it, the
 // attempts or budget run out, or ctx ends, and returns the last outcome.
 func resendRefused[T any](ctx context.Context, c *Client, refused func(T) bool, send func() (T, error)) (T, error) {
-	c.earn(1)
+	c.earn()
 	for attempt := 2; ; attempt++ {
 		result, err := send()
-		if err != nil || !refused(result) || c.resend(ctx, attempt, 1) == 0 {
+		if err != nil || !refused(result) || !c.resend(ctx, attempt) {
 			return result, err
-		}
-	}
-}
-
-// resendBatch sends the positions refused returns again, in order, until none
-// is left, the attempts or budget run out, or a resend fails. It sends a
-// prefix when the budget covers only part of them.
-func (c *Client) resendBatch(ctx context.Context, refused func() []int, send func([]int) error) error {
-	for attempt := 2; ; attempt++ {
-		positions := refused()
-		positions = positions[:c.resend(ctx, attempt, len(positions))]
-		if len(positions) == 0 {
-			return nil
-		}
-		if err := send(positions); err != nil {
-			return err
 		}
 	}
 }
@@ -143,34 +124,4 @@ func readRefused(result *ReadResult) bool {
 
 func nativeRefused(result *NativeResult) bool {
 	return result != nil && result.Completion == NativeNotStarted && result.Response == nil && refusal(result.Failure)
-}
-
-// resendableMutations returns, in input order, the refused mutations that can
-// be sent again without reordering a resource: those whose later requests for
-// the same resource were all refused too.
-func resendableMutations(requests []*MutateRequest, results []*MutationResult) []int {
-	settled := make(map[string]bool)
-	var positions []int
-	for i := len(requests) - 1; i >= 0; i-- {
-		resource := requests[i].Resource
-		if !mutationRefused(results[i]) {
-			settled[resource] = true
-			continue
-		}
-		if !settled[resource] {
-			positions = append(positions, i)
-		}
-	}
-	slices.Reverse(positions)
-	return positions
-}
-
-func resendableReads(results []*ReadResult) []int {
-	var positions []int
-	for i, result := range results {
-		if readRefused(result) {
-			positions = append(positions, i)
-		}
-	}
-	return positions
 }

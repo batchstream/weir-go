@@ -15,6 +15,7 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -58,9 +59,12 @@ const (
 
 var errLaneClosed = errors.New("shared Execute stream closed")
 
+// laneKey names a group of streams. Calls with no owner share theirs; each record
+// stream of a Client owns one group, whose one stream holds its window.
 type laneKey struct {
 	store string
 	read  bool
+	owner uint64
 }
 
 type lanePool struct {
@@ -72,6 +76,8 @@ type lanePool struct {
 	endpoints *endpoints
 	// turn rotates which of equally used servers a new stream asks for.
 	turn atomic.Uint32
+	// owners numbers the record streams that own a group.
+	owners atomic.Uint64
 	// refusals holds when each server last refused a record, so streams do
 	// not move to a server that is shedding records.
 	refusalsMu sync.Mutex
@@ -98,6 +104,26 @@ func newLanePool(client pb.StoreServiceClient, servers *endpoints) *lanePool {
 }
 
 func (p *lanePool) close() { p.cancel() }
+
+// ownKey returns a key for a group only one record stream uses.
+func (p *lanePool) ownKey(store string, read bool) laneKey {
+	key := laneKey{store: store, read: read, owner: p.owners.Add(1)}
+	return key
+}
+
+// forget drains and removes a record stream's group once the stream ended.
+func (p *lanePool) forget(key laneKey) {
+	p.mu.Lock()
+	group := p.groups[key]
+	delete(p.groups, key)
+	p.mu.Unlock()
+	if group == nil {
+		return
+	}
+	for _, stream := range group.lanes {
+		stream.drain()
+	}
+}
 
 type callState int
 
@@ -247,7 +273,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		// was refused within the cooldown. With a healthy stream, overflow
 		// uses streams of its own.
 		probe := chosen == nil && cooling != nil && now.Sub(group.probeRefused) >= laneCooldown
-		grow := chosen == nil && cooling == nil || chosen != nil && load >= laneOpenAt
+		grow := chosen == nil && cooling == nil || key.owner == 0 && chosen != nil && load >= laneOpenAt
 		open := (probe || grow) && len(live) < maxLanes && opening == nil
 		// A new stream asks for the server with the fewest. While another
 		// server has two more, one of its streams moves there, so a replica
@@ -312,6 +338,10 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	streamCtx := laneCtx
 	if opening.target != "" {
 		streamCtx = context.WithValue(laneCtx, endpointPreference, opening.target)
+	}
+	// A group with one owner sends its caller's outgoing metadata.
+	if outgoing, ok := metadata.FromOutgoingContext(ctx); ok && key.owner != 0 {
+		streamCtx = metadata.NewOutgoingContext(streamCtx, outgoing)
 	}
 	// The opening caller's cancellation bounds connection establishment only.
 	stop := context.AfterFunc(ctx, cancel)
