@@ -6,7 +6,7 @@ the Stores hosted there. IP and DNS addresses work in Kubernetes and other
 deployments.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.22.0
+go get github.com/batchstream/weir-go@v0.23.0
 ```
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.17.0`
