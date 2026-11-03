@@ -143,8 +143,8 @@ type MutateOptions struct {
 	Requests  []*MutateRequest
 }
 
-// ReadStreamOptions produces a finite sequence without retaining every input or
-// result. Next returns io.EOF after its final item. Items are validated before
+// ReadStreamOptions produces reads without retaining every input or result. Next
+// returns io.EOF after its final item. Items are validated before
 // they are sent; an invalid later item does not undo earlier requests.
 // Consume receives each confirmed result as its record completes; the index
 // identifies the input, starting at 1.

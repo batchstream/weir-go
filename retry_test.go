@@ -221,17 +221,20 @@ func TestMutateResendsRefusedRecordsWithoutReorderingAResource(t *testing.T) {
 		}
 		return results
 	}
-	// The later write of x applied, so its refused earlier write stays refused.
+	// The later write of x waits until its refused earlier write was sent again.
 	peer.refuse("records/s:x", 1)
 	first := putRequest("records/s:x", `{"n":1}`)
 	other := putRequest("records/s:y", `{"n":2}`)
 	later := putRequest("records/s:x", `{"n":3}`)
 	results := mutate(first, other, later)
-	if results[0].GetOutcome() != MutationNotStarted || results[1].GetOutcome() != MutationApplied || results[2].GetOutcome() != MutationApplied {
-		t.Fatal("refused write was resent after a later write of its resource", results)
+	if results[0].GetOutcome() != MutationApplied || results[1].GetOutcome() != MutationApplied || results[2].GetOutcome() != MutationApplied {
+		t.Fatal("a refused write was not resent", results)
 	}
-	peer.drain()
-	// Both writes of z were refused, so both are resent in input order.
+	applied := slices.DeleteFunc(peer.drain(), func(document string) bool { return document == `{"n":2}` })
+	if !slices.Equal(applied, []string{`{"n":1}`, `{"n":3}`}) {
+		t.Fatal("a resource's writes applied out of order", applied)
+	}
+	// The first two sends of z are refused; both writes still apply in order.
 	peer.refuse("records/s:z", 2)
 	first = putRequest("records/s:z", `{"n":4}`)
 	later = putRequest("records/s:z", `{"n":5}`)
@@ -262,18 +265,24 @@ func TestReadResendsRefusedReads(t *testing.T) {
 
 func TestResendBudgetAllowsATenthOfFirstSendsPlusABurst(t *testing.T) {
 	budget := newResendBudget()
-	if covered := budget.spend(resendBurst + 50); covered != resendBurst {
+	spent := func(attempts int) int {
+		covered := 0
+		for range attempts {
+			if budget.spend() {
+				covered++
+			}
+		}
+		return covered
+	}
+	if covered := spent(resendBurst + 50); covered != resendBurst {
 		t.Fatal("burst not bounded", covered)
 	}
-	if covered := budget.spend(1); covered != 0 {
-		t.Fatal("empty budget covered a resend", covered)
-	}
 	budget.earn(25)
-	if covered := budget.spend(5); covered != 2 {
+	if covered := spent(5); covered != 2 {
 		t.Fatal("first sends did not earn a tenth of a resend each", covered)
 	}
 	budget.earn(1 << 20)
-	if covered := budget.spend(1 << 20); covered != resendBurst {
+	if covered := spent(1 << 20); covered != resendBurst {
 		t.Fatal("credit grew past the burst", covered)
 	}
 }
@@ -311,21 +320,5 @@ func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 		if test.refused != test.want {
 			t.Error(test.name, test.refused)
 		}
-	}
-}
-
-func TestResendableMutationsKeepEachResourceInOrder(t *testing.T) {
-	draining := protocol.Fail(pb.FailureCode_UNAVAILABLE, "store draining")
-	refused := protocol.Mutation(pb.MutationOutcome_NOT_STARTED, draining)
-	applied := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
-	requests := []*MutateRequest{
-		putRequest("records/s:a", `{}`), putRequest("records/s:b", `{}`), putRequest("records/s:a", `{}`),
-		putRequest("records/s:c", `{}`), putRequest("records/s:c", `{}`), putRequest("records/s:d", `{}`), putRequest("records/s:d", `{}`),
-	}
-	// a: refused then applied; b: refused; c: applied then refused; d: refused
-	// then unconfirmed, which may have applied.
-	results := []*MutationResult{refused, refused, applied, applied, refused, refused, nil}
-	if positions := resendableMutations(requests, results); !slices.Equal(positions, []int{1, 4}) {
-		t.Fatal("unexpected resendable positions", positions)
 	}
 }

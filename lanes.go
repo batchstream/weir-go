@@ -15,6 +15,7 @@ import (
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -58,9 +59,12 @@ const (
 
 var errLaneClosed = errors.New("shared Execute stream closed")
 
+// laneKey names a group of streams. Calls with no owner share theirs; each record
+// stream of a Client owns one group, whose one stream holds its window.
 type laneKey struct {
 	store string
 	read  bool
+	owner uint64
 }
 
 type lanePool struct {
@@ -72,6 +76,8 @@ type lanePool struct {
 	endpoints *endpoints
 	// turn rotates which of equally used servers a new stream asks for.
 	turn atomic.Uint32
+	// owners numbers the record streams that own a group.
+	owners atomic.Uint64
 	// refusals holds when each server last refused a record, so streams do
 	// not move to a server that is shedding records.
 	refusalsMu sync.Mutex
@@ -83,6 +89,11 @@ type lanePool struct {
 
 type laneGroup struct {
 	lanes []*lane
+	// owned holds the streams of a record stream's group that have not ended,
+	// and writers their write goroutines, so a failed record stream can end them
+	// before its caller reuses what they may still be reading.
+	owned   []*lane
+	writers sync.WaitGroup
 	// opening is closed when the stream being opened is ready or failed.
 	opening chan struct{}
 	// probeRefused is when a probing stream's server last refused a record.
@@ -98,6 +109,35 @@ func newLanePool(client pb.StoreServiceClient, servers *endpoints) *lanePool {
 }
 
 func (p *lanePool) close() { p.cancel() }
+
+// ownKey returns a key for a group only one record stream uses.
+func (p *lanePool) ownKey(store string, read bool) laneKey {
+	key := laneKey{store: store, read: read, owner: p.owners.Add(1)}
+	return key
+}
+
+// forget removes a record stream's group once the stream ended. Its gRPC streams
+// have answered every record and drain, or after a failure they end at once and
+// their writers stop.
+func (p *lanePool) forget(key laneKey, failed bool) {
+	p.mu.Lock()
+	group := p.groups[key]
+	delete(p.groups, key)
+	p.mu.Unlock()
+	if group == nil {
+		return
+	}
+	if failed {
+		for _, stream := range group.owned {
+			stream.cancel()
+		}
+		group.writers.Wait()
+		return
+	}
+	for _, stream := range group.lanes {
+		stream.drain()
+	}
+}
 
 type callState int
 
@@ -171,22 +211,64 @@ type lane struct {
 // otherwise reports false so the caller can use a stream of its own. Callers
 // validate first because an invalid request ends the stream for every record.
 func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command) (*pb.Event, bool, error) {
+	return p.finish(ctx, key, command, nil)
+}
+
+// queuedRecord is a record enqueue placed on a stream, or why it did not: an
+// error, or neither for a record that needs a stream of its own.
+type queuedRecord struct {
+	lane *lane
+	call *laneCall
+	err  error
+}
+
+// enqueue queues one validated command on a stream without waking the stream's
+// writer, so that records known together leave in one message.
+func (p *lanePool) enqueue(ctx context.Context, key laneKey, command *pb.Command) *queuedRecord {
+	queued := &queuedRecord{}
 	size := proto.Size(command)
 	if size > laneRecordBytes {
-		return nil, false, nil
+		return queued
 	}
 	for range laneAttempts {
 		chosen, err := p.reserve(ctx, key)
 		if err != nil {
-			return nil, true, err
+			queued.err = err
+			return queued
 		}
 		if chosen == nil {
+			return queued
+		}
+		queued.call = chosen.enqueue(ctx, command, size)
+		if queued.call != nil {
+			queued.lane = chosen
+			return queued
+		}
+	}
+	return queued
+}
+
+// finish waits for the outcome of a record enqueue placed, or sends it now when
+// queued is nil, and sends it again when its stream closed before sending it.
+func (p *lanePool) finish(ctx context.Context, key laneKey, command *pb.Command, queued *queuedRecord) (*pb.Event, bool, error) {
+	for range laneAttempts {
+		if queued == nil {
+			queued = p.enqueue(ctx, key, command)
+			if queued.lane != nil {
+				queued.lane.signal()
+			}
+		}
+		if queued.err != nil {
+			return nil, true, queued.err
+		}
+		if queued.lane == nil {
 			return nil, false, nil
 		}
-		outcome := chosen.call(ctx, command, size)
+		outcome := queued.lane.wait(ctx, queued.call)
 		if !outcome.retry {
 			return outcome.event, true, outcome.err
 		}
+		queued = nil
 	}
 	return nil, false, nil
 }
@@ -247,7 +329,7 @@ func (p *lanePool) reserve(ctx context.Context, key laneKey) (*lane, error) {
 		// was refused within the cooldown. With a healthy stream, overflow
 		// uses streams of its own.
 		probe := chosen == nil && cooling != nil && now.Sub(group.probeRefused) >= laneCooldown
-		grow := chosen == nil && cooling == nil || chosen != nil && load >= laneOpenAt
+		grow := chosen == nil && cooling == nil || key.owner == 0 && chosen != nil && load >= laneOpenAt
 		open := (probe || grow) && len(live) < maxLanes && opening == nil
 		// A new stream asks for the server with the fewest. While another
 		// server has two more, one of its streams moves there, so a replica
@@ -313,6 +395,10 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	if opening.target != "" {
 		streamCtx = context.WithValue(laneCtx, endpointPreference, opening.target)
 	}
+	// A group with one owner sends its caller's outgoing metadata.
+	if outgoing, ok := metadata.FromOutgoingContext(ctx); ok && key.owner != 0 {
+		streamCtx = metadata.NewOutgoingContext(streamCtx, outgoing)
+	}
 	// The opening caller's cancellation bounds connection establishment only.
 	stop := context.AfterFunc(ctx, cancel)
 	stream, err := p.client.Execute(streamCtx, grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxRetryRPCBufferSize(0))
@@ -331,7 +417,15 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), address: address, probing: opening.probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
 		opened.load.Store(1)
 		go opened.receive()
-		go opened.write()
+		if key.owner != 0 {
+			group.writers.Add(1)
+		}
+		go func() {
+			if key.owner != 0 {
+				defer group.writers.Done()
+			}
+			opened.write()
+		}()
 	} else {
 		cancel()
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -342,6 +436,10 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	p.mu.Lock()
 	// A server that stopped resolving while the stream opened gets no
 	// records; leave has already drained its other streams.
+	if opened != nil && key.owner != 0 {
+		group.owned = slices.DeleteFunc(group.owned, func(stream *lane) bool { return stream.ctx.Err() != nil })
+		group.owned = append(group.owned, opened)
+	}
 	switch {
 	case opened == nil:
 	case !p.endpoints.resolves(opened.address):
@@ -366,27 +464,36 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	return opened, err
 }
 
-// call queues one record on a reserved stream and waits for its outcome.
-func (l *lane) call(ctx context.Context, command *pb.Command, size int) laneOutcome {
+// enqueue queues one record on a reserved stream, or returns nil and frees its
+// slot when the stream no longer takes records.
+func (l *lane) enqueue(ctx context.Context, command *pb.Command, size int) *laneCall {
 	pending := &laneCall{command: command, size: size, done: make(chan laneOutcome, 1)}
 	pending.deadline, _ = ctx.Deadline()
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closing || l.err != nil {
-		l.mu.Unlock()
 		l.load.Add(-1)
-		retry := laneOutcome{retry: true}
-		return retry
+		return nil
 	}
 	l.queued = append(l.queued, pending)
 	if l.idle != nil {
 		l.idle.Stop()
 	}
-	l.mu.Unlock()
-	l.signal()
+	return pending
+}
+
+// wait returns the outcome of a queued record.
+func (l *lane) wait(ctx context.Context, pending *laneCall) laneOutcome {
 	select {
 	case outcome := <-pending.done:
 		return outcome
 	case <-ctx.Done():
+		// A result that already arrived counts, whichever case select chose.
+		select {
+		case outcome := <-pending.done:
+			return outcome
+		default:
+		}
 		l.abandon(pending)
 		abandoned := laneOutcome{err: ctx.Err()}
 		return abandoned
@@ -529,7 +636,7 @@ func (l *lane) sent(calls []*laneCall, err error) {
 		outcome.err = err
 	case l.err != nil:
 		// The stream failed during Send and left these records to the writer.
-		outcome.err = l.err
+		outcome = l.ended()
 	default:
 		l.mu.Unlock()
 		return
@@ -578,6 +685,24 @@ func (l *lane) receive() {
 		l.pool.refusedBy(l.address)
 	}
 	l.fail(err)
+}
+
+// ended is the outcome of a record outstanding when the stream ended. A record
+// on a stream the server turned away was refused; any other may have started.
+func (l *lane) ended() laneOutcome {
+	failure := refusedStream(l.err)
+	if failure == nil {
+		outcome := laneOutcome{err: l.err}
+		return outcome
+	}
+	event := &pb.Event{}
+	if l.key.read {
+		event.Value = &pb.Event_ReadResult{ReadResult: protocol.ReadFailure(failure)}
+	} else {
+		event.Value = &pb.Event_MutationResult{MutationResult: protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure)}
+	}
+	outcome := laneOutcome{event: event}
+	return outcome
 }
 
 func (l *lane) deliver(response *pb.ExecuteResponse) error {
@@ -707,10 +832,10 @@ func (l *lane) fail(err error) {
 	if l.idle != nil {
 		l.idle.Stop()
 	}
+	outcome := l.ended()
 	l.mu.Unlock()
 	for _, pending := range outstanding {
 		l.load.Add(-1)
-		outcome := laneOutcome{err: err}
 		pending.done <- outcome
 	}
 	l.handBack(returned)

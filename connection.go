@@ -29,7 +29,7 @@ var ErrClosed = errors.New("Weir client is closed")
 // address. Every server behind the address must host the Stores the client
 // uses. Reuse a Client across goroutines and close it after callers finish.
 // It sends a record again only when a server refused it before it began, and
-// never one that may have taken effect; streams are never resent.
+// never one that may have taken effect.
 type Client struct {
 	connection *grpc.ClientConn
 	store      pb.StoreServiceClient
@@ -136,8 +136,7 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 // if it is already executing. A record a server refused before it began is
 // sent again, up to four sends within the caller's deadline.
 func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
+	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
 	batch := ReadOptions{StoreName: options.StoreName, Requests: []*ReadRequest{options.Request}}
@@ -150,8 +149,7 @@ func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResu
 	send := func() (*ReadResult, error) {
 		event, shared, err := c.lanes.execute(ctx, key, command)
 		if !shared {
-			result, err := ReadOne(ctx, client, options)
-			return result, callError(ctx, err)
+			return c.readAlone(ctx, options.StoreName, options.Request)
 		}
 		if err != nil {
 			return nil, err
@@ -187,8 +185,7 @@ func (c *Client) AtomicTransform(ctx context.Context, options AtomicTransformOpt
 }
 
 func (c *Client) mutateOne(ctx context.Context, store string, request *MutateRequest) (*MutationResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
+	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
 	batch := MutateOptions{StoreName: store, Requests: []*MutateRequest{request}}
@@ -205,8 +202,7 @@ func (c *Client) mutateOne(ctx context.Context, store string, request *MutateReq
 	send := func() (*MutationResult, error) {
 		event, shared, err := c.lanes.execute(ctx, key, command)
 		if !shared {
-			result, err := mutateOne(ctx, client, batch)
-			return result, callError(ctx, err)
+			return c.mutateAlone(ctx, store, command)
 		}
 		if err != nil {
 			return nil, err

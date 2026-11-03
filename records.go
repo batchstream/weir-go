@@ -17,7 +17,10 @@ func Read(ctx context.Context, client pb.StoreServiceClient, options ReadOptions
 	if err := validateReads(ctx, options); err != nil {
 		return nil, err
 	}
-	return readRecords(ctx, client, options)
+	stream := func(ctx context.Context, streamOptions ReadStreamOptions) error {
+		return ReadStream(ctx, client, streamOptions)
+	}
+	return readRecords(ctx, options, stream)
 }
 
 // Mutate validates every input before opening one Execute stream.
@@ -28,71 +31,43 @@ func Mutate(ctx context.Context, client pb.StoreServiceClient, options MutateOpt
 	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
 	}
-	return mutateRecords(ctx, client, options)
+	stream := func(ctx context.Context, streamOptions MutateStreamOptions) error {
+		return MutateStream(ctx, client, streamOptions)
+	}
+	return mutateRecords(ctx, options, stream)
 }
 
-// Read sends the reads a server refused before they began again, in a new
-// stream, once the first one completes without an error.
+// Read sends its reads over a stream of the Client, so it moves between servers
+// as ReadStream does. Results retain input order; a later error preserves
+// confirmed items and leaves unconfirmed positions nil.
 func (c *Client) Read(ctx context.Context, options ReadOptions) ([]*ReadResult, error) {
 	if err := validateReads(ctx, options); err != nil {
 		return nil, err
 	}
-	client, err := c.storeClient()
-	if err != nil {
+	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
-	c.earn(len(options.Requests))
-	results, err := readRecords(ctx, client, options)
-	if err != nil {
-		return results, err
+	stream := func(ctx context.Context, options ReadStreamOptions) error {
+		return c.readStream(ctx, options, true)
 	}
-	refused := func() []int { return resendableReads(results) }
-	send := func(positions []int) error {
-		again := ReadOptions{StoreName: options.StoreName, Requests: make([]*ReadRequest, len(positions))}
-		for i, position := range positions {
-			again.Requests[i] = options.Requests[position]
-		}
-		resent, err := readRecords(ctx, client, again)
-		for i, position := range positions {
-			results[position] = resent[i]
-		}
-		return err
-	}
-	err = c.resendBatch(ctx, refused, send)
-	return results, err
+	return readRecords(ctx, options, stream)
 }
 
-// Mutate sends the mutations a server refused before they began again, in a
-// new stream, once the first one completes without an error. A refused
-// mutation is sent again only when every later request for its resource was
-// refused too, so each resource's mutations still apply in input order.
+// Mutate sends its mutations over a stream of the Client, so it moves between
+// servers as MutateStream does and each resource's mutations apply in input
+// order. A later error preserves confirmed results; nil positions remain
+// unacknowledged and may have applied. The call is not a transaction.
 func (c *Client) Mutate(ctx context.Context, options MutateOptions) ([]*MutationResult, error) {
 	if err := validateMutations(ctx, options); err != nil {
 		return nil, err
 	}
-	client, err := c.storeClient()
-	if err != nil {
+	if _, err := c.storeClient(); err != nil {
 		return nil, err
 	}
-	c.earn(len(options.Requests))
-	results, err := mutateRecords(ctx, client, options)
-	if err != nil {
-		return results, err
+	stream := func(ctx context.Context, options MutateStreamOptions) error {
+		return c.mutateStream(ctx, options, true)
 	}
-	refused := func() []int { return resendableMutations(options.Requests, results) }
-	send := func(positions []int) error {
-		again := MutateOptions{StoreName: options.StoreName, Requests: make([]*MutateRequest, len(positions))}
-		for i, position := range positions {
-			again.Requests[i] = options.Requests[position]
-		}
-		resent, err := mutateRecords(ctx, client, again)
-		for i, position := range positions {
-			results[position] = resent[i]
-		}
-		return err
-	}
-	err = c.resendBatch(ctx, refused, send)
-	return results, err
+	return mutateRecords(ctx, options, stream)
 }
 
 func validateReads(ctx context.Context, options ReadOptions) error {
@@ -129,7 +104,7 @@ func validateMutations(ctx context.Context, options MutateOptions) error {
 	return nil
 }
 
-func readRecords(ctx context.Context, client pb.StoreServiceClient, options ReadOptions) ([]*ReadResult, error) {
+func readRecords(ctx context.Context, options ReadOptions, stream func(context.Context, ReadStreamOptions) error) ([]*ReadResult, error) {
 	results := make([]*ReadResult, len(options.Requests))
 	position := 0
 	streamOptions := ReadStreamOptions{StoreName: options.StoreName}
@@ -145,11 +120,11 @@ func readRecords(ctx context.Context, client pb.StoreServiceClient, options Read
 		results[index-1] = result
 		return nil
 	}
-	err := ReadStream(ctx, client, streamOptions)
+	err := stream(ctx, streamOptions)
 	return results, err
 }
 
-func mutateRecords(ctx context.Context, client pb.StoreServiceClient, options MutateOptions) ([]*MutationResult, error) {
+func mutateRecords(ctx context.Context, options MutateOptions, stream func(context.Context, MutateStreamOptions) error) ([]*MutationResult, error) {
 	results := make([]*MutationResult, len(options.Requests))
 	position := 0
 	streamOptions := MutateStreamOptions{StoreName: options.StoreName}
@@ -165,7 +140,7 @@ func mutateRecords(ctx context.Context, client pb.StoreServiceClient, options Mu
 		results[index-1] = result
 		return nil
 	}
-	err := MutateStream(ctx, client, streamOptions)
+	err := stream(ctx, streamOptions)
 	return results, err
 }
 

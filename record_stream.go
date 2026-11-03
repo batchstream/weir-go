@@ -12,6 +12,8 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -26,12 +28,7 @@ func ReadStream(ctx context.Context, client pb.StoreServiceClient, options ReadS
 		if err != nil {
 			return nil, err
 		}
-		if err := protocol.ValidateReadRequest(request); err != nil {
-			return nil, err
-		}
-		operation := &pb.Command_Read{Read: request}
-		command := &pb.Command{Operation: operation}
-		return command, nil
+		return readCommand(request)
 	}
 	consume := func(ctx context.Context, response *pb.ExecuteResponse) error {
 		wire := response.Event.GetReadResult()
@@ -55,16 +52,7 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 		if err != nil {
 			return nil, err
 		}
-		request, err := wireMutation(input)
-		if err != nil {
-			return nil, err
-		}
-		if err := protocol.ValidateMutationRequest(request); err != nil {
-			return nil, err
-		}
-		operation := &pb.Command_Mutate{Mutate: request}
-		command := &pb.Command{Operation: operation}
-		return command, nil
+		return mutateCommand(input)
 	}
 	consume := func(ctx context.Context, response *pb.ExecuteResponse) error {
 		result := response.Event.GetMutationResult()
@@ -77,25 +65,92 @@ func MutateStream(ctx context.Context, client pb.StoreServiceClient, options Mut
 	return recordStream(ctx, client, optionsInternal)
 }
 
+// readCommand validates one read and wraps it for sending.
+func readCommand(request *ReadRequest) (*pb.Command, error) {
+	if err := protocol.ValidateReadRequest(request); err != nil {
+		return nil, err
+	}
+	operation := &pb.Command_Read{Read: request}
+	command := &pb.Command{Operation: operation}
+	return command, nil
+}
+
+// mutateCommand validates one mutation and wraps it for sending.
+func mutateCommand(input *MutateRequest) (*pb.Command, error) {
+	request, err := wireMutation(input)
+	if err != nil {
+		return nil, err
+	}
+	if err := protocol.ValidateMutationRequest(request); err != nil {
+		return nil, err
+	}
+	operation := &pb.Command_Mutate{Mutate: request}
+	command := &pb.Command{Operation: operation}
+	return command, nil
+}
+
 func readResult(wire *pb.ReadResult) *ReadResult {
 	result := &ReadResult{Document: wire.GetDocument(), Missing: wire.GetMissing() != nil, Failure: wire.GetFailure()}
 	return result
 }
 
-func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
-	client, err := c.storeClient()
-	if err != nil {
-		return err
+// refusedStream returns the Failure a server sends when it turns a stream away
+// before reading any of it, which proves that nothing on the stream took
+// effect. A lost connection is UNAVAILABLE too, but has no such Failure.
+func refusedStream(err error) *pb.Failure {
+	if status.Code(err) != codes.Unavailable {
+		return nil
 	}
-	return ReadStream(ctx, client, options)
+	for _, detail := range status.Convert(err).Details() {
+		if failure, ok := detail.(*pb.Failure); ok {
+			return failure
+		}
+	}
+	return nil
 }
 
-func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) error {
-	client, err := c.storeClient()
-	if err != nil {
-		return err
+// mutateAlone sends one mutation on a stream of its own. A refused stream is
+// the record's refusal, like one on a shared stream.
+func (c *Client) mutateAlone(ctx context.Context, store string, command *pb.Command) (*MutationResult, error) {
+	result, err := sendMutationAlone(ctx, c.store, store, command)
+	if failure := refusedStream(err); failure != nil && result == nil {
+		return protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure), nil
 	}
-	return MutateStream(ctx, client, options)
+	return result, callError(ctx, err)
+}
+
+// readAlone sends one read on a stream of its own, as mutateAlone does.
+func (c *Client) readAlone(ctx context.Context, store string, request *ReadRequest) (*ReadResult, error) {
+	alone := ReadOneOptions{StoreName: store, Request: request}
+	result, err := ReadOne(ctx, c.store, alone)
+	if failure := refusedStream(err); failure != nil && result == nil {
+		refused := &ReadResult{Failure: failure}
+		return refused, nil
+	}
+	return result, callError(ctx, err)
+}
+
+// sendMutationAlone sends one wire mutation on a stream of its own.
+func sendMutationAlone(ctx context.Context, client pb.StoreServiceClient, store string, command *pb.Command) (*MutationResult, error) {
+	var result *MutationResult
+	sent := false
+	next := func(context.Context) (*pb.Command, error) {
+		if sent {
+			return nil, io.EOF
+		}
+		sent = true
+		return command, nil
+	}
+	consume := func(_ context.Context, response *pb.ExecuteResponse) error {
+		result = response.Event.GetMutationResult()
+		if result == nil {
+			return errors.New("unexpected event in Mutate stream")
+		}
+		return nil
+	}
+	options := recordStreamOptions{store: store, next: next, consume: consume}
+	err := recordStream(ctx, client, options)
+	return result, err
 }
 
 type recordStreamOptions struct {

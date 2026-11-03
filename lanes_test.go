@@ -18,9 +18,11 @@ import (
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 )
 
 // laneTestPeer applies every mutation at once except the held resource, whose
@@ -43,6 +45,18 @@ type laneTestPeer struct {
 	rejecting atomic.Bool
 	// held counts the held records that arrived.
 	held atomic.Int64
+	// outgoing holds the metadata of the last stream that opened.
+	outgoing atomic.Value
+}
+
+// refusedStreamError is how a server turns a stream away before reading it.
+func refusedStreamError(message string) error {
+	failure := protocol.Fail(pb.FailureCode_UNAVAILABLE, message)
+	refused, err := status.New(codes.Unavailable, message).WithDetails(protoadapt.MessageV1Of(failure))
+	if err != nil {
+		panic(err)
+	}
+	return refused.Err()
 }
 
 func newLaneTestPeer() *laneTestPeer {
@@ -53,9 +67,12 @@ func newLaneTestPeer() *laneTestPeer {
 func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
 	stream := &recordPeer{BidiStreamingServer: packed}
 	if p.rejecting.Load() {
-		return status.Error(codes.Unavailable, "draining")
+		return refusedStreamError("draining")
 	}
 	p.streams.Add(1)
+	if incoming, ok := metadata.FromIncomingContext(stream.Context()); ok {
+		p.outgoing.Store(incoming)
+	}
 	var send sync.Mutex
 	// Held results finish before a clean half-close; an error ends them.
 	var held sync.WaitGroup
@@ -104,6 +121,9 @@ func (p *laneTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequest
 		}
 		if p.draining.Load() {
 			resource = "records/s:refused"
+		}
+		if strings.HasPrefix(resource, "records/s:held") {
+			resource = "records/s:held"
 		}
 		switch resource {
 		case "records/s:broken":
@@ -583,8 +603,9 @@ func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 			refused++
 		}
 	}
-	// One record reveals the drain and at most one rides the rejected probe.
-	if refused != 1 || failed > 1 || applied < 18 {
+	// One record reveals the drain and at most one rides the refused probe, and
+	// neither ever started.
+	if refused > 2 || failed != 0 || applied < 18 {
 		t.Fatal("a rejected probe held calls on the draining server", applied, refused, failed)
 	}
 }
@@ -871,20 +892,20 @@ func TestStreamsDoNotKeepMovingToAServerThatRejectsThem(t *testing.T) {
 	// The joining server rejects new streams, as an overloaded one does.
 	second.rejecting.Store(true)
 	servers.resolve(servers.addresses...)
-	failed := 0
+	refused := 0
 	for range 100 {
 		result, err := lanePut(t.Context(), client, "records/s:next", 16)
-		if err == nil && result.GetOutcome() != MutationApplied {
-			t.Fatal("record was not applied", result)
-		}
 		if err != nil {
-			failed++
+			t.Fatal(err)
+		}
+		if result.GetOutcome() != MutationApplied {
+			refused++
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// Only a record on the first stream the server rejected fails.
-	if failed > 1 {
-		t.Fatal("streams kept moving to a server that rejects them", failed)
+	// Only a record on the first stream the server refused is refused itself.
+	if refused > 1 {
+		t.Fatal("streams kept moving to a server that rejects them", refused)
 	}
 	if streams := laneTestStreams(client); streams[servers.addresses[0]] < 3 {
 		t.Fatal("rejected moves drained the first server's streams", streams)
