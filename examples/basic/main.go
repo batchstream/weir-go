@@ -44,12 +44,10 @@ func run() error {
 		target = weir.EncodeSegment(*index) + "/s:example"
 		document = &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
 	}
-	completion := &weir.MutationOptions{Visibility: weir.MutationQueryVisible}
-	request := &weir.MutateRequest{Resource: target, Action: weir.MutationPut, Document: document, Options: completion}
-	opts := weir.MutateOptions{StoreName: *storeName, Requests: []*weir.MutateRequest{request}}
-	results, err := client.Mutate(ctx, opts)
+	request := &weir.MutateRequest{Resource: target, Action: weir.MutationPut, Document: document}
+	results, err := client.Mutate(ctx, *storeName, weir.WithRequests(request), weir.WithQueryVisible())
 	if err != nil {
-		if len(results) != 0 && results[0] != nil {
+		if results[0] != nil {
 			return fmt.Errorf("write RPC incomplete; backend evidence=%v: %w", results[0], err)
 		}
 		return fmt.Errorf("write result unavailable; effects indeterminate: %w", err)
@@ -57,12 +55,12 @@ func run() error {
 	if results[0].GetOutcome() != weir.MutationApplied || results[0].GetFailure() != nil {
 		return fmt.Errorf("write: %v", results[0])
 	}
-	batch := weir.ReadOptions{StoreName: *storeName}
+	var batch []*weir.ReadRequest
 	for range *count {
 		read := &weir.ReadRequest{Resource: target}
-		batch.Requests = append(batch.Requests, read)
+		batch = append(batch, read)
 	}
-	reads, err := client.Read(ctx, batch)
+	reads, err := client.Read(ctx, *storeName, weir.WithRequests(batch...))
 	if err != nil {
 		return fmt.Errorf("read RPC incomplete: %w", err)
 	}

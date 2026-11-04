@@ -81,14 +81,12 @@ func (stream *completionStream) Recv() (*pb.ExecuteResponses, error) {
 
 func TestNativeWaitsForSendAfterTerminalEOF(t *testing.T) {
 	stream := &completionStream{delivered: make(chan struct{}), eofSeen: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
-	client := &completionClient{stream: stream}
+	client := &Client{store: &completionClient{stream: stream}}
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
-		options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
-		_, err := Native(ctx, client, options)
+		_, err := client.Native(ctx, "records", clientTestNativeRequest())
 		done <- err
 	}()
 	select {
@@ -124,17 +122,18 @@ func TestLocalSendFailureCancelsReceiveAndJoins(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			failure := errors.New("local send failed")
 			stream := &completionStream{delivered: make(chan struct{}), sendErr: failure}
-			client := &completionClient{stream: stream}
+			client := &Client{store: &completionClient{stream: stream}}
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 			var err error
 			if mode == "native" {
-				options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
-				options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
-				_, err = Native(ctx, client, options)
+				_, err = client.Native(ctx, "records", clientTestNativeRequest())
 			} else {
-				options := ReadOptions{StoreName: "records", Requests: []*ReadRequest{clientTestReadRequest()}}
-				_, err = Read(ctx, client, options)
+				command, _, commandErr := readCommand(clientTestReadRequest())
+				if commandErr != nil {
+					t.Fatal(commandErr)
+				}
+				_, err = readKind.alone(ctx, client, "records", command)
 			}
 			if !errors.Is(err, failure) || ctx.Err() != nil {
 				t.Fatal("local Send failure was lost or receive needed caller deadline", err, ctx.Err())
@@ -145,14 +144,12 @@ func TestLocalSendFailureCancelsReceiveAndJoins(t *testing.T) {
 
 func TestNativeRejectsInvalidRequestContentTypeBeforeRPC(t *testing.T) {
 	peer := &clientTestPeer{}
-	client := clientTestConnection(t, peer)
+	client := clientTestClient(t, peer)
 	document := &Document{ContentType: string([]byte{0xff})}
 	request := &NativeRequest{Resource: "records", Request: document}
-	options := NativeOptions{StoreName: "records", Request: request}
-	options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	end, err := Native(ctx, client, options)
+	end, err := client.Native(ctx, "records", request)
 	if err == nil || end != nil || ctx.Err() != nil || peer.received.Load() != 0 {
 		t.Fatal("local protobuf error waited for a response or sent malformed input", end, err, ctx.Err(), peer.received.Load())
 	}

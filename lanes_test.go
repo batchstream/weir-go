@@ -210,7 +210,7 @@ func laneTestDial(t *testing.T, servers *laneTestServers, peers []*laneTestPeer)
 		servers.addresses = append(servers.addresses, laneTestListen(t, peer))
 	}
 	servers.resolver.InitialState(servers.state(servers.addresses...))
-	options := append(connectionOptions(endpointConfig), grpc.WithResolvers(servers.resolver))
+	options := append(connectionOptions(), grpc.WithResolvers(servers.resolver))
 	connection, err := grpc.NewClient("weirlanes:///records", options...)
 	if err != nil {
 		t.Fatal(err)
@@ -261,11 +261,8 @@ func laneTestListen(t *testing.T, peer *laneTestPeer) string {
 // each peer's stream count at that point.
 func laneTestReady(t *testing.T, client *Client, peers ...*laneTestPeer) []int64 {
 	t.Helper()
-	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
-	request := &WriteRequest{Resource: "records/s:ready", Document: document}
-	options := WriteOptions{StoreName: "records", Request: request}
 	for range 200 {
-		if _, err := Put(t.Context(), client.store, options); err != nil {
+		if _, err := putAlone(t.Context(), client, "records/s:ready"); err != nil {
 			t.Fatal(err)
 		}
 		counts := make([]int64, len(peers))
@@ -284,10 +281,16 @@ func laneTestReady(t *testing.T, client *Client, peers ...*laneTestPeer) []int64
 }
 
 func lanePut(ctx context.Context, client *Client, resource string, size int) (*MutationResult, error) {
-	document := &Document{ContentType: "application/json", Data: []byte(`{"padding":"` + strings.Repeat("x", size) + `"}`)}
-	request := &WriteRequest{Resource: resource, Document: document}
-	options := WriteOptions{StoreName: "records", Request: request}
-	return client.Put(ctx, options)
+	return mutateOne(ctx, client, putRequest(resource, `{"padding":"`+strings.Repeat("x", size)+`"}`))
+}
+
+// putAlone sends one mutation on a gRPC stream of its own.
+func putAlone(ctx context.Context, client *Client, resource string) (*MutationResult, error) {
+	command, _, err := mutateCommand(putRequest(resource, `{}`), nil)
+	if err != nil {
+		return nil, err
+	}
+	return mutateKind.alone(ctx, client, "records", command)
 }
 
 func TestConcurrentSingleRecordCallsShareABoundedSetOfStreams(t *testing.T) {
@@ -584,11 +587,8 @@ func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 	draining.rejecting.Store(true)
 	// A stream of its own moves round-robin so the first probe reaches the
 	// draining server.
-	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
-	request := &WriteRequest{Resource: "records/s:turn", Document: document}
-	options := WriteOptions{StoreName: "records", Request: request}
 	turned := healthy.streams.Load()
-	if _, err := Put(t.Context(), client.store, options); err != nil || healthy.streams.Load() != turned+1 {
+	if _, err := putAlone(t.Context(), client, "records/s:turn"); err != nil || healthy.streams.Load() != turned+1 {
 		t.Fatal("round-robin did not turn to the healthy server", err)
 	}
 	applied, refused, failed := 0, 0, 0

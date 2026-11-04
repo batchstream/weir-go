@@ -108,8 +108,7 @@ func TestCallsLeaveAServerThatStopsAnswering(t *testing.T) {
 		defer cancel()
 		first := &MutateRequest{Resource: "records/s:first", Action: MutationPut, Document: document}
 		second := &MutateRequest{Resource: "records/s:second", Action: MutationPut, Document: document}
-		options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
-		_, err := client.Mutate(ctx, options)
+		_, err := client.Mutate(ctx, "records", WithRequests(first, second))
 		return err
 	}
 	frozenAt := time.Now()

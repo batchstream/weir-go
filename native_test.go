@@ -4,132 +4,13 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
-
-func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
-	for _, mode := range []string{"read_missing", "read_failure", "read_target_missing"} {
-		t.Run(mode, func(t *testing.T) {
-			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
-			result, err := ReadOne(t.Context(), client, options)
-			if err != nil || result == nil || result.Document != nil {
-				t.Fatal("Read lost backend result", result, err)
-			}
-			if mode == "read_missing" && (!result.Missing || result.Failure != nil) {
-				t.Fatal("Read changed missing into failure", result)
-			}
-			if mode == "read_failure" && (result.Missing || result.Failure.GetCode() != FailurePermissionDenied) {
-				t.Fatal("Read lost failure evidence", result)
-			}
-			if mode == "read_target_missing" && (result.Missing || result.Failure.GetCode() != FailureTargetNotFound) {
-				t.Fatal("missing backend target became successful document absence", result)
-			}
-		})
-	}
-}
-
-func TestTypedMutationsSelectBackendOperation(t *testing.T) {
-	acknowledged := &MutationOptions{}
-	visible := &MutationOptions{Visibility: MutationQueryVisible}
-	cases := []struct {
-		name    string
-		options *MutationOptions
-	}{
-		{name: "default"},
-		{name: "acknowledged", options: acknowledged},
-		{name: "visible", options: visible},
-	}
-	for _, test := range cases {
-		t.Run(test.name, func(t *testing.T) {
-			peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 5)}
-			client := clientTestConnection(t, peer)
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-			defer cancel()
-			document := &Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-			request := &WriteRequest{Resource: "records/s:key", Document: document, Options: test.options}
-			write := WriteOptions{StoreName: "records", Request: request}
-			for _, action := range []string{"create", "put", "replace", "delete", "transform"} {
-				var result *MutationResult
-				var err error
-				switch action {
-				case "create":
-					result, err = Create(ctx, client, write)
-				case "put":
-					result, err = Put(ctx, client, write)
-				case "replace":
-					result, err = Replace(ctx, client, write)
-				case "delete":
-					request := &DeleteRequest{Resource: "records/s:key", Options: test.options}
-					options := DeleteOptions{StoreName: "records", Request: request}
-					result, err = Delete(ctx, client, options)
-				case "transform":
-					program := &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
-					request := &AtomicTransformRequest{Resource: "records/s:key", Lua: program, Options: test.options}
-					options := AtomicTransformOptions{StoreName: "records", Request: request}
-					result, err = AtomicTransform(ctx, client, options)
-				}
-				if err != nil || result.GetOutcome() != MutationApplied {
-					t.Fatal(action, result, err)
-				}
-				mutation := <-peer.mutations
-				if mutation.Resource != request.Resource || !proto.Equal(mutation.Options, test.options) {
-					t.Fatal("typed operation lost its resource or complete options", action, mutation)
-				}
-				selected := false
-				switch action {
-				case "create":
-					selected = mutation.GetCreate() != nil
-				case "put":
-					selected = mutation.GetPut() != nil
-				case "replace":
-					selected = mutation.GetReplace() != nil
-				case "delete":
-					selected = mutation.GetDelete() != nil
-				case "transform":
-					selected = mutation.GetAtomicTransform().GetLua() != nil
-				}
-				if !selected {
-					t.Fatal("SDK executed a different mutation", action, mutation)
-				}
-			}
-			if peer.received.Load() != 5 {
-				t.Fatal("typed mutations were replayed", peer.received.Load())
-			}
-		})
-	}
-}
-
-func TestAtomicTransformRejectsAmbiguousFormsBeforeBusinessSend(t *testing.T) {
-	for _, both := range []bool{false, true} {
-		t.Run(map[bool]string{false: "neither", true: "both"}[both], func(t *testing.T) {
-			peer := &clientTestPeer{mode: "typed_mutation"}
-			client := clientTestConnection(t, peer)
-			request := &AtomicTransformRequest{Resource: "records/s:key"}
-			if both {
-				request.Lua = &LuaTransform{Source: []byte("return function(current, incoming) return current end")}
-				request.BackendExpression = &Document{ContentType: "application/json", Data: []byte(`{}`)}
-			}
-			options := AtomicTransformOptions{StoreName: "records", Request: request}
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-			if result, err := AtomicTransform(ctx, client, options); err == nil || result != nil {
-				t.Fatal("invalid transform was not rejected", result, err)
-			}
-			if peer.received.Load() != 0 {
-				t.Fatal("invalid transform sent business data", peer.received.Load())
-			}
-		})
-	}
-}
 
 func (p *clientTestPeer) nativeExecute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
 	metadata := &Document{ContentType: "application/vnd.example.response", Data: []byte{0xff, 0}}
@@ -237,33 +118,32 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: test.mode}
-			client := clientTestConnection(t, peer)
-			options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+			client := clientTestClient(t, peer)
 			chunks := 0
 			failure := errors.New("consumer rejected body")
-			options.Consume = func(_ context.Context, response *NativeResponse, data []byte) error {
+			consume := func(_ context.Context, response *NativeResponse, data []byte) error {
 				chunks++
 				if string(data) != "native body bytes" {
-					t.Fatal("body bytes changed", response, data)
+					t.Error("body bytes changed", response, data)
 				}
 				if test.mode == "native_http_error" {
 					httpResponse, err := ParseHTTPNativeResponse(response)
 					if err != nil || httpResponse.StatusCode != 404 {
-						t.Fatal("complete native HTTP failure lost metadata", response, err)
+						t.Error("complete native HTTP failure lost metadata", response, err)
 					}
 				} else if test.mode == "native_no_metadata" {
 					if response.Metadata != nil {
-						t.Fatal("absent metadata changed", response)
+						t.Error("absent metadata changed", response)
 					}
 				} else if response.Metadata.ContentType != "application/vnd.example.response" {
-					t.Fatal("opaque metadata changed", response)
+					t.Error("opaque metadata changed", response)
 				}
 				if test.mode == "native_consumer_chunk_error" {
 					return failure
 				}
 				return nil
 			}
-			result, err := Native(t.Context(), client, options)
+			result, err := client.Native(t.Context(), "records", clientTestNativeRequest(), WithChunks(consume))
 			if result == nil || result.Completion != test.completion || (result.Response != nil) != test.response || (result.Failure != nil) != test.failure || chunks != test.chunks || (err != nil) != test.rpcError {
 				t.Fatal("Native conflated body, completion and RPC evidence", result, err, chunks)
 			}
@@ -279,12 +159,10 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 
 func TestNativeSendsBackendRootRequest(t *testing.T) {
 	peer := &clientTestPeer{mode: "native_no_metadata"}
-	client := clientTestConnection(t, peer)
+	client := clientTestClient(t, peer)
 	document := &Document{ContentType: "application/http", Data: []byte("GET /_cluster/health HTTP/1.1\r\n\r\n")}
 	request := &NativeRequest{Request: document}
-	options := NativeOptions{StoreName: "search", Request: request}
-	options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
-	result, err := Native(t.Context(), client, options)
+	result, err := client.Native(t.Context(), "search", request)
 	if err != nil || result == nil || result.Completion != NativeResponseComplete || peer.streams.Load() != 1 || peer.received.Load() != 1 {
 		t.Fatal("Native backend root request failed", result, err, peer.streams.Load(), peer.received.Load())
 	}
@@ -294,11 +172,10 @@ func TestNativeRejectsContradictoryOrMalformedResponseEvidence(t *testing.T) {
 	for _, mode := range []string{"native_empty_chunk", "native_not_started_after_head", "native_not_started_after_chunk", "native_duplicate_head", "native_chunk_before_head", "native_complete_without_head", "native_invalid_metadata", "native_unknown_completion", "native_unknown_fields", "native_unknown_fields_final_error", "native_unknown_failure", "native_missing_end", "native_wrong_kind", "native_wrong_index"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			options := NativeOptions{StoreName: "records", Request: clientTestNativeRequest()}
+			client := clientTestClient(t, peer)
 			chunks := 0
-			options.Consume = func(context.Context, *NativeResponse, []byte) error { chunks++; return nil }
-			result, err := Native(t.Context(), client, options)
+			consume := func(context.Context, *NativeResponse, []byte) error { chunks++; return nil }
+			result, err := client.Native(t.Context(), "records", clientTestNativeRequest(), WithChunks(consume))
 			if err == nil || result != nil && result.Completion != NativeCompletionUnconfirmed {
 				t.Fatal("invalid completion evidence exposed", result, err)
 			}
@@ -320,14 +197,47 @@ func TestNativeRejectsInvalidRequestEnvelopeBeforeRPC(t *testing.T) {
 		{Resource: "records", Request: invalid},
 	} {
 		peer := &clientTestPeer{}
-		client := clientTestConnection(t, peer)
-		options := NativeOptions{StoreName: "records", Request: request}
-		options.Consume = func(context.Context, *NativeResponse, []byte) error { return nil }
-		if result, err := Native(t.Context(), client, options); err == nil || result != nil {
+		client := clientTestClient(t, peer)
+		if result, err := client.Native(t.Context(), "records", request); err == nil || result != nil {
 			t.Fatal("invalid native request envelope accepted", result, err)
 		}
 		if peer.streams.Load() != 0 {
 			t.Fatal("invalid request opened an RPC")
 		}
+	}
+}
+
+func TestNativeCollectsTheBodyUnlessChunksConsumeIt(t *testing.T) {
+	peer := &clientTestPeer{mode: "native_normal"}
+	client := clientTestClient(t, peer)
+	result, err := client.Native(t.Context(), "records", clientTestNativeRequest())
+	if err != nil || string(result.Body) != "native body bytes" || result.Completion != NativeResponseComplete {
+		t.Fatal("the body was not collected", result, err)
+	}
+	var chunks [][]byte
+	consume := func(_ context.Context, _ *NativeResponse, chunk []byte) error {
+		chunks = append(chunks, chunk)
+		return nil
+	}
+	result, err = client.Native(t.Context(), "records", clientTestNativeRequest(), WithChunks(consume))
+	if err != nil || result.Body != nil || len(chunks) != 1 || string(chunks[0]) != "native body bytes" {
+		t.Fatal("a consumed body was also collected", result, chunks, err)
+	}
+}
+
+func TestNativeKeepsTheBodyThatArrivedBeforeAnError(t *testing.T) {
+	peer := &clientTestPeer{mode: "native_final_status_error"}
+	client := clientTestClient(t, peer)
+	result, err := client.Native(t.Context(), "records", clientTestNativeRequest())
+	if status.Code(err) != codes.Unavailable || result == nil || string(result.Body) != "native body bytes" {
+		t.Fatal("a later error lost the body", result, err)
+	}
+}
+
+func TestNativeRequiresARequest(t *testing.T) {
+	peer := &clientTestPeer{}
+	client := clientTestClient(t, peer)
+	if result, err := client.Native(t.Context(), "records", nil); err == nil || result != nil || peer.streams.Load() != 0 {
+		t.Fatal("a call without a request was accepted", result, err)
 	}
 }

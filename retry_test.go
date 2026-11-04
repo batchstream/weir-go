@@ -138,10 +138,7 @@ func putRequest(resource, data string) *MutateRequest {
 }
 
 func refusingPut(ctx context.Context, client *Client, resource string) (*MutationResult, error) {
-	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
-	request := &WriteRequest{Resource: resource, Document: document}
-	options := WriteOptions{StoreName: "records", Request: request}
-	return client.Put(ctx, options)
+	return mutateOne(ctx, client, putRequest(resource, `{}`))
 }
 
 func TestClientResendsRecordsAServerRefusedBeforeTheyBegan(t *testing.T) {
@@ -154,8 +151,7 @@ func TestClientResendsRecordsAServerRefusedBeforeTheyBegan(t *testing.T) {
 		t.Fatal("refused write was not resent until applied", result, err, peer.sent("records/s:write"))
 	}
 	request := &ReadRequest{Resource: "records/s:read"}
-	options := ReadOneOptions{StoreName: "records", Request: request}
-	read, err := client.ReadOne(t.Context(), options)
+	read, err := readOne(t.Context(), client, request)
 	if err != nil || !read.Missing || peer.sent("records/s:read") != 2 {
 		t.Fatal("refused read was not resent", read, err, peer.sent("records/s:read"))
 	}
@@ -214,8 +210,7 @@ func TestMutateResendsRefusedRecordsWithoutReorderingAResource(t *testing.T) {
 	peer := newRefusingPeer()
 	client := refusingClient(t, peer)
 	mutate := func(requests ...*MutateRequest) []*MutationResult {
-		options := MutateOptions{StoreName: "records", Requests: requests}
-		results, err := client.Mutate(t.Context(), options)
+		results, err := client.Mutate(t.Context(), "records", WithRequests(requests...))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -253,8 +248,7 @@ func TestReadResendsRefusedReads(t *testing.T) {
 	client := refusingClient(t, peer)
 	first := &ReadRequest{Resource: "records/s:a"}
 	second := &ReadRequest{Resource: "records/s:b"}
-	options := ReadOptions{StoreName: "records", Requests: []*ReadRequest{first, second}}
-	results, err := client.Read(t.Context(), options)
+	results, err := client.Read(t.Context(), "records", WithRequests(first, second))
 	if err != nil || !results[0].Missing || !results[1].Missing {
 		t.Fatal("refused read was not resent", results, err)
 	}

@@ -22,12 +22,12 @@ func main() {
 		panic(err)
 	}
 	defer client.Close()
-	readOptions := weir.ReadOptions{StoreName: *store}
+	var requests []*weir.ReadRequest
 	for _, resource := range strings.Split(*resources, ",") {
 		request := &weir.ReadRequest{Resource: resource}
-		readOptions.Requests = append(readOptions.Requests, request)
+		requests = append(requests, request)
 	}
-	reads, err := client.Read(ctx, readOptions)
+	reads, err := client.Read(ctx, *store, weir.WithRequests(requests...))
 	if err != nil {
 		panic(err)
 	}

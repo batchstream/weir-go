@@ -1,8 +1,6 @@
 package weir
 
 import (
-	"context"
-
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 )
@@ -19,10 +17,6 @@ type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome
 
-// MutationOptions controls completion uniformly for every mutation action.
-// A nil Options or zero Visibility waits for application acknowledgement.
-type MutationOptions = pb.MutationOptions
-type MutationVisibility = pb.MutationVisibility
 type LuaTransform = pb.LuaTransform
 type ReadRequest = pb.ReadRequest
 
@@ -38,9 +32,6 @@ const (
 	MutationNotApplied = pb.MutationOutcome_NOT_APPLIED
 	MutationApplied    = pb.MutationOutcome_APPLIED
 	MutationUnknown    = pb.MutationOutcome_UNKNOWN
-
-	MutationApplicationAcknowledged = pb.MutationVisibility_APPLICATION_ACKNOWLEDGED
-	MutationQueryVisible            = pb.MutationVisibility_QUERY_VISIBLE
 
 	NativeCompletionUnconfirmed = pb.NativeCompletion_NATIVE_COMPLETION_UNSPECIFIED
 	NativeNotStarted            = pb.NativeCompletion_NATIVE_NOT_STARTED
@@ -64,48 +55,16 @@ const (
 // EncodeSegment encodes one decoded resource path segment, including slashes.
 func EncodeSegment(segment string) string { return protocol.EncodeSegment(segment) }
 
-type WriteRequest struct {
-	Resource string
-	Document *Document
-	Options  *MutationOptions
-}
-
-type DeleteRequest struct {
-	Resource string
-	Options  *MutationOptions
-}
-
-// AtomicTransformRequest requires exactly one of Lua and BackendExpression.
-type AtomicTransformRequest struct {
-	Resource          string
-	Lua               *LuaTransform
-	BackendExpression *Document
-	Options           *MutationOptions
-}
-
 // NativeResult retains validated response and completion evidence. Completion is
 // NativeCompletionUnconfirmed until a terminal acknowledgement arrives; Response
 // may already be available. An RPC error never revokes a confirmed terminal.
 // Completion describes response transport, not whether backend writes applied.
+// Body holds the response body of a call without WithChunks, as far as it arrived.
 type NativeResult struct {
 	Response   *NativeResponse
+	Body       []byte
 	Completion NativeCompletion
 	Failure    *Failure
-}
-
-// ReadOneOptions describes a single read. Use ReadOptions to share one RPC across
-// multiple independent requests in the same Store.
-type ReadOneOptions struct {
-	StoreName string
-	Request   *ReadRequest
-}
-
-// ReadOptions describes a finite read sequence addressed to one Store. Resources
-// are canonical paths relative to StoreName. Results have the input order. Do
-// not mutate requests or their document bytes until the call returns.
-type ReadOptions struct {
-	StoreName string
-	Requests  []*ReadRequest
 }
 
 // MutationAction selects one business operation without a protobuf oneof.
@@ -121,80 +80,12 @@ const (
 
 // MutateRequest describes one mutation. Create, Put and Replace require Document;
 // Delete accepts no payload; AtomicTransform requires Lua or BackendExpression.
-// Options applies to every action. MutationQueryVisible requires visibility to
-// subsequent normal queries before an APPLIED result without Failure. APPLIED
-// with Failure confirms application only. Nil Options or zero Visibility waits
-// for application acknowledgement without a separate visibility guarantee.
 type MutateRequest struct {
 	Resource          string
 	Action            MutationAction
 	Document          *Document
 	Lua               *LuaTransform
 	BackendExpression *Document
-	Options           *MutationOptions
-}
-
-// MutateOptions describes independent mutations addressed to one Store. It is
-// not a transaction. Same-resource requests execute in input order; different
-// resources may execute concurrently. Cross-RPC ordering follows the database.
-// Do not mutate requests, options or their document bytes until the call returns.
-type MutateOptions struct {
-	StoreName string
-	Requests  []*MutateRequest
-}
-
-// ReadStreamOptions produces reads without retaining every input or result. Next
-// returns io.EOF after its final item. Items are validated before
-// they are sent; an invalid later item does not undo earlier requests.
-// Consume receives each confirmed result as its record completes; the index
-// identifies the input, starting at 1.
-// Next and Consume run concurrently; synchronize any shared application state.
-// Both callbacks must honor their context and return promptly. Keep yielded
-// requests and document bytes immutable until the corresponding Consume call.
-type ReadStreamOptions struct {
-	StoreName string
-	Next      func(context.Context) (*ReadRequest, error)
-	Consume   func(context.Context, uint64, *ReadResult) error
-}
-
-// MutateStreamOptions incrementally produces mutations to one Store. Next
-// returns io.EOF after the final item. Consume receives confirmed results as
-// their records complete, identified by input index; a later error does not
-// revoke those acknowledgements. Items not consumed remain unacknowledged and
-// must never be automatically replayed.
-// Next and Consume run concurrently; synchronize any shared application state.
-// Both callbacks must honor their context and return promptly. Keep yielded
-// requests, options and document bytes immutable until the corresponding
-// Consume call.
-type MutateStreamOptions struct {
-	StoreName string
-	Next      func(context.Context) (*MutateRequest, error)
-	Consume   func(context.Context, uint64, *MutationResult) error
-}
-
-type WriteOptions struct {
-	StoreName string
-	Request   *WriteRequest
-}
-
-type DeleteOptions struct {
-	StoreName string
-	Request   *DeleteRequest
-}
-
-type AtomicTransformOptions struct {
-	StoreName string
-	Request   *AtomicTransformRequest
-}
-
-// Native consumes only nonempty response chunks with their validated metadata.
-// Consume completes before the next chunk and must honor its context. An empty
-// response invokes no callback; its metadata is available in NativeResult. Do
-// not mutate response metadata, which remains attached to the final result.
-type NativeOptions struct {
-	StoreName string
-	Request   *NativeRequest
-	Consume   func(context.Context, *NativeResponse, []byte) error
 }
 
 // ReadResult contains exactly one of Document, Missing, or Failure. Missing

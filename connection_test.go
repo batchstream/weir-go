@@ -2,6 +2,7 @@ package weir
 
 import (
 	"testing"
+	"time"
 
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
@@ -28,7 +29,7 @@ func TestNewRequiresHostAndPort(t *testing.T) {
 }
 
 // A resolver that returns several servers and its own service config must not
-// change the client's round-robin balancing or turn on retries.
+// change the client's balancing or turn on retries.
 func TestConnectionSpreadsCallsAndIgnoresResolverServiceConfig(t *testing.T) {
 	first, second := &clientTestPeer{}, &clientTestPeer{}
 	addresses := []resolver.Address{{Addr: clientTestAddress(t, first)}, {Addr: clientTestAddress(t, second)}}
@@ -41,22 +42,31 @@ func TestConnectionSpreadsCallsAndIgnoresResolverServiceConfig(t *testing.T) {
 		state := resolver.State{Addresses: addresses, ServiceConfig: config}
 		builder.InitialState(state)
 	}
-	options := append(connectionOptions(roundRobinConfig), grpc.WithResolvers(builder))
+	options := append(connectionOptions(), grpc.WithResolvers(builder))
 	connection, err := grpc.NewClient("weirtest:///records", options...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	// Package-level calls open one stream each, so every call is balanced.
-	store := pb.NewStoreServiceClient(connection)
-	for range 40 {
-		request := clientTestReadRequest()
-		readOptions := ReadOneOptions{StoreName: "records", Request: request}
-		if _, err := ReadOne(t.Context(), store, readOptions); err != nil {
+	// A stream of its own is balanced on each call.
+	client := &Client{store: pb.NewStoreServiceClient(connection)}
+	command, _, err := readCommand(clientTestReadRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := int64(0)
+	deadline := time.Now().Add(5 * time.Second)
+	for first.streams.Load() == 0 || second.streams.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("calls did not reach both servers", first.streams.Load(), second.streams.Load())
+		}
+		_, err := readKind.alone(t.Context(), client, "records", command)
+		if err != nil {
 			t.Fatal(err)
 		}
+		calls++
 	}
-	if first.streams.Load() == 0 || second.streams.Load() == 0 || first.streams.Load()+second.streams.Load() != 40 {
-		t.Fatal("calls were not spread across both servers exactly once", first.streams.Load(), second.streams.Load())
+	if first.streams.Load()+second.streams.Load() != calls {
+		t.Fatal("calls were not sent exactly once", first.streams.Load(), second.streams.Load(), calls)
 	}
 }
