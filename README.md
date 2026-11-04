@@ -2,452 +2,200 @@
 
 [![CI](https://github.com/batchstream/weir-go/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/batchstream/weir-go/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/batchstream/weir-go.svg)](https://pkg.go.dev/github.com/batchstream/weir-go) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.3.
-Point a client at a Weir application address and send typed business requests to
-the Stores hosted there. IP and DNS addresses work in Kubernetes and other
-deployments.
+Typed Go client for [Weir](https://github.com/batchstream/weir).
+
+## Overview
+
+### Methods
+
+| Method | Use |
+| --- | --- |
+| `ReadOne` | Read one record. |
+| `Read` | Read many records. Results return in input order. |
+| `Create` | Write one record that must not exist. |
+| `Replace` | Write one record that must exist. |
+| `Put` | Create or replace one record. |
+| `Delete` | Delete one record. |
+| `Mutate` | Write many records in one call. Not a transaction. |
+| `AtomicTransform` | Change one record with a Lua function or a backend expression. |
+| `ReadStream`, `MutateStream` | Send and receive records incrementally. |
+| `Native` | Send a backend's own command. Use it for queries, scans and counts. |
+
+### Backend formats
+
+| Backend | Resource | Document content type |
+| --- | --- | --- |
+| MongoDB | `database/collection/s:key` | `application/bson`. The first field is an `_id` that matches the key. |
+| Elasticsearch, OpenSearch | `index/s:key` | `application/json` |
+
+The SDK does not encode documents. Your code owns the document bytes.
+
+### Mutation outcomes
+
+| Outcome | Meaning |
+| --- | --- |
+| `MutationApplied` | The requested change is in effect. It can still carry a Failure from a later acknowledgement. |
+| `MutationNotStarted` | No backend mutation began. |
+| `MutationNotApplied` | The mutation is known not to have applied. |
+| `MutationUnknown` | The mutation may or may not have applied. |
+
+### Rules
+
+1. Create one Client and reuse it across goroutines. Close it after callers
+   finish.
+2. Set a context deadline on every call.
+3. Check the Go error and every result. A record can fail while the Go error is
+   nil.
+4. Never automatically resend a mutation that is `MutationUnknown` or has no
+   result. It may have applied. Reconcile it first.
+5. The application listener uses plaintext gRPC. Restrict its network access.
+
+## Requirements
+
+| Item | Requirement |
+| --- | --- |
+| Go | 1.27.3 |
+| Weir server | Reachable at a `host:port` address. In Kubernetes, use a headless Service. |
+| Collections and indices | Must exist before typed reads and mutations. `Native` can create them. |
+
+## Quick start
+
+This writes one record to MongoDB through Weir and reads it back.
+
+**Step 1.** Start MongoDB and Weir with steps 1 to 4 of the
+[Weir quick start](https://github.com/batchstream/weir#quick-start).
+
+**Step 2.** In a second terminal, create a module and add the SDK.
 
 ```sh
-go get github.com/batchstream/weir-go@v0.23.0
+mkdir hello
+cd hello
+go mod init example.com/hello
+go get github.com/batchstream/weir-go@v0.23.0 go.mongodb.org/mongo-driver/v2/bson
 ```
 
-The SDK depends on the stable `github.com/batchstream/weir-protocol v0.17.0`
-release. The independent protocol repository owns public schemas, generated
-protobuf types and shared validation. Both Weir and this SDK consume
-it; neither the protocol nor SDK module depends on the server. The SDK does not
-generate schemas.
-
-## Connect and read
-
-Import only `weir "github.com/batchstream/weir-go"` for ordinary business calls:
+**Step 3.** Save this as `main.go`.
 
 ```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-client, err := weir.New("127.0.0.1:7447")
-if err != nil { return err }
-defer client.Close()
+package main
 
-first := &weir.ReadRequest{Resource: "records/s:example"}
-second := &weir.ReadRequest{Resource: "records/s:another"}
-readOptions := weir.ReadOptions{StoreName: "search", Requests: []*weir.ReadRequest{first, second}}
-results, err := client.Read(ctx, readOptions)
-if err != nil { return fmt.Errorf("read RPC failed; unacknowledged results %v: %w", results, err) }
-for index, result := range results {
-    if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
-    fmt.Println(index, "missing:", result.Missing)
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	weir "github.com/batchstream/weir-go"
+	"go.mongodb.org/mongo-driver/v2/bson"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := weir.New("127.0.0.1:7447")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	const storeName = "mongo"
+	const resource = "weir_example/records/s:hello"
+
+	// Write one record. The first field is an _id that matches the resource key.
+	record := bson.D{{Key: "_id", Value: "hello"}, {Key: "message", Value: "hi"}}
+	data, err := bson.Marshal(record)
+	if err != nil {
+		log.Fatal(err)
+	}
+	document := &weir.Document{ContentType: "application/bson", Data: data}
+	writeRequest := &weir.WriteRequest{Resource: resource, Document: document}
+	writeOptions := weir.WriteOptions{StoreName: storeName, Request: writeRequest}
+	written, err := client.Put(ctx, writeOptions)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if written.GetFailure() != nil {
+		log.Fatal(written.GetFailure())
+	}
+	fmt.Println("outcome:", written.GetOutcome())
+
+	// Read the record back.
+	readRequest := &weir.ReadRequest{Resource: resource}
+	readOptions := weir.ReadOneOptions{StoreName: storeName, Request: readRequest}
+	result, err := client.ReadOne(ctx, readOptions)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if result.Failure != nil {
+		log.Fatal(result.Failure)
+	}
+	fmt.Println("missing:", result.Missing)
+
+	var stored bson.M
+	err = bson.Unmarshal(result.Document.Data, &stored)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("message:", stored["message"])
 }
 ```
 
-`New` takes a `host:port` address and rejects anything else. It connects on
-first use and reconnects after failures. When a DNS name resolves to several
-Weir servers, streams are spread round-robin across them, so every server behind
-the address must host the Stores the client uses. Each Read, Mutate, record
-stream or Native call uses a gRPC stream of its own; single-record calls share
-streams, as described under [Streaming and deadlines](#streaming-and-deadlines). Use a name
-that lists every server, such as a Kubernetes headless Service; a ClusterIP
-Service resolves to one virtual IP. The Client looks the name up again every 5
-seconds. A server that joins receives new calls once connected, and shared
-streams move to it until every server carries about the same number. A server
-that stops resolving, as a Kubernetes Pod does once it starts terminating,
-receives no new records; its streams finish the records they carry and close.
-So scaling a headless Service up or down, or rolling out a new version, does not
-fail calls, however long they run, provided a server stops resolving at least a
-few seconds before it stops taking records, as the Weir chart's preStop delay
-arranges. A server that does not host the requested
-Store fails the call with NotFound. Reuse the client across goroutines and
-close it after callers finish.
-Calls started after `Close` return `ErrClosed`; calls still running end with a
-gRPC cancellation error. A call of a Client whose context ends returns the
-context's error, so test it with `errors.Is` rather than its gRPC status; the
-package operation functions return the gRPC status. A Client sends a record again only when a server refused it
-before it began, as described under
-[Resending refused records](#resending-refused-records).
+**Step 4.** Run it.
 
-In Kubernetes, give the Service's full name with a trailing dot, such as
-`weir.application.svc.cluster.local.:7447`. Without the dot, a name with fewer
-than five dots is first tried under each of the Pod's DNS search domains. In a
-Pod with four search domains, one lookup of `weir.application.svc` sends 6
-queries and `weir.application.svc.cluster.local` sends 10, against 2 with the
-dot; every Client repeats its lookup every 5 seconds.
-
-A Client pings a server it has heard nothing from for 10 seconds and drops the
-connection if no answer comes within 5 seconds, so calls leave a server they
-can no longer reach, such as one behind a broken network path or a hung
-process, even while its name still resolves. Calls waiting on that connection
-end with an error, and a mutation sent on it has an unknown outcome. Servers
-must accept pings this often, as those of the Weir chart 0.15.0-rc.1 and later
-do; an older server ends such connections, after which the Client pings less
-often for the rest of its life. Upgrade servers before Clients.
-
-Resources are canonical paths relative to `StoreName`.
-`weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
-are `DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
-`application/bson` with the first `_id` matching the resource key. Search documents
-use `application/json`. The caller owns its document codec; the SDK preserves bytes.
-
-## Business operations
-
-Each method takes named options with `StoreName`. `Read` and `Mutate` accept
-`Requests`; single-operation helpers accept `Request`:
-
-| Method | Options / request | Result |
-| --- | --- | --- |
-| `Read` | `ReadOptions` / multiple `ReadRequest` | `[]*ReadResult`: Document, Missing, Failure |
-| `Mutate` | `MutateOptions` / multiple `MutateRequest` | `[]*MutationResult` |
-| `ReadStream` | `ReadStreamOptions` / producer and consumer | per-item `ReadResult` callbacks |
-| `MutateStream` | `MutateStreamOptions` / producer and consumer | per-item `MutationResult` callbacks |
-| `ReadOne` | `ReadOneOptions` / `ReadRequest` | `ReadResult` |
-| `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
-| `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
-| `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
-| `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
-
-`Read` and `Mutate` validate the complete input before sending anything. An empty
-input, nil request, malformed resource, unsupported action or invalid document
-envelope rejects the entire call without sending earlier valid items. Every
-resource is relative to one `StoreName`. Each input is sent as one
-ExecuteRequest as soon as the window and an earlier mutation of its resource allow.
-Results arrive as records complete and are returned in input order, including
-repeated resources. Individual backend failures stay in their result positions. A later
-RPC failure preserves every validated result already received; unconfirmed
-positions remain nil and any such mutation may have applied. Never
-automatically replay those mutations.
-
-```go
-firstDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1}`)}
-secondDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":2}`)}
-first := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationPut, Document: firstDoc}
-second := &weir.MutateRequest{Resource: "records/s:second", Action: weir.MutationPut, Document: secondDoc}
-options := weir.MutateOptions{StoreName: "search", Requests: []*weir.MutateRequest{first, second}}
-results, err := client.Mutate(ctx, options)
-// Inspect every result's Outcome/Failure, even when err is nonnil. Never replay
-// an unacknowledged mutation automatically.
+```sh
+go run .
 ```
 
-`MutateRequest.Action` selects `MutationCreate`, `MutationPut`, `MutationReplace`,
-`MutationDelete` or `MutationAtomicTransform`. Writes require Document, Delete
-accepts no payload, and AtomicTransform requires exactly one Lua or
-BackendExpression. A batch is not a transaction. Mutations to the same resource
-execute in input order, including after an item failure; different resources may
-run concurrently. Across RPCs, ordering follows the database semantics.
+Expected output:
 
-A logical call has no total byte or item limit. Each ExecuteRequest carries one
-read or mutation and each response carries its indexed result. Backend protocols determine accepted document sizes. The SDK permits at most 32 unconsumed results and 8 MiB of
-unacknowledged encoded input; a larger legal request uses the window alone.
-Credit returns after each Consume callback finishes. A size-dependent wait can
-hold one produced item that has not yet been sent. Sending and receiving run
-concurrently so HTTP/2 flow control advances in both directions. The SDK never
-waits for another input or EOF before sending the current item.
-`Read` and `Mutate` intentionally accumulate results for their caller; use the
-streaming interfaces to avoid retaining the full input and result sequence.
-
-`WriteRequest` contains Resource and Document. Create requires absence; Replace
-requires an existing resource; Put creates or replaces. AtomicTransform requires
-exactly one Lua or BackendExpression. `MutateRequest`, `WriteRequest`,
-`DeleteRequest` and `AtomicTransformRequest` share `Options *MutationOptions`.
-Nil options or `MutationApplicationAcknowledged` (the zero Visibility value)
-wait for application acknowledgement. Set Visibility to `MutationQueryVisible`
-when subsequent normal queries must observe the mutation before the operation
-succeeds.
-An APPLIED result without Failure confirms that guarantee; APPLIED with Failure
-confirms application only and must not be replayed automatically. This includes
-Lua keep and missing-document deletes. Search adapters wait for refresh; backends
-without deferred query visibility satisfy this when the mutation is acknowledged.
-The SDK forwards the complete options message and rejects unknown option fields
-or undeclared visibility values.
-Keep options immutable until the call returns or its result is consumed.
-
-```go
-completion := &weir.MutationOptions{Visibility: weir.MutationQueryVisible}
-request := &weir.WriteRequest{Resource: "records/s:first", Document: document, Options: completion}
-options := weir.WriteOptions{StoreName: "search", Request: request}
-result, err := client.Put(ctx, options)
+```text
+outcome: APPLIED
+missing: false
+message: hi
 ```
 
-`ReadResult` contains exactly one of Document, Missing, or Failure. Missing is a
-successful read that confirmed document absence. `FailureTargetNotFound` means a
-required backend collection or index is missing. A failure does not establish
-that the requested document is absent. Individual Read/Mutate failures are result
-data, even when the Go error is nil; inspect every result as well as the error.
+## Documentation
 
-`MutationApplied` means the requested semantics were satisfied. It includes a
-successful Lua keep and deleting an already absent document without a database
-write. APPLIED may carry a subsequent acknowledgement Failure. Other outcomes
-always carry a Failure: NOT_STARTED means no backend mutation began, NOT_APPLIED
-means absence of application was established, and UNKNOWN means available evidence
-cannot establish whether it applied. A later RPC failure does not revoke any
-confirmed item. Unconfirmed nil positions may have applied; reconcile them through
-application knowledge and never automatically replay writes.
+| Guide | Contents |
+| --- | --- |
+| [Connections](docs/connections.md) | Addresses, Kubernetes DNS names, keepalive and closing |
+| [Operations](docs/operations.md) | Reads, writes, visibility, results and outcomes |
+| [Lua](docs/lua.md) | Lua transforms |
+| [Native](docs/native.md) | Backend commands and HTTP helpers |
+| [Streaming](docs/streaming.md) | Streams, deadlines and resending refused records |
+| [Development](docs/development.md) | Tests, real backend tests and releases |
+| [API reference](https://pkg.go.dev/github.com/batchstream/weir-go) | Every exported type and function |
 
-Requests and responses reject unknown protobuf fields recursively. FailureCode
-accepts only declared nonzero values. The SDK validates required result variants,
-completion evidence, document envelopes and indexes. A Failure leads to a
-resend only as described under
-[Resending refused records](#resending-refused-records), and never changes
-confirmed MutationApplied evidence.
-A malformed later response preserves previously confirmed results.
+| Example | Shows |
+| --- | --- |
+| [read](examples/read/main.go) | A typed read |
+| [basic](examples/basic/main.go) | A mutation, then many reads in one stream |
+| [native](examples/native/main.go) | A native command and its response |
 
-### Lua transforms
-
-`LuaTransform` accepts UTF-8 Source and optional Input. Source must return exactly
-one function, called with ordinary Lua tables as `function(current, incoming)`.
-Missing current or omitted Input is nil. Fields, arrays, comparisons and loops
-use ordinary Lua syntax; `weir.null()` represents explicit document null.
-For example, this merge can create a record on its first call:
-
-```go
-input := &weir.Document{ContentType: "application/json", Data: []byte(`{"state":"ready"}`)}
-source := []byte(`return function(current, incoming)
-    current = current or weir.object()
-    for key, item in pairs(incoming or {}) do current[key] = item end
-    return current
-end`)
-lua := &weir.LuaTransform{Source: source, Input: input}
-request := &weir.AtomicTransformRequest{Resource: "records/s:first", Lua: lua}
-options := weir.AtomicTransformOptions{StoreName: "search", Request: request}
-result, err := client.AtomicTransform(ctx, options)
-```
-
-Mongo Input uses BSON. Lua source and document values have no Weir size, depth,
-or node-count gate. The callback must return exactly one object to create/replace,
-or `weir.keep()`, `weir.delete()` or `weir.reject(message)`. Reject returns
-NOT_APPLIED with PRECONDITION_FAILED; nil, missing/multiple returns and scalar
-results are errors. `weir.object()` and `weir.array()` distinguish empty containers.
-Lua integers preserve 64 bits, and `weir.time.now()` returns one fixed UTC timestamp
-per operation, including confirmed conflict retries. This function entry point,
-return contract, helper behavior and document conversion follow the protocol's
-Lua contract. See the server's
-[Lua guide](https://github.com/batchstream/weir/blob/main/docs/lua.md).
-Concurrent first creation can trigger a bounded fresh read/evaluation after a
-confirmed conflict. An ambiguous write or commit acknowledgement never triggers
-automatic replay.
-
-### Native requests and responses
-
-`NativeRequest` has Resource and a required Request Document. Its ContentType
-identifies an adapter-owned format; Data carries opaque bytes and may be empty. The public protocol and SDK do not select or interpret backends.
-A new Store can use its own content type without changing the schema or SDK.
-Backend queries, counts and traversal use Native with caller-owned backend
-commands, pagination and cleanup.
-Native imposes no command, method, path or parameter allowlist. The backend
-handles authorization and operation semantics. Resource is an optional canonical
-prefix; empty addresses the backend root when supported. MongoDB accepts a
-database target or an empty Resource with `$db` in its `application/bson` command
-document. Search uses `application/http` and an optional resource prefix.
-
-```go
-document := &weir.Document{ContentType: "application/vnd.example.command", Data: commandBytes}
-request := &weir.NativeRequest{Resource: "records", Request: document}
-options := weir.NativeOptions{StoreName: "example", Request: request}
-options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
-    return consumeNativeBytes(ctx, response, data)
-}
-result, err := client.Native(ctx, options)
-```
-
-Consume receives nonempty response chunks and finishes before the next chunk.
-`NativeResult.Response` also retains metadata for an empty body when no callback
-runs. Response.Metadata is an optional opaque Document;
-Response.BodyContentType describes the separately streamed body. Metadata may
-use a different content type from the request. Do not mutate response metadata
-in a callback. The SDK hides the wire Head/Chunk/End phases.
-
-For HTTP-backed adapters, `NewHTTPNativeRequest(resource, request)` consumes and
-closes a standard `net/http.Request` body and serializes an `application/http`
-Document. It emits an HTTP/1.1 origin-form target, exact Content-Length and no
-default User-Agent. Methods, escaped paths, queries and application headers are
-preserved. Pass an empty resource for backend-root operations. HTTP request bodies
-and headers have no SDK size gate. Trailers are rejected. The Host header never
-chooses the Store or backend destination.
-
-```go
-httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/example", nil)
-if err != nil { return err }
-request, err := weir.NewHTTPNativeRequest("records", httpRequest)
-if err != nil { return err }
-options := weir.NativeOptions{StoreName: "search", Request: request}
-options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
-    return consumeNativeBytes(ctx, response, data)
-}
-result, err := client.Native(ctx, options)
-```
-
-`ParseHTTPNativeResponse(response)` optionally parses application/http metadata
-containing a complete status line and CRLF header block, with no body bytes or
-transfer framing. It returns HTTPNativeResponse with StatusCode and Headers;
-response body bytes continue through Native's chunk consumer. These helpers are
-ordinary HTTP codecs, independent of any Store type or protobuf backend fields.
-
-NativeResult distinguishes response evidence from the Go error. A confirmed
-NativeNotStarted means the backend operation did not start. NativeResponseIncomplete
-means it started without a complete response and establishes no write outcome.
-NativeCompletionUnconfirmed means no terminal was received; Response may still be
-available. NativeResponseComplete means all response bytes arrived. Its status/body
-can report a backend error such as HTTP 404 with no Go error; interpret that data
-separately. A validated terminal is retained alongside a later RPC error. A
-Client sends a Native request again only after a refused NativeNotStarted without
-a Response.
-
-## Streaming and deadlines
-
-All business operations use bidirectional Execute streams. Each stream addresses
-one Store and one operation kind. Native sends one request, closes its input and
-consumes response metadata and body chunks incrementally. Transport and backend
-protocols govern representable messages and accepted data.
-
-`ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
-returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
-result)` receives each confirmed result as its record completes; the index,
-starting at 1, identifies the input.
-Inputs are validated as they are produced; an invalid later item does not undo
-earlier requests. A Client's stream succeeds with one result per submitted input;
-a package function's also requires a final gRPC OK. Results delivered before a
-later producer, consumer or transport error remain evidence, and a Client's stream
-goes on delivering results it already received after such an error, unless
-Consume itself failed. Next and Consume run concurrently; synchronize shared
-application state. Callbacks must honor their context and return promptly;
-the SDK cancels and joins its sender before returning. Keep yielded requests and
-document bytes immutable until the corresponding Consume callback begins.
-
-```go
-position := 0
-options := weir.ReadStreamOptions{StoreName: "search"}
-options.Next = func(ctx context.Context) (*weir.ReadRequest, error) {
-    if position == len(resourceNames) { return nil, io.EOF }
-    request := &weir.ReadRequest{Resource: resourceNames[position]}
-    position++
-    return request, nil
-}
-options.Consume = func(ctx context.Context, index uint64, result *weir.ReadResult) error {
-    if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
-    if result.Missing { return nil }
-    return processDocument(ctx, result.Document)
-}
-err := client.ReadStream(ctx, options)
-```
-
-Consumers should commit or release each result promptly and avoid retaining
-unbounded events.
-
-A Client's `Read`, `Mutate`, `ReadStream` and `MutateStream` each send their
-records over a gRPC stream of their own, and replace it with one to another server
-when its server stops resolving or refuses a record, and every minute, so a
-call may stay open for as long as its producer has records, and an idle one holds
-no gRPC stream after 10 seconds. A record over 1 MiB uses a further gRPC stream of
-its own. `Read` and `Mutate` send the records that fit their window of 32 records
-and 8 MiB together, in messages of up to 1 MiB. A stream's mutations of one resource run in input order,
-each after the previous one's result, including after a failure; records of
-different resources may arrive at the server in any order. A broken gRPC stream
-ends the call with its error, and mutations without a result may have applied.
-The package operation functions keep one gRPC stream for the whole call, end
-with an error when its server goes away and leave following servers to their
-caller.
-
-The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
-`Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
-of the same Client, so many goroutines in one process pay for a few gRPC streams
-instead of one per call. A stream sends the records queued on it together in one
-message of up to 1 MiB, and the server returns results that complete together
-in one message, so a busy stream pays for a message per burst rather than per
-record. Each Store and operation kind takes new records on at
-most 32 streams of 32 outstanding records; another stream opens once every
-stream is half full, and calls beyond that capacity, or with a record over 1
-MiB, use a stream of their own. With fewer concurrent calls, one stream, and so
-one server, carries a Store's calls until it retires. Results return as each
-record completes, so a slow call does not hold back the others. A record the
-server rejects fails alone, but a broken stream fails every record outstanding
-on it. A call's deadline travels with its record, so the server drops it if it
-is still queued when the deadline passes. Canceling a call stops waiting and
-asks the server to cancel only that record; as with any canceled call, a record
-already executing may still take effect. When the server refuses a record
-without starting it, as a draining or overloaded server or an unavailable
-backend does, the refusal returns to the caller. A server that turns a new gRPC
-stream away before reading it, as a draining or overloaded one does, says so with
-a status detail, and that refuses the stream's records alike. For 10 seconds afterwards the
-stream takes new records only when no other stream can, and while another stream
-does, it closes as soon as it falls quiet, so new records move to other servers
-and a draining server's streams end. When every stream of a Store has refused,
-a fresh stream looks for a server that is not refusing; once that stream is
-refused too, as when the backend is unavailable everywhere, the refusing streams
-keep carrying calls and the next fresh stream opens 10 seconds later.
-Shared streams do not move to a server that refused a record, or rejected a
-stream before answering one, within those 10 seconds. Streams retire after a minute, which lets the server's connection age
-rebalance clients behind one virtual IP, and idle streams close after 10
-seconds. Shared streams do not carry outgoing gRPC metadata from a call's
-context; package operation functions keep one stream per call and send it.
-
-`Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
-operation functions accept a generated StoreService client for custom
-connections and protocol fixtures; ordinary applications use New and typed Client
-methods. `Dial` accepts any gRPC target; the caller owns its validation and the
-connection lifetime.
-
-### Resending refused records
-
-A Client sends a record again when a server refused it before it began: a
-`MutationNotStarted` mutation, a read Failure, or a `NativeNotStarted` without a
-Response, whose Failure code is `FailureUnavailable`. A replica draining for a
-rolling restart, a replica under memory pressure and an unavailable backend
-refuse this way. Such a record took no effect, so sending it again cannot apply
-it twice. `FailureResourceExhausted` reports that the request exceeded a budget
-of its own, such as a result over the message size limit, which a resend would
-exceed again. Every other result, including UNKNOWN, NOT_APPLIED, APPLIED with a
-Failure and nil positions, and every Go error reach the caller unchanged.
-
-A record is sent at most four times. The wait before each resend is jittered
-between half and all of 50 ms, 100 ms and then 200 ms. A resend is made only
-when the context deadline leaves that longest wait again for the send after it.
-A resend that still outlasts the deadline ends with the deadline error, and that
-record may have taken effect. Resends across a Client stay within one per ten
-first sends plus a burst of 100, so a server that refuses everything never
-receives several times its normal traffic. A record still refused at the end
-keeps its NOT_STARTED evidence, and later mutations of its resource in the same
-call still run after it. The caller may send it again, unless such a mutation
-did not end NOT_STARTED; sending it then would apply it after that mutation. The
-package operation functions never resend. Use caller deadlines; they bound
-resends as well as calls.
-
-## Examples and validation
-
-[read](examples/read/main.go) performs a typed read, [basic](examples/basic/main.go)
-mutates a document then reads multiple resources in one stream, and
-[native](examples/native/main.go) consumes
-native responses. These examples use SDK request and result types.
+## Development
 
 ```sh
 go test -race ./...
 go vet ./...
 ```
 
-Default tests use owned loopback fixtures, without databases or production I/O.
-CI checks typed operation dispatch, acknowledgements with transport errors,
-malformed/empty native chunks, incremental consumption,
-completion/cancellation, refusal-only resends and deadline admission. It also checks that
-the module graph does not contain the Weir server, that `go.mod` replaces no
-module and that the protocol is a released `vMAJOR.MINOR.PATCH` version.
+Default tests need no databases. See [Development](docs/development.md) for real
+backend tests.
 
-After a reviewed change is merged, an authorized maintainer publishes a stable
-version with `gh workflow run release.yml --ref main -f version=vX.Y.Z`. The
-workflow runs CI on the `main` commit, then tags that commit and creates its
-GitHub release; it refuses a version already tagged at another commit.
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Security reports: [SECURITY.md](SECURITY.md)
 
-Real backend tests require an explicit tag and operator-provided fixtures:
+## Related repositories
 
-```sh
-WEIR_ADDRESS=127.0.0.1:7447 \
-WEIR_MONGO_STORE=mongo \
-WEIR_MONGO_RESOURCE=weir_example/records \
-WEIR_SEARCH_STORE=search \
-WEIR_SEARCH_RESOURCE=weir_example \
-go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|Streaming)' -v .
-```
+| Repository | Purpose |
+| --- | --- |
+| [weir](https://github.com/batchstream/weir) | Server |
+| **[weir-go](https://github.com/batchstream/weir-go)** | Go client SDK (this repository) |
+| [weir-protocol](https://github.com/batchstream/weir-protocol) | Public gRPC schema and validation |
+| [weir-charts](https://github.com/batchstream/weir-charts) | Helm chart |
+| [weir-tests](https://github.com/batchstream/weir-tests) | System tests and benchmarks |
 
-Pre-create disposable collections/indexes. Each test creates and cleans up only
-its generated records. Lifecycle tests cover CRUD, backend expressions and
-Native; streaming tests verify same-resource ordering through an individual
-failure, Lua persistence, and repeated and missing reads. System integration tests,
-backend fault tests and throughput benchmarks belong to the independent
-[weir-tests](https://github.com/batchstream/weir-tests) repository.
+## License
 
-The Weir application listener uses plaintext gRPC; restrict its network access.
+MIT. See [LICENSE](LICENSE).
