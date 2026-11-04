@@ -25,12 +25,12 @@ go vet ./...
 ```
 
 Default tests use owned loopback fixtures, without databases.
-[Real backend tests](README.md#examples-and-validation) need the `integration` tag
+[Real backend tests](docs/development.md#real-backend-tests) need the `integration` tag
 and operator-provided fixtures.
 
 ## Prepare a pull request
 
 - Keep the change focused and explain the observed problem and resulting behavior.
 - Add a regression test when fixing behavior.
-- Update the README and [examples](examples) when the API changes.
+- Update the README, [docs](docs) and [examples](examples) when the API changes.
 - Add system integration, backend fault tests and throughput benchmarks to [weir-tests](https://github.com/batchstream/weir-tests).
