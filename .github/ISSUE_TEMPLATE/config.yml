@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/batchstream/weir-go#readme
+    about: Usage and development guide for this repository.
+  - name: Weir server issues
+    url: https://github.com/batchstream/weir/issues
+    about: Report problems specific to the Weir server.
+  - name: Security vulnerability
+    url: https://github.com/batchstream/weir-go/security/advisories/new
+    about: Report a vulnerability privately.

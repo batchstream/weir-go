@@ -1,0 +1,41 @@
+name: Bug report
+description: Report incorrect behavior with a reproducible example.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, use [private reporting](https://github.com/batchstream/weir-go/security/advisories/new).
+        Remove credentials, private endpoints and document data from logs and configuration.
+  - type: input
+    id: version
+    attributes:
+      label: SDK version
+      description: Module version from `go.mod`, or commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Go version, Weir server revision, and backend and version.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest request, script or test case that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Logs and configuration
+      description: Relevant, redacted diagnostics. For performance issues, include the workload and resource limits.
+      render: text
