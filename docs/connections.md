@@ -24,7 +24,11 @@ So scaling a headless Service up or down, or rolling out a new version, does not
 fail calls, however long they run, provided a server stops resolving at least a
 few seconds before it stops taking records, as the Weir chart's preStop delay
 arranges. A server that does not host the requested
-Store fails the call with NotFound. Reuse the client across goroutines and
+Store fails the call with NotFound.
+
+## Reuse and close
+
+Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A call of a Client whose context ends returns the

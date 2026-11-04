@@ -6,6 +6,13 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 
 ## Overview
 
+### Terms
+
+| Term | Meaning |
+| --- | --- |
+| Store | A named backend connection on the Weir server. Every request names a Store. |
+| Resource | The path of one record in a Store. |
+
 ### Methods
 
 | Method | Use |
@@ -28,13 +35,15 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 | MongoDB | `database/collection/s:key` | `application/bson`. The first field is an `_id` that matches the key. |
 | Elasticsearch, OpenSearch | `index/s:key` | `application/json` |
 
-The SDK does not encode documents. Your code owns the document bytes.
+MongoDB keys can also use `i:` for a 64-bit integer or `oid:` for an ObjectId in
+lowercase hex. `weir.EncodeSegment` encodes a path segment. The SDK does not encode
+documents. Your code owns the document bytes.
 
 ### Mutation outcomes
 
 | Outcome | Meaning |
 | --- | --- |
-| `MutationApplied` | The requested change is in effect. It can still carry a Failure from a later acknowledgement. |
+| `MutationApplied` | The requested semantics were satisfied, including a no-op such as deleting an absent record. It can still carry a Failure from a later acknowledgement. |
 | `MutationNotStarted` | No backend mutation began. |
 | `MutationNotApplied` | The mutation is known not to have applied. |
 | `MutationUnknown` | The mutation may or may not have applied. |
@@ -46,9 +55,12 @@ The SDK does not encode documents. Your code owns the document bytes.
 2. Set a context deadline on every call.
 3. Check the Go error and every result. A record can fail while the Go error is
    nil.
-4. Never automatically resend a mutation that is `MutationUnknown` or has no
-   result. It may have applied. Reconcile it first.
-5. The application listener uses plaintext gRPC. Restrict its network access.
+4. Never automatically resend a mutation that is `MutationApplied` or
+   `MutationUnknown`, or that has no result. It has applied or may have applied.
+   Reconcile it first.
+5. A write may not be visible to the next Search query. Set
+   `MutationQueryVisible` when it must be.
+6. The application listener uses plaintext gRPC. Restrict its network access.
 
 ## Requirements
 
@@ -57,6 +69,7 @@ The SDK does not encode documents. Your code owns the document bytes.
 | Go | 1.27.3 |
 | Weir server | Reachable at a `host:port` address. In Kubernetes, use a headless Service. |
 | Collections and indices | Must exist before typed reads and mutations. `Native` can create them. |
+| Docker | For the quick start only |
 
 ## Quick start
 
@@ -71,7 +84,7 @@ This writes one record to MongoDB through Weir and reads it back.
 mkdir hello
 cd hello
 go mod init example.com/hello
-go get github.com/batchstream/weir-go@v0.23.0 go.mongodb.org/mongo-driver/v2/bson
+go get github.com/batchstream/weir-go@v0.23.1 go.mongodb.org/mongo-driver/v2/bson
 ```
 
 **Step 3.** Save this as `main.go`.
@@ -130,7 +143,9 @@ func main() {
 	if result.Failure != nil {
 		log.Fatal(result.Failure)
 	}
-	fmt.Println("missing:", result.Missing)
+	if result.Missing {
+		log.Fatal("record not found")
+	}
 
 	var stored bson.M
 	err = bson.Unmarshal(result.Document.Data, &stored)
@@ -151,9 +166,11 @@ Expected output:
 
 ```text
 outcome: APPLIED
-missing: false
 message: hi
 ```
+
+**Step 5.** Stop Weir and MongoDB with step 6 of the
+[Weir quick start](https://github.com/batchstream/weir#quick-start).
 
 ## Documentation
 

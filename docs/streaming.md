@@ -45,7 +45,7 @@ err := client.ReadStream(ctx, options)
 Consumers should commit or release each result promptly and avoid retaining
 unbounded events.
 
-## Streams of collecting and stream calls
+## Read, Mutate, ReadStream and MutateStream
 
 A Client's `Read`, `Mutate`, `ReadStream` and `MutateStream` each send their
 records over a gRPC stream of their own, and replace it with one to another server
