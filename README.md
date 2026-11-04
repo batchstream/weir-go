@@ -1,3 +1,19 @@
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="weir-go: a typed Go client for Weir." width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/batchstream/weir-go/actions/workflows/ci.yml"><img src="https://github.com/batchstream/weir-go/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/batchstream/weir-go/actions/workflows/vulnerabilities.yml"><img src="https://github.com/batchstream/weir-go/actions/workflows/vulnerabilities.yml/badge.svg?branch=main" alt="Vulnerabilities"></a>
+  <a href="https://pkg.go.dev/github.com/batchstream/weir-go"><img src="https://pkg.go.dev/badge/github.com/batchstream/weir-go.svg" alt="Go Reference"></a>
+  <a href="https://github.com/batchstream/weir-go/releases/latest"><img src="https://img.shields.io/github/v/release/batchstream/weir-go" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/batchstream/weir">Server</a> &nbsp;·&nbsp; <strong>Go SDK</strong> &nbsp;·&nbsp; <a href="https://github.com/batchstream/weir-protocol">Protocol</a> &nbsp;·&nbsp; <a href="https://github.com/batchstream/weir-charts">Helm chart</a> &nbsp;·&nbsp; <a href="https://github.com/batchstream/weir-tests">System tests</a>
+</p>
+
 # Weir Go SDK
 
 Typed Go client for [Weir](https://github.com/batchstream/weir). Requires Go 1.27.3.
@@ -449,3 +465,9 @@ backend fault tests and throughput benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
 
 The Weir application listener uses plaintext gRPC; restrict its network access.
+
+## Contributing and license
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and report
+vulnerabilities as described in [SECURITY.md](SECURITY.md). This repository is
+released under the [MIT License](LICENSE).
