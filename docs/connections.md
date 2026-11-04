@@ -11,9 +11,9 @@ deployments.
 `New` takes a `host:port` address and rejects anything else. It connects on
 first use and reconnects after failures. When a DNS name resolves to several
 Weir servers, streams are spread round-robin across them, so every server behind
-the address must host the Stores the client uses. Each Read, Mutate, record
-stream or Native call uses a gRPC stream of its own; single-record calls share
-streams, as described under [Streaming and deadlines](streaming.md). Use a name
+the address must host the Stores the client uses. A Read or Mutate of one
+request shares streams, and any other call uses a gRPC stream of its own, as
+described under [Streaming and deadlines](streaming.md). Use a name
 that lists every server, such as a Kubernetes headless Service; a ClusterIP
 Service resolves to one virtual IP. The Client looks the name up again every 5
 seconds. A server that joins receives new calls once connected, and shared
@@ -31,9 +31,8 @@ Store fails the call with NotFound.
 Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
-gRPC cancellation error. A call of a Client whose context ends returns the
-context's error, so test it with `errors.Is` rather than its gRPC status; the
-package operation functions return the gRPC status. A Client sends a record again only when a server refused it
+gRPC cancellation error. A call whose context ends returns the context's
+error, so test it with `errors.Is` rather than its gRPC status. A Client sends a record again only when a server refused it
 before it began, as described under
 [Resending refused records](streaming.md#resending-refused-records).
 

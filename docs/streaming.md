@@ -9,64 +9,69 @@ one Store and one operation kind. Native sends one request, closes its input and
 consumes response metadata and body chunks incrementally. Transport and backend
 protocols govern representable messages and accepted data.
 
-## ReadStream and MutateStream
+## WithNext and consume callbacks
 
-`ReadStream` and `MutateStream` take `Next` and `Consume` callbacks. `Next(ctx)`
-returns one request, or `io.EOF` to end the finite input. `Consume(ctx, index,
-result)` receives each confirmed result as its record completes; the index,
-starting at 1, identifies the input.
-Inputs are validated as they are produced; an invalid later item does not undo
-earlier requests. A Client's stream succeeds with one result per submitted input;
-a package function's also requires a final gRPC OK. Results delivered before a
-later producer, consumer or transport error remain evidence, and a Client's stream
-goes on delivering results it already received after such an error, unless
-Consume itself failed. Next and Consume run concurrently; synchronize shared
-application state. Callbacks must honor their context and return promptly;
-the SDK cancels and joins its sender before returning. Keep yielded requests and
-document bytes immutable until the corresponding Consume callback begins.
+`WithNext` takes a callback whose `next(ctx)` returns one request, or `io.EOF` to
+end the finite input. `WithReadConsume` and `WithMutateConsume` take a callback
+whose `consume(ctx, index, result)` receives each confirmed result as its record
+completes, so not in input order. The index, starting at 0, identifies the record
+across `WithRequests` and `WithNext`. With a consume callback the call collects
+nothing and returns nil results. Either option works without the other: Next
+without a consume callback still returns every result, in input order, with a nil
+position for each record that has no result.
+
+Next starts once the requests of `WithRequests` have entered the window, without
+waiting for their results. Mutations of one resource keep input order across both.
+Next's requests are validated as they are produced; an invalid later item does not
+undo earlier requests. A call of a Client succeeds with one result per submitted
+input. Results delivered before a later producer, consumer or transport error
+remain evidence, and a call goes on delivering results it already received after
+such an error, unless the consume callback itself failed. Next and the consume
+callback run concurrently; synchronize shared application state. Callbacks must
+honor their context and return promptly; the SDK cancels and joins its sender
+before returning. Keep yielded requests and document bytes immutable until the
+corresponding consume callback begins.
 
 ```go
 position := 0
-options := weir.ReadStreamOptions{StoreName: "search"}
-options.Next = func(ctx context.Context) (*weir.ReadRequest, error) {
+next := func(ctx context.Context) (*weir.ReadRequest, error) {
     if position == len(resourceNames) { return nil, io.EOF }
     request := &weir.ReadRequest{Resource: resourceNames[position]}
     position++
     return request, nil
 }
-options.Consume = func(ctx context.Context, index uint64, result *weir.ReadResult) error {
+consume := func(ctx context.Context, index int, result *weir.ReadResult) error {
     if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
     if result.Missing { return nil }
     return processDocument(ctx, result.Document)
 }
-err := client.ReadStream(ctx, options)
+_, err := client.Read(ctx, "search", weir.WithNext(next), weir.WithReadConsume(consume))
 ```
 
 Consumers should commit or release each result promptly and avoid retaining
 unbounded events.
 
-## Read, Mutate, ReadStream and MutateStream
+## Calls with a stream of their own
 
-A Client's `Read`, `Mutate`, `ReadStream` and `MutateStream` each send their
-records over a gRPC stream of their own, and replace it with one to another server
+A `Read` or `Mutate` that does not share streams, as described below, sends its
+records over a gRPC stream of its own, and replaces it with one to another server
 when its server stops resolving or refuses a record, and every minute, so a
 call may stay open for as long as its producer has records, and an idle one holds
 no gRPC stream after 10 seconds. A record over 1 MiB uses a further gRPC stream of
-its own. `Read` and `Mutate` send the records that fit their window of 32 records
-and 8 MiB together, in messages of up to 1 MiB. A stream's mutations of one resource run in input order,
-each after the previous one's result, including after a failure; records of
-different resources may arrive at the server in any order. A broken gRPC stream
-ends the call with its error, and mutations without a result may have applied.
-The package operation functions keep one gRPC stream for the whole call, end
-with an error when its server goes away and leave following servers to their
-caller.
+its own. A call without `WithNext` sends the records that fit its window of 32
+records and 8 MiB together, in messages of up to 1 MiB; a call with `WithNext` may
+wait on it, so it sends each record as soon as it is produced. A stream's mutations
+of one resource run in input order, each after the previous one's result, including
+after a failure; records of different resources may arrive at the server in any
+order. A broken gRPC stream ends the call with its error, and mutations without a
+result may have applied.
 
 ## Shared streams of single-record calls
 
-The single-record Client methods (`ReadOne`, `Create`, `Put`, `Replace`,
-`Delete` and `AtomicTransform`) share long-lived streams with concurrent calls
-of the same Client, so many goroutines in one process pay for a few gRPC streams
-instead of one per call. A stream sends the records queued on it together in one
+A `Read` or `Mutate` of exactly one request, without `WithNext`, a consume callback
+or outgoing gRPC metadata, shares long-lived streams with concurrent calls of the
+same Client, so many goroutines in one process pay for a few gRPC streams instead
+of one per call. A stream sends the records queued on it together in one
 message of up to 1 MiB, and the server returns results that complete together
 in one message, so a busy stream pays for a message per burst rather than per
 record. Each Store and operation kind takes new records on at
@@ -79,7 +84,8 @@ server rejects fails alone, but a broken stream fails every record outstanding
 on it. A call's deadline travels with its record, so the server drops it if it
 is still queued when the deadline passes. Canceling a call stops waiting and
 asks the server to cancel only that record; as with any canceled call, a record
-already executing may still take effect. When the server refuses a record
+already executing may still take effect. The stream may also still be reading the
+record's document after the call returns, so do not reuse its bytes. When the server refuses a record
 without starting it, as a draining or overloaded server or an unavailable
 backend does, the refusal returns to the caller. A server that turns a new gRPC
 stream away before reading it, as a draining or overloaded one does, says so with
@@ -94,15 +100,7 @@ Shared streams do not move to a server that refused a record, or rejected a
 stream before answering one, within those 10 seconds. Streams retire after a minute, which lets the server's connection age
 rebalance clients behind one virtual IP, and idle streams close after 10
 seconds. Shared streams do not carry outgoing gRPC metadata from a call's
-context; package operation functions keep one stream per call and send it.
-
-## Dial and package functions
-
-`Dial` uses gRPC's normal adaptive flow control and reusable connections. Package
-operation functions accept a generated StoreService client for custom
-connections and protocol fixtures; ordinary applications use New and typed Client
-methods. `Dial` accepts any gRPC target; the caller owns its validation and the
-connection lifetime.
+context; a call with outgoing metadata uses a stream of its own and sends it.
 
 ## Resending refused records
 
@@ -125,6 +123,5 @@ first sends plus a burst of 100, so a server that refuses everything never
 receives several times its normal traffic. A record still refused at the end
 keeps its NOT_STARTED evidence, and later mutations of its resource in the same
 call still run after it. The caller may send it again, unless such a mutation
-did not end NOT_STARTED; sending it then would apply it after that mutation. The
-package operation functions never resend. Use caller deadlines; they bound
-resends as well as calls.
+did not end NOT_STARTED; sending it then would apply it after that mutation. Use
+caller deadlines; they bound resends as well as calls.
