@@ -29,16 +29,23 @@ Store fails the call with NotFound.
 ## gRPC options
 
 `WithDialOptions` adds gRPC options to a Client's connection, such as a stats
-handler or interceptor for tracing, or a custom dialer:
+handler, an interceptor or a custom dialer:
 
 ```go
 client, err := weir.New("weir:7447", weir.WithDialOptions(grpc.WithStatsHandler(handler)))
 ```
 
-They can replace the Client's defaults for transport credentials, keepalive and
-message sizes. They cannot change what the Client relies on: gRPC never retries,
-service configs, including `grpc.WithDefaultServiceConfig`, have no effect, and the
-Client's own resolver and balancer follow its servers.
+They can replace the Client's defaults for transport credentials and keepalive.
+They cannot change what the Client relies on: gRPC never resends a record, message
+sizes stay at the protocol's limit, service configs, including
+`grpc.WithDefaultServiceConfig`, have no effect, and the Client's own resolver and
+balancer follow its servers.
+
+Stats handlers and interceptors see gRPC streams, not calls. A Read or Mutate sends
+its records over streams that can outlive it, and a shared stream carries the
+records of many calls, so they see none of a call's context values or deadline.
+They suit stream metrics and logging, not per-call tracing. Only Native and a record
+that needs a gRPC stream of its own run with the caller's context.
 
 The address stays `host:port`, so `New` accepts no other gRPC target. A custom
 dialer can reach a Unix socket or an in-memory server, with an IP literal and any

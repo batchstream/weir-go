@@ -105,9 +105,10 @@ func validHostname(host string) bool {
 	return true
 }
 
-// connectionOptions orders a connection's options so that custom ones replace the
-// defaults but not what a Client relies on. gRPC takes the first resolver of a
-// scheme and the last value of the other options.
+// connectionOptions orders a connection's options so that custom ones can replace
+// the credentials and keepalive but not what a Client relies on. gRPC takes the
+// first resolver of a scheme and the last credentials, keepalive and service
+// config. Each stream sets its message sizes itself, which outranks these.
 func connectionOptions(custom []grpc.DialOption, servers resolver.Builder) []grpc.DialOption {
 	pings := keepalive.ClientParameters{Time: keepaliveTime, Timeout: keepaliveTimeout, PermitWithoutStream: true}
 	options := []grpc.DialOption{
