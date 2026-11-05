@@ -56,6 +56,9 @@ const (
 	endpointsAttribute endpointKey = iota
 	// endpointPreference carries the server a shared stream asks for.
 	endpointPreference
+	// endpointPicked carries where the picker records the server it chose for a
+	// stream, as a stream's peer depends on its dialer and interceptors.
+	endpointPicked
 )
 
 func (e *endpoints) onLeave(leave func(gone []string)) {
@@ -194,14 +197,15 @@ type endpointPicker struct {
 }
 
 func (p *endpointPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
-	if address, ok := info.Ctx.Value(endpointPreference).(string); ok {
-		if subConn := p.byAddress[address]; subConn != nil {
-			preferred := balancer.PickResult{SubConn: subConn}
-			return preferred, nil
-		}
+	address, preferred := info.Ctx.Value(endpointPreference).(string)
+	if !preferred || p.byAddress[address] == nil {
+		index := p.next.Add(1) % uint32(len(p.addresses))
+		address = p.addresses[index]
 	}
-	index := p.next.Add(1) % uint32(len(p.addresses))
-	result := balancer.PickResult{SubConn: p.byAddress[p.addresses[index]]}
+	if picked, ok := info.Ctx.Value(endpointPicked).(*atomic.Pointer[string]); ok {
+		picked.Store(&address)
+	}
+	result := balancer.PickResult{SubConn: p.byAddress[address]}
 	return result, nil
 }
 
@@ -220,7 +224,7 @@ func (b *endpointResolverBuilder) Build(target resolver.Target, cc resolver.Clie
 	if err != nil {
 		return nil, err
 	}
-	// A stream's peer address has a canonical port, so the port must be too.
+	// One server has one address, so its port is canonical.
 	number, err := strconv.ParseUint(port, 10, 16)
 	if err != nil {
 		return nil, err
@@ -293,7 +297,7 @@ func (r *endpointResolver) lookup() ([]string, error) {
 	}
 	addresses := make([]string, len(hosts))
 	for i, host := range hosts {
-		// A stream's peer address is canonical, so IP literals must be too.
+		// One server has one address, so IP literals are canonical.
 		if ip, err := netip.ParseAddr(host); err == nil {
 			host = ip.Unmap().String()
 		}

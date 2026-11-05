@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,17 +86,34 @@ func TestConnectionSpreadsCallsAndIgnoresResolverServiceConfig(t *testing.T) {
 	}
 }
 
-// sharedAndOwnCalls sends a call on a shared stream and one on a stream of its own.
-func sharedAndOwnCalls(t *testing.T, client *Client) {
+// countsStreams answers like countsMessages and counts the streams it serves.
+type countsStreams struct {
+	countsMessages
+	streams atomic.Int64
+}
+
+func (p *countsStreams) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	p.streams.Add(1)
+	return p.countsMessages.Execute(packed)
+}
+
+// sharedAndOwnCalls sends two calls that share a stream and one on a stream of its
+// own, and checks that the server served those two streams.
+func sharedAndOwnCalls(t *testing.T, client *Client, peer *countsStreams) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	if _, err := mutateOne(ctx, client, putRequest("records/s:a", `{}`)); err != nil {
-		t.Fatal("shared stream:", err)
+	for range 2 {
+		if _, err := mutateOne(ctx, client, putRequest("records/s:a", `{}`)); err != nil {
+			t.Fatal("shared stream:", err)
+		}
 	}
 	results, err := client.Mutate(ctx, "records", WithRequests(putRequest("records/s:a", `{}`), putRequest("records/s:b", `{}`)))
 	if err != nil || results[1].GetOutcome() != MutationApplied {
 		t.Fatal("own stream:", results, err)
+	}
+	if streams := peer.streams.Load(); streams != 2 {
+		t.Fatal("the calls did not use one shared stream and one of their own", streams)
 	}
 }
 
@@ -124,17 +142,17 @@ func TestDialOptionsReachAServerThroughACustomDialer(t *testing.T) {
 	for name, test := range dialers {
 		t.Run(name, func(t *testing.T) {
 			server := grpc.NewServer()
-			peer := &countsMessages{}
+			peer := &countsStreams{}
 			pb.RegisterStoreServiceServer(server, peer)
 			go func() { _ = server.Serve(test.listener) }()
 			t.Cleanup(server.Stop)
 			// The address only labels the server the dialer reaches.
-			client, err := New("127.0.0.1:1", nil, WithDialOptions(grpc.WithContextDialer(test.dial)))
+			client, err := New("127.0.0.1:1", nil, WithDialOptions(nil, grpc.WithContextDialer(test.dial)))
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer client.Close()
-			sharedAndOwnCalls(t, client)
+			sharedAndOwnCalls(t, client, peer)
 		})
 	}
 }
@@ -146,15 +164,45 @@ func TestDialOptionsAddAnInterceptor(t *testing.T) {
 		return streamer(ctx, desc, connection, method, options...)
 	}
 	option := WithDialOptions(grpc.WithStreamInterceptor(interceptor))
-	peer := &countsMessages{}
+	peer := &countsStreams{}
 	client, err := New(serveForTest(t, peer), option)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	sharedAndOwnCalls(t, client)
+	sharedAndOwnCalls(t, client, peer)
 	if calls.Load() == 0 {
 		t.Fatal("the interceptor did not run")
+	}
+}
+
+// hidesPeer is a stream whose Context lacks the gRPC peer, as a wrapper's can.
+type hidesPeer struct {
+	grpc.ClientStream
+}
+
+func (hidesPeer) Context() context.Context { return context.Background() }
+
+func TestAStreamKnowsItsServerBehindAnInterceptorsWrapper(t *testing.T) {
+	interceptor := func(ctx context.Context, desc *grpc.StreamDesc, connection *grpc.ClientConn, method string, streamer grpc.Streamer, options ...grpc.CallOption) (grpc.ClientStream, error) {
+		stream, err := streamer(ctx, desc, connection, method, options...)
+		wrapped := hidesPeer{ClientStream: stream}
+		return wrapped, err
+	}
+	peer := &countsStreams{}
+	address := serveForTest(t, peer)
+	client, err := New(address, WithDialOptions(grpc.WithStreamInterceptor(interceptor)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	sharedAndOwnCalls(t, client, peer)
+	client.lanes.mu.Lock()
+	defer client.lanes.mu.Unlock()
+	key := laneKey{store: "records"}
+	group := client.lanes.groups[key]
+	if group == nil || len(group.lanes) != 1 || group.lanes[0].address != address {
+		t.Fatal("a stream cannot be matched to the server that leaves", group)
 	}
 }
 
@@ -162,31 +210,38 @@ func TestDialOptionsCannotReplaceWhatAClientReliesOn(t *testing.T) {
 	// Neither a resolver that never answers nor another balancer may take over.
 	other := manual.NewBuilderWithScheme(endpointScheme)
 	balancer := grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`)
-	peer := &countsMessages{}
+	peer := &countsStreams{}
 	client, err := New(serveForTest(t, peer), WithDialOptions(grpc.WithResolvers(other), balancer))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	sharedAndOwnCalls(t, client)
-	client.lanes.endpoints.mu.Lock()
-	ready := len(client.lanes.endpoints.ready)
-	client.lanes.endpoints.mu.Unlock()
-	if ready == 0 {
-		t.Fatal("another balancer replaced the Client's: it knows no ready server")
+	sharedAndOwnCalls(t, client, peer)
+	// The balancer reports its ready servers just after its picker takes over.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(client.lanes.endpoints.usable()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("another balancer replaced the Client's: it knows no ready server")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
-// tlsTestServer serves TLS for a certificate of one name and returns the pool that
-// trusts it and an address through localhost.
-func tlsTestServer(t *testing.T, name string) (*x509.CertPool, string) {
+// tlsTestServer serves TLS with a certificate for one name or IP, and returns the
+// pool that trusts it and the server's address, an IP literal with a single server.
+func tlsTestServer(t *testing.T, name string, peer pb.StoreServiceServer) (*x509.CertPool, string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	subject := pkix.Name{CommonName: name}
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: subject, DNSNames: []string{name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: subject, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign}
+	if ip := net.ParseIP(name); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{name}
+	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -204,37 +259,35 @@ func tlsTestServer(t *testing.T, name string) (*x509.CertPool, string) {
 	chain := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 	config := &tls.Config{Certificates: []tls.Certificate{chain}}
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(config)))
-	peer := &countsMessages{}
 	pb.RegisterStoreServiceServer(server, peer)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
-	_, port, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pool, net.JoinHostPort("localhost", port)
+	return pool, listener.Addr().String()
 }
 
 func TestDialOptionsReplaceCredentialsAndTLSChecksTheAddressName(t *testing.T) {
-	pool, address := tlsTestServer(t, "localhost")
+	peer := &countsStreams{}
+	pool, address := tlsTestServer(t, "127.0.0.1", peer)
 	trusted := grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(pool, ""))
 	client, err := New(address, WithDialOptions(trusted))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	sharedAndOwnCalls(t, client)
+	sharedAndOwnCalls(t, client, peer)
 
-	otherPool, otherAddress := tlsTestServer(t, "other.example")
+	otherPeer := &countsStreams{}
+	otherPool, otherAddress := tlsTestServer(t, "other.example", otherPeer)
 	mismatched := grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(otherPool, ""))
 	other, err := New(otherAddress, WithDialOptions(mismatched))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer other.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if _, err := mutateOne(ctx, other, putRequest("records/s:a", `{}`)); err == nil {
-		t.Fatal("a certificate for another name was accepted")
+	_, err = mutateOne(ctx, other, putRequest("records/s:a", `{}`))
+	if err == nil || !strings.Contains(err.Error(), "certificate") || otherPeer.streams.Load() != 0 {
+		t.Fatal("a certificate for another name was accepted, or another error hid it", err, otherPeer.streams.Load())
 	}
 }

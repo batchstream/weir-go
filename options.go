@@ -16,12 +16,20 @@ type clientOptions struct {
 
 // WithDialOptions adds gRPC options to a Client's connection, such as a stats
 // handler, an interceptor or a custom dialer. They can replace its defaults for
-// transport credentials, keepalive and message sizes. They cannot change what a
-// Client relies on: gRPC never retries, service configs have no effect, and its
-// own resolver and balancer follow its servers. Several WithDialOptions add their
-// options in order.
+// transport credentials and keepalive. They cannot change what a Client relies
+// on: gRPC never resends a record, message sizes stay at the protocol's limit,
+// service configs have no effect, and its own resolver and balancer follow its
+// servers. Stats handlers and interceptors see gRPC streams rather than calls, so
+// they suit stream metrics, not per-call tracing. Several WithDialOptions add their
+// options in order, and a nil one is ignored.
 func WithDialOptions(options ...grpc.DialOption) ClientOption {
-	option := func(config *clientOptions) { config.dial = append(config.dial, options...) }
+	option := func(config *clientOptions) {
+		for _, dial := range options {
+			if dial != nil {
+				config.dial = append(config.dial, dial)
+			}
+		}
+	}
 	return option
 }
 
