@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
@@ -239,5 +240,27 @@ func TestNativeRequiresARequest(t *testing.T) {
 	client := clientTestClient(t, peer)
 	if result, err := client.Native(t.Context(), "records", nil); err == nil || result != nil || peer.streams.Load() != 0 {
 		t.Fatal("a call without a request was accepted", result, err)
+	}
+}
+
+// answersNothing holds every stream open until its caller leaves.
+type answersNothing struct{}
+
+func (answersNothing) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	<-packed.Context().Done()
+	return packed.Context().Err()
+}
+
+func TestNativeReturnsTheErrorOfItsContext(t *testing.T) {
+	client, err := New(serveForTest(t, answersNothing{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	result, err := client.Native(ctx, "records", clientTestNativeRequest())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("a Native past its deadline did not return the context's error", result, err)
 	}
 }

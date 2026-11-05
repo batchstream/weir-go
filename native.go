@@ -25,7 +25,8 @@ func (c *Client) Native(ctx context.Context, store string, request *NativeReques
 	}
 	call := nativeCall{store: store, request: request, chunks: config.chunks}
 	send := func() (*NativeResult, error) { return call.send(ctx, client) }
-	return resendRefused(ctx, c, nativeRefused, send)
+	result, err := resendRefused(ctx, c, nativeRefused, send)
+	return result, callError(ctx, err)
 }
 
 // nativeCall describes one send of a Native request.
