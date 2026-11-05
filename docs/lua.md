@@ -1,6 +1,6 @@
 # Lua transforms
 
-How to change a record with a Lua function through `AtomicTransform`.
+How to change a record with a Lua function through `MutationAtomicTransform`.
 
 `LuaTransform` accepts UTF-8 Source and optional Input. Source must return exactly
 one function, called with ordinary Lua tables as `function(current, incoming)`.
@@ -16,9 +16,8 @@ source := []byte(`return function(current, incoming)
     return current
 end`)
 lua := &weir.LuaTransform{Source: source, Input: input}
-request := &weir.AtomicTransformRequest{Resource: "records/s:first", Lua: lua}
-options := weir.AtomicTransformOptions{StoreName: "search", Request: request}
-result, err := client.AtomicTransform(ctx, options)
+request := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationAtomicTransform, Lua: lua}
+results, err := client.Mutate(ctx, "search", weir.WithRequests(request))
 ```
 
 Mongo Input uses BSON. Lua source and document values have no Weir size, depth,

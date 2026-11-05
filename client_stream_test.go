@@ -22,19 +22,18 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// heldStream is a MutateStream of a Client that a test feeds record by record.
+// heldStream is a Mutate of a Client that a test feeds record by record.
 type heldStream struct {
 	input    chan string
 	produced atomic.Int64
 	mu       sync.Mutex
-	results  map[uint64]*MutationResult
+	results  map[int]*MutationResult
 	done     chan error
 }
 
 func openHeldStream(ctx context.Context, client *Client) *heldStream {
-	held := &heldStream{input: make(chan string), results: make(map[uint64]*MutationResult), done: make(chan error, 1)}
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+	held := &heldStream{input: make(chan string), results: make(map[int]*MutationResult), done: make(chan error, 1)}
+	next := func(ctx context.Context) (*MutateRequest, error) {
 		select {
 		case resource, ok := <-held.input:
 			if !ok {
@@ -46,13 +45,16 @@ func openHeldStream(ctx context.Context, client *Client) *heldStream {
 			return nil, ctx.Err()
 		}
 	}
-	options.Consume = func(_ context.Context, index uint64, result *MutationResult) error {
+	consume := func(_ context.Context, index int, result *MutationResult) error {
 		held.mu.Lock()
 		defer held.mu.Unlock()
 		held.results[index] = result
 		return nil
 	}
-	go func() { held.done <- client.MutateStream(ctx, options) }()
+	go func() {
+		_, err := client.Mutate(ctx, "records", WithNext(next), WithMutateConsume(consume))
+		held.done <- err
+	}()
 	return held
 }
 
@@ -269,14 +271,13 @@ func TestClientStreamPausedConsumerStopsTheProducer(t *testing.T) {
 	client := laneTestClient(t, peer)
 	release := make(chan struct{})
 	var produced atomic.Int64
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(context.Context) (*MutateRequest, error) {
+	next := func(context.Context) (*MutateRequest, error) {
 		if produced.Add(1) > 2*recordWindowItems {
 			return nil, io.EOF
 		}
 		return putRequest(fmt.Sprintf("records/s:%d", produced.Load()), `{}`), nil
 	}
-	options.Consume = func(ctx context.Context, _ uint64, _ *MutationResult) error {
+	consume := func(ctx context.Context, _ int, _ *MutationResult) error {
 		select {
 		case <-release:
 			return nil
@@ -285,7 +286,10 @@ func TestClientStreamPausedConsumerStopsTheProducer(t *testing.T) {
 		}
 	}
 	done := make(chan error, 1)
-	go func() { done <- client.MutateStream(t.Context(), options) }()
+	go func() {
+		_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
+		done <- err
+	}()
 	time.Sleep(100 * time.Millisecond)
 	// The window's records plus the one the producer holds waiting for room.
 	if count := produced.Load(); count > recordWindowItems+1 {
@@ -319,7 +323,7 @@ func TestClientStreamFailureKeepsWhatWasConfirmedAndResendsNothing(t *testing.T)
 	}
 	held.mu.Lock()
 	defer held.mu.Unlock()
-	if len(held.results) != 1 || held.results[1] == nil {
+	if len(held.results) != 1 || held.results[0] == nil {
 		t.Fatal("confirmed results differ", held.results)
 	}
 	var sent []string
@@ -335,31 +339,30 @@ func TestClientStreamReportsItsCallbacksAndInputs(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
 	failure := errors.New("application failure")
-	one := func() func(context.Context) (*MutateRequest, error) {
-		sent := false
-		return func(context.Context) (*MutateRequest, error) {
-			if sent {
-				return nil, io.EOF
-			}
-			sent = true
-			return putRequest("records/s:a", `{}`), nil
-		}
+	consume := func(context.Context, int, *MutationResult) error { return nil }
+	failing := func(context.Context, int, *MutationResult) error { return failure }
+	empty := func(context.Context) (*MutateRequest, error) { return nil, io.EOF }
+	broken := func(context.Context) (*MutateRequest, error) { return nil, failure }
+	invalid := func(context.Context) (*MutateRequest, error) {
+		request := &MutateRequest{}
+		return request, nil
 	}
-	consume := func(context.Context, uint64, *MutationResult) error { return nil }
+	record := WithRequests(putRequest("records/s:a", `{}`))
 	tests := []struct {
 		name    string
-		options MutateStreamOptions
+		store   string
+		options []MutateOption
 		want    string
 	}{
-		{name: "no callbacks", options: MutateStreamOptions{StoreName: "records"}, want: "requires a producer"},
-		{name: "invalid store", options: MutateStreamOptions{StoreName: "", Next: one(), Consume: consume}, want: "valid Store"},
-		{name: "empty input", options: MutateStreamOptions{StoreName: "records", Consume: consume, Next: func(context.Context) (*MutateRequest, error) { return nil, io.EOF }}, want: "at least one record"},
-		{name: "producer error", options: MutateStreamOptions{StoreName: "records", Consume: consume, Next: func(context.Context) (*MutateRequest, error) { return nil, failure }}, want: "request 1: application failure"},
-		{name: "invalid request", options: MutateStreamOptions{StoreName: "records", Consume: consume, Next: func(context.Context) (*MutateRequest, error) { return &MutateRequest{}, nil }}, want: "request 1"},
-		{name: "consumer error", options: MutateStreamOptions{StoreName: "records", Next: one(), Consume: func(context.Context, uint64, *MutationResult) error { return failure }}, want: "application failure"},
+		{name: "no input", store: "records", options: nil, want: "requires a Store and requests"},
+		{name: "invalid store", store: "", options: []MutateOption{record}, want: "requires a Store and requests"},
+		{name: "empty input", store: "records", options: []MutateOption{WithNext(empty), WithMutateConsume(consume)}, want: "at least one record"},
+		{name: "producer error", store: "records", options: []MutateOption{WithNext(broken), WithMutateConsume(consume)}, want: "request 0: application failure"},
+		{name: "invalid request", store: "records", options: []MutateOption{WithNext(invalid), WithMutateConsume(consume)}, want: "request 0"},
+		{name: "consumer error", store: "records", options: []MutateOption{record, WithMutateConsume(failing)}, want: "application failure"},
 	}
 	for _, test := range tests {
-		err := client.MutateStream(t.Context(), test.options)
+		_, err := client.Mutate(t.Context(), test.store, test.options...)
 		if err == nil || !strings.Contains(err.Error(), test.want) {
 			t.Errorf("%s: err=%v, want %q", test.name, err, test.want)
 		}
@@ -439,8 +442,7 @@ func TestClientStreamSendsALargeRecordAlone(t *testing.T) {
 	before := laneTestReady(t, client, peer)[0]
 	large := strings.Repeat("x", laneRecordBytes+1)
 	sent := 0
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(context.Context) (*MutateRequest, error) {
+	next := func(context.Context) (*MutateRequest, error) {
 		if sent == 2 {
 			return nil, io.EOF
 		}
@@ -448,14 +450,15 @@ func TestClientStreamSendsALargeRecordAlone(t *testing.T) {
 		return putRequest(fmt.Sprintf("records/s:%d", sent), `{"padding":"`+large+`"}`), nil
 	}
 	results := 0
-	options.Consume = func(_ context.Context, _ uint64, result *MutationResult) error {
+	consume := func(_ context.Context, _ int, result *MutationResult) error {
 		if result.GetOutcome() != MutationApplied {
 			t.Error(result)
 		}
 		results++
 		return nil
 	}
-	if err := client.MutateStream(t.Context(), options); err != nil || results != 2 {
+	_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
+	if err != nil || results != 2 {
 		t.Fatal(err, results)
 	}
 	if opened := peer.streams.Load() - before; opened != 2 {
@@ -523,7 +526,7 @@ func TestLoneServerRefusingStreamsReportsItsRecordsNotStarted(t *testing.T) {
 		t.Fatal("the refusal did not reach the consumer", refused)
 	}
 	held.mu.Lock()
-	result := held.results[1]
+	result := held.results[0]
 	held.mu.Unlock()
 	if result.GetOutcome() != MutationNotStarted || result.GetFailure().GetCode() != FailureUnavailable {
 		t.Fatal(result)
@@ -622,12 +625,12 @@ func TestClientMutateKeepsResultsReceivedBeforeTheStreamBroke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	options := MutateOptions{StoreName: "records"}
+	var requests []*MutateRequest
 	for index := range count {
-		options.Requests = append(options.Requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
+		requests = append(requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
 	}
 	for range 50 {
-		results, err := client.Mutate(t.Context(), options)
+		results, err := client.Mutate(t.Context(), "records", WithRequests(requests...))
 		if status.Code(err) != codes.Unavailable {
 			t.Fatal(err)
 		}
@@ -650,9 +653,8 @@ func TestClientStreamConsumesAResultWaitingWhenTheStreamBreaks(t *testing.T) {
 	entered := make(chan struct{}, 8)
 	release := make(chan struct{})
 	var mu sync.Mutex
-	seen := make(map[uint64]bool)
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+	seen := make(map[int]bool)
+	next := func(ctx context.Context) (*MutateRequest, error) {
 		select {
 		case resource := <-input:
 			return putRequest(resource, `{}`), nil
@@ -660,7 +662,7 @@ func TestClientStreamConsumesAResultWaitingWhenTheStreamBreaks(t *testing.T) {
 			return nil, ctx.Err()
 		}
 	}
-	options.Consume = func(ctx context.Context, index uint64, _ *MutationResult) error {
+	consume := func(ctx context.Context, index int, _ *MutationResult) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -672,7 +674,10 @@ func TestClientStreamConsumesAResultWaitingWhenTheStreamBreaks(t *testing.T) {
 		return nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- client.MutateStream(t.Context(), options) }()
+	go func() {
+		_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
+		done <- err
+	}()
 	input <- "records/s:one"
 	<-entered
 	input <- "records/s:two"
@@ -683,7 +688,7 @@ func TestClientStreamConsumesAResultWaitingWhenTheStreamBreaks(t *testing.T) {
 	if err := <-done; status.Code(err) != codes.Unavailable {
 		t.Fatal(err)
 	}
-	if !seen[1] || !seen[2] {
+	if !seen[0] || !seen[1] {
 		t.Fatal("a result received before the break did not reach Consume", seen)
 	}
 }
@@ -694,19 +699,19 @@ func TestClientStreamStopsConsumingOnceConsumeFails(t *testing.T) {
 	failure := errors.New("application failure")
 	sent := 0
 	calls := 0
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(context.Context) (*MutateRequest, error) {
+	next := func(context.Context) (*MutateRequest, error) {
 		if sent == recordWindowItems {
 			return nil, io.EOF
 		}
 		sent++
 		return putRequest(fmt.Sprintf("records/s:%d", sent), `{}`), nil
 	}
-	options.Consume = func(context.Context, uint64, *MutationResult) error {
+	consume := func(context.Context, int, *MutationResult) error {
 		calls++
 		return failure
 	}
-	if err := client.MutateStream(t.Context(), options); !errors.Is(err, failure) || calls != 1 {
+	_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
+	if !errors.Is(err, failure) || calls != 1 {
 		t.Fatal(err, calls)
 	}
 }
@@ -737,27 +742,27 @@ func TestLargeRecordKeepsItsResultWhenItsStreamEndsWithAnError(t *testing.T) {
 	}
 	defer client.Close()
 	large := putRequest("records/s:large", `{"padding":"`+strings.Repeat("x", laneRecordBytes+1)+`"}`)
-	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{large}}
-	results, err := client.Mutate(t.Context(), options)
-	if status.Code(err) != codes.Internal || results[0].GetOutcome() != MutationApplied {
-		t.Fatal(results, err)
+	result, err := mutateOne(t.Context(), client, large)
+	if status.Code(err) != codes.Internal || result.GetOutcome() != MutationApplied {
+		t.Fatal(result, err)
 	}
 }
 
-// Under the race detector this shows that a canceled call stops reading its
-// request before returning, as a caller may then reuse its bytes.
+// Under the race detector this shows that a canceled call on a stream of its own
+// stops reading its requests before returning, as a caller may then reuse their
+// bytes. A single record shares a stream instead, whose writer outlives the call.
 func TestCanceledMutateReturnsAfterItsWriterStoppedReading(t *testing.T) {
 	peer := newLaneTestPeer()
 	client := laneTestClient(t, peer)
 	buffer := []byte(`{"padding":"` + strings.Repeat("x", 256<<10) + `"}`)
 	document := &Document{ContentType: "application/json", Data: buffer}
-	request := &MutateRequest{Resource: "records/s:reuse", Action: MutationPut, Document: document}
-	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request}}
+	first := &MutateRequest{Resource: "records/s:reuse", Action: MutationPut, Document: document}
+	second := &MutateRequest{Resource: "records/s:again", Action: MutationPut, Document: document}
 	deadline := time.Now().Add(time.Second)
 	for attempt := 0; time.Now().Before(deadline); attempt++ {
 		ctx, cancel := context.WithCancel(t.Context())
 		timer := time.AfterFunc(time.Duration(rand.N(60))*time.Microsecond, cancel)
-		_, _ = client.Mutate(ctx, options)
+		_, _ = client.Mutate(ctx, "records", WithRequests(first, second))
 		timer.Stop()
 		cancel()
 		for index := 12; index < len(buffer)-2; index += 4096 {
@@ -815,21 +820,22 @@ func TestClientBatchLeavesInOneMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	mutations := MutateOptions{StoreName: "records"}
-	reads := ReadOptions{StoreName: "records"}
+	var mutations []*MutateRequest
+	var reads []*ReadRequest
 	for index := range recordWindowItems {
 		resource := fmt.Sprintf("records/s:%d", index)
-		mutations.Requests = append(mutations.Requests, putRequest(resource, `{}`))
-		reads.Requests = append(reads.Requests, &ReadRequest{Resource: resource})
+		mutations = append(mutations, putRequest(resource, `{}`))
+		read := &ReadRequest{Resource: resource}
+		reads = append(reads, read)
 	}
 	for range 200 {
-		if _, err := client.Mutate(t.Context(), mutations); err != nil {
+		if _, err := client.Mutate(t.Context(), "records", WithRequests(mutations...)); err != nil {
 			t.Fatal(err)
 		}
 		if messages := peer.take(); len(messages) != 1 || messages[0] != recordWindowItems {
 			t.Fatal("a batch of mutations was split", messages)
 		}
-		if _, err := client.Read(t.Context(), reads); err != nil {
+		if _, err := client.Read(t.Context(), "records", WithRequests(reads...)); err != nil {
 			t.Fatal(err)
 		}
 		if messages := peer.take(); len(messages) != 1 || messages[0] != recordWindowItems {
@@ -846,11 +852,11 @@ func TestClientBatchBeyondItsWindowSendsTheRestAsResultsArrive(t *testing.T) {
 	}
 	defer client.Close()
 	const count = 3*recordWindowItems + 1
-	options := MutateOptions{StoreName: "records"}
+	var requests []*MutateRequest
 	for index := range count {
-		options.Requests = append(options.Requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
+		requests = append(requests, putRequest(fmt.Sprintf("records/s:%d", index), `{}`))
 	}
-	results, err := client.Mutate(t.Context(), options)
+	results, err := client.Mutate(t.Context(), "records", WithRequests(requests...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,14 +876,17 @@ func TestClientBatchBeyondItsWindowSendsTheRestAsResultsArrive(t *testing.T) {
 }
 
 func TestClientBatchOfOneResourceKeepsItsOrder(t *testing.T) {
-	peer := newLaneTestPeer()
-	client := laneTestClient(t, peer)
+	peer := newRefusingPeer()
+	client := refusingClient(t, peer)
 	const count = 8
-	options := MutateOptions{StoreName: "records"}
-	for range count {
-		options.Requests = append(options.Requests, putRequest("records/s:same", `{}`))
+	var requests []*MutateRequest
+	var want []string
+	for index := range count {
+		data := fmt.Sprintf(`{"n":%d}`, index)
+		requests = append(requests, putRequest("records/s:same", data))
+		want = append(want, data)
 	}
-	results, err := client.Mutate(t.Context(), options)
+	results, err := client.Mutate(t.Context(), "records", WithRequests(requests...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -885,6 +894,22 @@ func TestClientBatchOfOneResourceKeepsItsOrder(t *testing.T) {
 		if result.GetOutcome() != MutationApplied {
 			t.Fatal(index, result)
 		}
+	}
+	if applied := peer.drain(); !slices.Equal(applied, want) {
+		t.Fatal("a resource's records did not keep input order", applied)
+	}
+	// Each record waits for the previous one's result, so none shares a message.
+	counting := &countsMessages{}
+	countingClient, err := New(serveForTest(t, counting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer countingClient.Close()
+	if _, err := countingClient.Mutate(t.Context(), "records", WithRequests(requests...)); err != nil {
+		t.Fatal(err)
+	}
+	if messages := counting.take(); len(messages) != count || slices.Max(messages) != 1 {
+		t.Fatal("a record did not wait for the previous result of its resource", messages)
 	}
 }
 
@@ -897,9 +922,12 @@ func TestCanceledBatchEndsWithItsRecordsUnsent(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{putRequest("records/s:a", `{}`)}}
-	if _, err := client.Mutate(ctx, options); !errors.Is(err, context.Canceled) {
+	requests := WithRequests(putRequest("records/s:a", `{}`), putRequest("records/s:b", `{}`))
+	if _, err := client.Mutate(ctx, "records", requests); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+	if sent := peer.take(); len(sent) != 0 {
+		t.Fatal("a canceled call sent records", sent)
 	}
 }
 
@@ -909,15 +937,17 @@ func TestCloseEndsAStreamWaitingForItsProducer(t *testing.T) {
 		t.Fatal(err)
 	}
 	producing := make(chan struct{})
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+	next := func(ctx context.Context) (*MutateRequest, error) {
 		close(producing)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	options.Consume = func(context.Context, uint64, *MutationResult) error { return nil }
+	consume := func(context.Context, int, *MutationResult) error { return nil }
 	done := make(chan error, 1)
-	go func() { done <- client.MutateStream(t.Context(), options) }()
+	go func() {
+		_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
+		done <- err
+	}()
 	<-producing
 	if err := client.Close(); err != nil {
 		t.Fatal(err)

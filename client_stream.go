@@ -15,85 +15,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ReadStream sends each produced read once there is room and consumes results
-// as they complete, over a gRPC stream of its own that follows the Client's
-// servers: it moves to another server when its server stops resolving, refuses
-// a read or reaches the stream lifetime. A read a server refused is sent again;
-// nothing else is. Every result received before a later error is consumed.
-func (c *Client) ReadStream(ctx context.Context, options ReadStreamOptions) error {
-	return c.readStream(ctx, options, false)
-}
-
-func (c *Client) readStream(ctx context.Context, options ReadStreamOptions, known bool) error {
-	if _, err := c.storeClient(); err != nil {
-		return err
-	}
-	if options.Next == nil || options.Consume == nil {
-		return errors.New("ReadStream requires a producer and consumer")
-	}
-	next := func(ctx context.Context) (*pb.Command, string, error) {
-		request, err := options.Next(ctx)
-		if err != nil {
-			return nil, "", err
-		}
-		command, err := readCommand(request)
-		return command, "", err
-	}
-	key := c.lanes.ownKey(options.StoreName, true)
-	send := func(ctx context.Context, command *pb.Command, queued *queuedRecord) (*ReadResult, error) {
-		event, shared, err := c.lanes.finish(ctx, key, command, queued)
-		if !shared {
-			return c.readAlone(ctx, options.StoreName, command.GetRead())
-		}
-		if err != nil {
-			return nil, err
-		}
-		return readResult(event.GetReadResult()), nil
-	}
-	stream := clientStreamOptions[*ReadResult]{key: key, known: known, next: next, send: send, refused: readRefused, consume: options.Consume}
-	return runClientStream(ctx, c, stream)
-}
-
-// MutateStream sends each produced mutation once there is room and consumes
-// results as they complete, over a gRPC stream of its own that follows the
-// Client's servers, as ReadStream does. Mutations of one resource run in input
-// order, each after the previous one's result, including after a failure. A
-// mutation a server refused is sent again; nothing else is. Each consumed result
-// is an individual acknowledgement, and every result received before a later
-// error is consumed; other mutations stay unacknowledged and may have applied.
-func (c *Client) MutateStream(ctx context.Context, options MutateStreamOptions) error {
-	return c.mutateStream(ctx, options, false)
-}
-
-func (c *Client) mutateStream(ctx context.Context, options MutateStreamOptions, known bool) error {
-	if _, err := c.storeClient(); err != nil {
-		return err
-	}
-	if options.Next == nil || options.Consume == nil {
-		return errors.New("MutateStream requires a producer and consumer")
-	}
-	next := func(ctx context.Context) (*pb.Command, string, error) {
-		request, err := options.Next(ctx)
-		if err != nil {
-			return nil, "", err
-		}
-		command, err := mutateCommand(request)
-		return command, command.GetMutate().GetResource(), err
-	}
-	key := c.lanes.ownKey(options.StoreName, false)
-	send := func(ctx context.Context, command *pb.Command, queued *queuedRecord) (*MutationResult, error) {
-		event, shared, err := c.lanes.finish(ctx, key, command, queued)
-		if !shared {
-			return c.mutateAlone(ctx, options.StoreName, command)
-		}
-		if err != nil {
-			return nil, err
-		}
-		return event.GetMutationResult(), nil
-	}
-	stream := clientStreamOptions[*MutationResult]{key: key, known: known, next: next, send: send, refused: mutationRefused, consume: options.Consume}
-	return runClientStream(ctx, c, stream)
-}
+// A record stream holds at most these records and bytes unconsumed. A larger
+// request proceeds alone.
+const recordWindowItems = protocol.RecordWindow
+const recordWindowBytes = 8 << 20
 
 // clientStreamOptions describes one record stream of a Client.
 type clientStreamOptions[R comparable] struct {
@@ -109,12 +34,12 @@ type clientStreamOptions[R comparable] struct {
 	// already queued.
 	send    func(context.Context, *pb.Command, *queuedRecord) (R, error)
 	refused func(R) bool
-	consume func(context.Context, uint64, R) error
+	consume func(context.Context, int, R) error
 }
 
 // streamRecord is one record produced for a stream.
 type streamRecord struct {
-	index    uint64
+	index    int
 	size     int
 	resource string
 	command  *pb.Command
@@ -154,9 +79,6 @@ type clientStream[R comparable] struct {
 }
 
 func runClientStream[R comparable](ctx context.Context, c *Client, options clientStreamOptions[R]) error {
-	if !protocol.ValidStoreName(options.key.store) {
-		return errors.New("Execute requires a client and valid Store")
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -190,12 +112,17 @@ func runClientStream[R comparable](ctx context.Context, c *Client, options clien
 // fail keeps the stream's first error and stops sending. A record that fails
 // cancels the ones behind it before they can start.
 func (s *clientStream[R]) fail(err error) {
+	s.keepFailure(err)
+	s.cancel()
+}
+
+// keepFailure keeps the stream's first error.
+func (s *clientStream[R]) keepFailure(err error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.failure == nil {
 		s.failure = err
 	}
-	s.mu.Unlock()
-	s.cancel()
 }
 
 // produce admits records until the input ends or fails, then closes outcomes
@@ -206,7 +133,7 @@ func (s *clientStream[R]) produce() {
 		s.sends.Wait()
 		close(s.outcomes)
 	}()
-	var count uint64
+	count := 0
 	inflight, bytes := 0, 0
 	// wait returns one consumed record's credit.
 	wait := func() bool {
@@ -238,8 +165,10 @@ func (s *clientStream[R]) produce() {
 			}
 			return
 		}
+		// Input that fails ends the input only: the records before it finish, and
+		// their results are the caller's evidence of what they did.
 		if err != nil {
-			s.fail(fmt.Errorf("request %d: %w", count+1, err))
+			s.keepFailure(fmt.Errorf("request %d: %w", count, err))
 			return
 		}
 		size := proto.Size(command)
@@ -249,10 +178,10 @@ func (s *clientStream[R]) produce() {
 				return
 			}
 		}
+		record := &streamRecord{index: count, size: size, resource: resource, command: command}
 		count++
 		inflight++
 		bytes += size
-		record := &streamRecord{index: count, size: size, resource: resource, command: command}
 		s.admit(record)
 	}
 }
@@ -290,7 +219,6 @@ func (s *clientStream[R]) wakeWriters() {
 	s.unsent = s.unsent[:0]
 }
 
-// run sends a record and then those waiting behind it, in order.
 // run sends a resource's records in input order, the first of them already
 // queued.
 func (s *clientStream[R]) run(record *streamRecord, queued *queuedRecord) {

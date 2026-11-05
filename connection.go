@@ -14,10 +14,10 @@ import (
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
-	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
 
@@ -40,11 +40,8 @@ type Client struct {
 	closeErr   error
 }
 
-// Service configs of a Client's own connection and of Dial's.
-const (
-	endpointConfig   = `{"loadBalancingConfig":[{"weir_endpoints":{}}]}`
-	roundRobinConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
-)
+// endpointConfig is the service config of a Client's connection.
+const endpointConfig = `{"loadBalancingConfig":[{"weir_endpoints":{}}]}`
 
 // A connection pings a server it has heard nothing from for keepaliveTime and
 // closes when keepaliveTimeout passes without an answer, so calls leave a
@@ -62,14 +59,19 @@ const (
 // across them. The Client looks the name up every five seconds: a server
 // that joins takes its share of streams, and one that stops resolving gets
 // no new records while its streams finish the ones they carry.
-func New(address string) (*Client, error) {
+func New(address string, options ...ClientOption) (*Client, error) {
 	if err := validateAddress(address); err != nil {
 		return nil, err
 	}
+	config := clientOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
 	servers := &endpoints{}
 	builder := &endpointResolverBuilder{endpoints: servers, lookup: net.DefaultResolver.LookupHost, interval: resolveInterval, spacing: resolveSpacing}
-	options := append(connectionOptions(endpointConfig), grpc.WithResolvers(builder))
-	connection, err := grpc.NewClient(endpointScheme+":///"+address, options...)
+	connection, err := grpc.NewClient(endpointScheme+":///"+address, connectionOptions(config.dial, builder)...)
 	if err != nil {
 		return nil, err
 	}
@@ -78,13 +80,6 @@ func New(address string) (*Client, error) {
 	servers.onLeave(lanes.leave)
 	client := &Client{connection: connection, store: store, lanes: lanes, resends: newResendBudget()}
 	return client, nil
-}
-
-// Dial creates a low-level connection to any gRPC target for the
-// package-level operation functions. The caller owns target validation and
-// the connection's lifetime.
-func Dial(target string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(target, connectionOptions(roundRobinConfig)...)
 }
 
 func validateAddress(address string) error {
@@ -110,16 +105,21 @@ func validHostname(host string) bool {
 	return true
 }
 
-func connectionOptions(serviceConfig string) []grpc.DialOption {
+// connectionOptions orders a connection's options so that custom ones can replace
+// the credentials and keepalive but not what a Client relies on. gRPC takes the
+// first resolver of a scheme and the last credentials, keepalive and service
+// config. Each stream sets its message sizes itself, which outranks these.
+func connectionOptions(custom []grpc.DialOption, servers resolver.Builder) []grpc.DialOption {
 	pings := keepalive.ClientParameters{Time: keepaliveTime, Timeout: keepaliveTimeout, PermitWithoutStream: true}
 	options := []grpc.DialOption{
+		grpc.WithResolvers(servers),
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
 		grpc.WithKeepaliveParams(pings),
-		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
-		grpc.WithDefaultServiceConfig(serviceConfig),
 		grpc.WithMaxHeaderListSize(^uint32(0)),
 		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes)),
 	}
+	options = append(options, custom...)
+	options = append(options, grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(), grpc.WithDefaultServiceConfig(endpointConfig))
 	return options
 }
 
@@ -128,88 +128,6 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 		return nil, ErrClosed
 	}
 	return c.store, nil
-}
-
-// ReadOne and the other single-record Client methods share a bounded set of
-// long-lived streams with concurrent calls of this Client. A canceled call
-// stops waiting and cancels only its own record, which may still take effect
-// if it is already executing. A record a server refused before it began is
-// sent again, up to four sends within the caller's deadline.
-func (c *Client) ReadOne(ctx context.Context, options ReadOneOptions) (*ReadResult, error) {
-	if _, err := c.storeClient(); err != nil {
-		return nil, err
-	}
-	batch := ReadOptions{StoreName: options.StoreName, Requests: []*ReadRequest{options.Request}}
-	if err := validateReads(ctx, batch); err != nil {
-		return nil, err
-	}
-	operation := &pb.Command_Read{Read: options.Request}
-	command := &pb.Command{Operation: operation}
-	key := laneKey{store: options.StoreName, read: true}
-	send := func() (*ReadResult, error) {
-		event, shared, err := c.lanes.execute(ctx, key, command)
-		if !shared {
-			return c.readAlone(ctx, options.StoreName, options.Request)
-		}
-		if err != nil {
-			return nil, err
-		}
-		return readResult(event.GetReadResult()), nil
-	}
-	return resendRefused(ctx, c, readRefused, send)
-}
-
-func (c *Client) Create(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	request := writeRequest(options.Request, MutationCreate)
-	return c.mutateOne(ctx, options.StoreName, request)
-}
-
-func (c *Client) Put(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	request := writeRequest(options.Request, MutationPut)
-	return c.mutateOne(ctx, options.StoreName, request)
-}
-
-func (c *Client) Replace(ctx context.Context, options WriteOptions) (*MutationResult, error) {
-	request := writeRequest(options.Request, MutationReplace)
-	return c.mutateOne(ctx, options.StoreName, request)
-}
-
-func (c *Client) Delete(ctx context.Context, options DeleteOptions) (*MutationResult, error) {
-	request := deleteRequest(options.Request)
-	return c.mutateOne(ctx, options.StoreName, request)
-}
-
-func (c *Client) AtomicTransform(ctx context.Context, options AtomicTransformOptions) (*MutationResult, error) {
-	request := transformRequest(options.Request)
-	return c.mutateOne(ctx, options.StoreName, request)
-}
-
-func (c *Client) mutateOne(ctx context.Context, store string, request *MutateRequest) (*MutationResult, error) {
-	if _, err := c.storeClient(); err != nil {
-		return nil, err
-	}
-	batch := MutateOptions{StoreName: store, Requests: []*MutateRequest{request}}
-	if err := validateMutations(ctx, batch); err != nil {
-		return nil, err
-	}
-	mutation, err := wireMutation(request)
-	if err != nil {
-		return nil, err
-	}
-	operation := &pb.Command_Mutate{Mutate: mutation}
-	command := &pb.Command{Operation: operation}
-	key := laneKey{store: store}
-	send := func() (*MutationResult, error) {
-		event, shared, err := c.lanes.execute(ctx, key, command)
-		if !shared {
-			return c.mutateAlone(ctx, store, command)
-		}
-		if err != nil {
-			return nil, err
-		}
-		return event.GetMutationResult(), nil
-	}
-	return resendRefused(ctx, c, mutationRefused, send)
 }
 
 // callError reports a call that ended with its context as the context's error,
@@ -226,17 +144,6 @@ func callError(ctx context.Context, err error) error {
 		return context.DeadlineExceeded
 	}
 	return err
-}
-
-// Native sends the request again only when a server refused it with
-// NativeNotStarted before any response.
-func (c *Client) Native(ctx context.Context, options NativeOptions) (*NativeResult, error) {
-	client, err := c.storeClient()
-	if err != nil {
-		return nil, err
-	}
-	send := func() (*NativeResult, error) { return Native(ctx, client, options) }
-	return resendRefused(ctx, c, nativeRefused, send)
 }
 
 // Close cancels active requests and closes the connection. Concurrent and

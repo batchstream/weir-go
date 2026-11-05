@@ -45,6 +45,9 @@ func (p *clientTestPeer) Execute(packed grpc.BidiStreamingServer[pb.ExecuteReque
 		if err := protocol.ValidateExecuteRequest(request); err != nil {
 			return status.Error(codes.InvalidArgument, err.Error())
 		}
+		if request.CancelIndex != 0 {
+			continue
+		}
 		requestBytes := int64(proto.Size(request))
 		for previous := p.maxBytes.Load(); requestBytes > previous; previous = p.maxBytes.Load() {
 			if p.maxBytes.CompareAndSwap(previous, requestBytes) {
@@ -221,14 +224,17 @@ func clientTestAddress(t *testing.T, peer *clientTestPeer) string {
 	return listener.Addr().String()
 }
 
-func clientTestConnection(t *testing.T, peer *clientTestPeer) pb.StoreServiceClient {
+// clientTestClient returns a Client of peer that sends each record once, so a
+// test sees every refusal and counts every send.
+func clientTestClient(t *testing.T, peer *clientTestPeer) *Client {
 	t.Helper()
-	connection, err := Dial("passthrough:///" + clientTestAddress(t, peer))
+	client, err := New(clientTestAddress(t, peer))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = connection.Close() })
-	return pb.NewStoreServiceClient(connection)
+	client.resends = nil
+	t.Cleanup(func() { _ = client.Close() })
+	return client
 }
 
 func clientTestReadRequest() *ReadRequest {
@@ -236,15 +242,54 @@ func clientTestReadRequest() *ReadRequest {
 	return request
 }
 
+// readOne returns the result of a Read of one request.
+func readOne(ctx context.Context, client *Client, request *ReadRequest) (*ReadResult, error) {
+	results, err := client.Read(ctx, "records", WithRequests(request))
+	if len(results) != 1 {
+		return nil, fmt.Errorf("read returned %d results: %w", len(results), err)
+	}
+	return results[0], err
+}
+
+// mutateOne returns the result of a Mutate of one request.
+func mutateOne(ctx context.Context, client *Client, request *MutateRequest, options ...MutateOption) (*MutationResult, error) {
+	options = append(options, WithRequests(request))
+	results, err := client.Mutate(ctx, "records", options...)
+	if len(results) != 1 {
+		return nil, fmt.Errorf("mutate returned %d results: %w", len(results), err)
+	}
+	return results[0], err
+}
+
+func deleteRequest(resource string) *MutateRequest {
+	request := &MutateRequest{Resource: resource, Action: MutationDelete}
+	return request
+}
+
 func TestReadRejectsMalformedStreamWithoutEvidence(t *testing.T) {
 	for _, mode := range []string{"invalid_result", "unknown_read_variant", "unknown_event_variant", "read_negative_failure", "missing_result", "zero_index", "skipped_index", "wrong_kind"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
-			result, err := ReadOne(t.Context(), client, options)
+			client := clientTestClient(t, peer)
+			// A peer that never answers leaves a shared stream open until the deadline.
+			timeout := 5 * time.Second
+			if mode == "missing_result" {
+				timeout = 200 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
+			result, err := readOne(ctx, client, clientTestReadRequest())
 			if err == nil || result != nil {
 				t.Fatal("unvalidated evidence exposed", result, err)
+			}
+			// A record that needs a stream of its own checks its events the same way.
+			command, _, err := readCommand(clientTestReadRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alone, err := readKind.alone(ctx, client, "records", command)
+			if err == nil || alone != nil {
+				t.Fatal("unvalidated evidence exposed on a stream of its own", alone, err)
 			}
 		})
 	}
@@ -254,9 +299,8 @@ func TestReadRejectsUnknownFieldsAndFailureCodes(t *testing.T) {
 	for _, mode := range []string{"read_unknown_fields", "read_unknown_fields_final_error", "read_unknown_missing", "read_unknown_failure"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			options := ReadOneOptions{StoreName: "records", Request: clientTestReadRequest()}
-			result, err := ReadOne(t.Context(), client, options)
+			client := clientTestClient(t, peer)
+			result, err := readOne(t.Context(), client, clientTestReadRequest())
 			if err == nil || result != nil {
 				t.Fatal("unknown response accepted as Read evidence", result, err)
 			}
@@ -271,10 +315,9 @@ func TestMutationKeepsAppliedEvidenceWithKnownFailureAndLaterError(t *testing.T)
 	for _, mode := range []string{"applied_known_failure", "applied_known_failure_later_error"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			request := &MutateRequest{Resource: "records/s:key", Action: MutationDelete}
-			options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request, request}}
-			results, err := Mutate(t.Context(), client, options)
+			client := clientTestClient(t, peer)
+			first, second := deleteRequest("records/s:first"), deleteRequest("records/s:second")
+			results, err := client.Mutate(t.Context(), "records", WithRequests(first, second))
 			if len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[0].GetFailure().GetCode() != FailureUnavailable {
 				t.Fatal("confirmed application evidence lost", results, err)
 			}
@@ -296,10 +339,9 @@ func TestMutationRetainsConfirmedPrefixBeforeUnknownResponse(t *testing.T) {
 	for _, mode := range []string{"applied_then_unknown_fields", "applied_then_unknown_code"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			request := &MutateRequest{Resource: "records/s:key", Action: MutationDelete}
-			options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{request, request}}
-			results, err := Mutate(t.Context(), client, options)
+			client := clientTestClient(t, peer)
+			request := deleteRequest("records/s:key")
+			results, err := client.Mutate(t.Context(), "records", WithRequests(request, request))
 			if err == nil || len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1] != nil {
 				t.Fatal("malformed later response changed confirmed prefix", results, err)
 			}
@@ -312,11 +354,10 @@ func TestMutationRetainsConfirmedPrefixBeforeUnknownResponse(t *testing.T) {
 
 func TestPutLostResponseHasNoAcknowledgementOrReplay(t *testing.T) {
 	peer := &clientTestPeer{mode: "write_reply_loss"}
-	client := clientTestConnection(t, peer)
+	client := clientTestClient(t, peer)
 	document := &Document{ContentType: "application/json", Data: []byte(`{}`)}
-	request := &WriteRequest{Resource: "records/s:key", Document: document}
-	options := WriteOptions{StoreName: "records", Request: request}
-	result, err := Put(t.Context(), client, options)
+	request := &MutateRequest{Resource: "records/s:key", Action: MutationPut, Document: document}
+	result, err := mutateOne(t.Context(), client, request)
 	if status.Code(err) != codes.Unavailable || result != nil || peer.streams.Load() != 1 || peer.received.Load() != 1 {
 		t.Fatal("lost response confirmed or replayed mutation", result, err, peer.streams.Load(), peer.received.Load())
 	}
@@ -326,10 +367,8 @@ func TestMutationRejectsInvalidOutcomeAndKeepsAppliedFailure(t *testing.T) {
 	for _, mode := range []string{"invalid_outcome", "unknown_outcome", "negative_failure", "applied_failure", "applied_unknown_failure", "applied_unknown_failure_later_error"} {
 		t.Run(mode, func(t *testing.T) {
 			peer := &clientTestPeer{mode: mode}
-			client := clientTestConnection(t, peer)
-			request := &DeleteRequest{Resource: "records/s:key"}
-			options := DeleteOptions{StoreName: "records", Request: request}
-			result, err := Delete(t.Context(), client, options)
+			client := clientTestClient(t, peer)
+			result, err := mutateOne(t.Context(), client, deleteRequest("records/s:key"))
 			if mode != "applied_failure" {
 				if err == nil || result != nil {
 					t.Fatal("unqualified UNKNOWN accepted", result, err)
@@ -343,14 +382,19 @@ func TestMutationRejectsInvalidOutcomeAndKeepsAppliedFailure(t *testing.T) {
 
 func TestMutationCancellationStopsCallWithoutReplay(t *testing.T) {
 	peer := &clientTestPeer{mode: "blocked_mutation", canceled: make(chan struct{})}
-	client := clientTestConnection(t, peer)
-	request := &DeleteRequest{Resource: "records/s:key"}
-	options := DeleteOptions{StoreName: "records", Request: request}
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	client := clientTestClient(t, peer)
+	first, second := deleteRequest("records/s:first"), deleteRequest("records/s:second")
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	result, err := Delete(ctx, client, options)
-	if err == nil || result != nil {
-		t.Fatal("blocked mutation succeeded", result, err)
+	go func() {
+		for peer.received.Load() == 0 && ctx.Err() == nil {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	results, err := client.Mutate(ctx, "records", WithRequests(first, second))
+	if err == nil || len(results) != 2 || results[0] != nil || results[1] != nil {
+		t.Fatal("blocked mutation succeeded", results, err)
 	}
 	select {
 	case <-peer.canceled:

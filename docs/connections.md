@@ -11,9 +11,9 @@ deployments.
 `New` takes a `host:port` address and rejects anything else. It connects on
 first use and reconnects after failures. When a DNS name resolves to several
 Weir servers, streams are spread round-robin across them, so every server behind
-the address must host the Stores the client uses. Each Read, Mutate, record
-stream or Native call uses a gRPC stream of its own; single-record calls share
-streams, as described under [Streaming and deadlines](streaming.md). Use a name
+the address must host the Stores the client uses. A Read or Mutate of one
+request usually shares streams, and any other call uses a gRPC stream of its own,
+as described under [Streaming and deadlines](streaming.md). Use a name
 that lists every server, such as a Kubernetes headless Service; a ClusterIP
 Service resolves to one virtual IP. The Client looks the name up again every 5
 seconds. A server that joins receives new calls once connected, and shared
@@ -26,14 +26,43 @@ few seconds before it stops taking records, as the Weir chart's preStop delay
 arranges. A server that does not host the requested
 Store fails the call with NotFound.
 
+## gRPC options
+
+`WithDialOptions` adds gRPC options to a Client's connection, such as a stats
+handler, an interceptor or a custom dialer:
+
+```go
+client, err := weir.New("weir:7447", weir.WithDialOptions(grpc.WithStatsHandler(handler)))
+```
+
+They can replace the Client's defaults for transport credentials and keepalive.
+They cannot change what the Client relies on: gRPC never resends a record, message
+sizes stay at the protocol's limit, service configs, including
+`grpc.WithDefaultServiceConfig`, have no effect, and the Client's own resolver and
+balancer follow its servers.
+
+Stats handlers and interceptors see gRPC streams, not calls. A Read or Mutate sends
+its records over streams that can outlive it, and a shared stream carries the
+records of many calls, so they see none of a call's context values or deadline.
+They suit stream metrics and logging, not per-call tracing. Only Native and a record
+that needs a gRPC stream of its own run with the caller's context.
+
+The address stays `host:port`, so `New` accepts no other gRPC target. A custom
+dialer can reach a Unix socket or an in-memory server, with an IP literal and any
+port as the address.
+
+The Weir application listener is plaintext, so TLS applies only to a proxy or
+sidecar in front of it. `grpc.WithTransportCredentials` then checks the certificate
+against the host name of the address. `grpc.WithCredentialsBundle` conflicts with
+the default credentials, so `New` returns an error for it.
+
 ## Reuse and close
 
 Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
-gRPC cancellation error. A call of a Client whose context ends returns the
-context's error, so test it with `errors.Is` rather than its gRPC status; the
-package operation functions return the gRPC status. A Client sends a record again only when a server refused it
+gRPC cancellation error. A call whose context ends returns the context's
+error, so test it with `errors.Is` rather than its gRPC status. A Client sends a record again only when a server refused it
 before it began, as described under
 [Resending refused records](streaming.md#resending-refused-records).
 

@@ -13,7 +13,7 @@ generate schemas.
 ## Examples
 
 [read](../examples/read/main.go) performs a typed read, [basic](../examples/basic/main.go)
-mutates a document then reads multiple resources in one stream, and
+mutates a document then reads multiple resources in one call, and
 [native](../examples/native/main.go) consumes
 native responses. These examples use SDK request and result types.
 

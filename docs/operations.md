@@ -15,8 +15,7 @@ defer client.Close()
 
 first := &weir.ReadRequest{Resource: "records/s:example"}
 second := &weir.ReadRequest{Resource: "records/s:another"}
-readOptions := weir.ReadOptions{StoreName: "search", Requests: []*weir.ReadRequest{first, second}}
-results, err := client.Read(ctx, readOptions)
+results, err := client.Read(ctx, "search", weir.WithRequests(first, second))
 if err != nil { return fmt.Errorf("read RPC failed; unacknowledged results %v: %w", results, err) }
 for index, result := range results {
     if result.Failure != nil { return fmt.Errorf("read %d failed: %v", index, result.Failure) }
@@ -26,7 +25,7 @@ for index, result := range results {
 
 ## Resources and documents
 
-Resources are canonical paths relative to `StoreName`.
+Resources are canonical paths relative to their Store.
 `weir.EncodeSegment` canonically encodes each decoded path segment. MongoDB paths
 are `DATABASE/COLLECTION/KEY`; Search paths are `INDEX/KEY`. Mongo documents use
 `application/bson` with the first `_id` matching the resource key. Search documents
@@ -34,32 +33,33 @@ use `application/json`. The caller owns its document codec; the SDK preserves by
 
 ## Methods
 
-Each method takes named options with `StoreName`. `Read` and `Mutate` accept
-`Requests`; single-operation helpers accept `Request`:
+Each method takes a context and a Store, then options:
 
-| Method | Options / request | Result |
+| Method | Options | Result |
 | --- | --- | --- |
-| `Read` | `ReadOptions` / multiple `ReadRequest` | `[]*ReadResult`: Document, Missing, Failure |
-| `Mutate` | `MutateOptions` / multiple `MutateRequest` | `[]*MutationResult` |
-| `ReadStream` | `ReadStreamOptions` / producer and consumer | per-item `ReadResult` callbacks |
-| `MutateStream` | `MutateStreamOptions` / producer and consumer | per-item `MutationResult` callbacks |
-| `ReadOne` | `ReadOneOptions` / `ReadRequest` | `ReadResult` |
-| `Create`, `Put`, `Replace` | `WriteOptions` / `WriteRequest` | `MutationResult` |
-| `Delete` | `DeleteOptions` / `DeleteRequest` | `MutationResult` |
-| `AtomicTransform` | `AtomicTransformOptions` / `AtomicTransformRequest` | `MutationResult` |
-| `Native` | `NativeOptions` / typed `NativeRequest`, byte consumer | `NativeResult` |
+| `Read` | `WithRequests`, `WithNext`, `WithReadConsume` | `[]*ReadResult`: Document, Missing, Failure |
+| `Mutate` | `WithRequests`, `WithNext`, `WithMutateConsume`, `WithQueryVisible` | `[]*MutationResult` |
+| `Native` | `WithChunks`, after a required `NativeRequest` | `NativeResult` |
 
 ## Read and Mutate
 
-`Read` and `Mutate` validate the complete input before sending anything. An empty
-input, nil request, malformed resource, unsupported action or invalid document
-envelope rejects the entire call without sending earlier valid items. Every
-resource is relative to one `StoreName`. Each input is sent as one
+`WithRequests` passes the records a call already holds, and `WithNext` a callback
+that produces more, as described under
+[Streaming and deadlines](streaming.md#withnext-and-consume-callbacks). The call
+sends the requests first, then what Next produces, and needs at least one record.
+Several `WithRequests` add their requests in order; a later `WithNext` or consume
+callback replaces an earlier one.
+
+A call validates every request of `WithRequests` before sending anything and
+before calling Next. A nil request, malformed resource, unsupported action or
+invalid document envelope rejects the entire call without sending earlier valid
+items. Every resource is relative to the call's Store. Each input is sent as one
 ExecuteRequest as soon as the window and an earlier mutation of its resource allow.
-Results arrive as records complete and are returned in input order, including
-repeated resources. Individual backend failures stay in their result positions. A later
-RPC failure preserves every validated result already received; unconfirmed
-positions remain nil and any such mutation may have applied. Never
+
+Without a consume callback, results return in input order, one per input,
+including repeated resources. Individual backend failures stay in their result
+positions. A later RPC failure preserves every validated result already received;
+unconfirmed positions remain nil and any such mutation may have applied. Never
 automatically replay those mutations.
 
 ```go
@@ -67,18 +67,22 @@ firstDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":1
 secondDoc := &weir.Document{ContentType: "application/json", Data: []byte(`{"n":2}`)}
 first := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationPut, Document: firstDoc}
 second := &weir.MutateRequest{Resource: "records/s:second", Action: weir.MutationPut, Document: secondDoc}
-options := weir.MutateOptions{StoreName: "search", Requests: []*weir.MutateRequest{first, second}}
-results, err := client.Mutate(ctx, options)
+results, err := client.Mutate(ctx, "search", weir.WithRequests(first, second))
 // Inspect every result's Outcome/Failure, even when err is nonnil. Never replay
 // an unacknowledged mutation automatically.
 ```
 
+Keep requests and their document bytes unchanged until the call returns. After a
+call whose context ended, do not reuse them at all: a single record's shared
+stream may still be reading them.
+
 ## Actions and ordering
 
 `MutateRequest.Action` selects `MutationCreate`, `MutationPut`, `MutationReplace`,
-`MutationDelete` or `MutationAtomicTransform`. Writes require Document, Delete
-accepts no payload, and AtomicTransform requires exactly one Lua or
-BackendExpression. A batch is not a transaction. Mutations to the same resource
+`MutationDelete` or `MutationAtomicTransform`. Create requires absence, Replace
+requires an existing resource and Put creates or replaces; all three require
+Document. Delete accepts no payload, and AtomicTransform requires exactly one Lua
+or BackendExpression. A call is not a transaction. Mutations to the same resource
 execute in input order, including after an item failure; different resources may
 run concurrently. Across RPCs, ordering follows the database semantics.
 
@@ -89,34 +93,24 @@ read or mutation and each response carries its indexed result. Backend protocols
 unacknowledged encoded input; a larger legal request uses the window alone.
 Credit returns after each Consume callback finishes. A size-dependent wait can
 hold one produced item that has not yet been sent. Sending and receiving run
-concurrently so HTTP/2 flow control advances in both directions. The SDK never
-waits for another input or EOF before sending the current item.
-`Read` and `Mutate` intentionally accumulate results for their caller; use the
-streaming interfaces to avoid retaining the full input and result sequence.
+concurrently so HTTP/2 flow control advances in both directions. A call with
+`WithNext` never waits for another input or EOF before sending the current item.
+Without a consume callback a call accumulates results for its caller; use `WithNext`
+and a consume callback to avoid retaining the full input and result sequence.
 
-## Write requests and visibility
+## Visibility
 
-`WriteRequest` contains Resource and Document. Create requires absence; Replace
-requires an existing resource; Put creates or replaces. AtomicTransform requires
-exactly one Lua or BackendExpression. `MutateRequest`, `WriteRequest`,
-`DeleteRequest` and `AtomicTransformRequest` share `Options *MutationOptions`.
-Nil options or `MutationApplicationAcknowledged` (the zero Visibility value)
-wait for application acknowledgement. Set Visibility to `MutationQueryVisible`
-when subsequent normal queries must observe the mutation before the operation
-succeeds.
+Without `WithQueryVisible` a mutation waits for application acknowledgement. Pass
+`WithQueryVisible` when subsequent normal queries must observe the mutations of a
+call before they succeed; it applies to every mutation of that call.
 An APPLIED result without Failure confirms that guarantee; APPLIED with Failure
 confirms application only and must not be replayed automatically. This includes
 Lua keep and missing-document deletes. Search adapters wait for refresh; backends
 without deferred query visibility satisfy this when the mutation is acknowledged.
-The SDK forwards the complete options message and rejects unknown option fields
-or undeclared visibility values.
-Keep options immutable until the call returns or its result is consumed.
 
 ```go
-completion := &weir.MutationOptions{Visibility: weir.MutationQueryVisible}
-request := &weir.WriteRequest{Resource: "records/s:first", Document: document, Options: completion}
-options := weir.WriteOptions{StoreName: "search", Request: request}
-result, err := client.Put(ctx, options)
+request := &weir.MutateRequest{Resource: "records/s:first", Action: weir.MutationPut, Document: document}
+results, err := client.Mutate(ctx, "search", weir.WithRequests(request), weir.WithQueryVisible())
 ```
 
 ## Read results

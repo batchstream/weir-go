@@ -18,16 +18,15 @@ document. Search uses `application/http` and an optional resource prefix.
 ```go
 document := &weir.Document{ContentType: "application/vnd.example.command", Data: commandBytes}
 request := &weir.NativeRequest{Resource: "records", Request: document}
-options := weir.NativeOptions{StoreName: "example", Request: request}
-options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
-    return consumeNativeBytes(ctx, response, data)
-}
-result, err := client.Native(ctx, options)
+result, err := client.Native(ctx, "example", request)
+// result.Body holds the response body, as far as it arrived.
 ```
 
 ## Responses
 
-Consume receives nonempty response chunks and finishes before the next chunk.
+`NativeResult.Body` holds the response body, as far as it arrived. To avoid
+retaining a large one, pass `WithChunks`: its callback receives nonempty response
+chunks and finishes before the next chunk, and Body stays nil.
 `NativeResult.Response` also retains metadata for an empty body when no callback
 runs. Response.Metadata is an optional opaque Document;
 Response.BodyContentType describes the separately streamed body. Metadata may
@@ -49,17 +48,16 @@ httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/_doc/examp
 if err != nil { return err }
 request, err := weir.NewHTTPNativeRequest("records", httpRequest)
 if err != nil { return err }
-options := weir.NativeOptions{StoreName: "search", Request: request}
-options.Consume = func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
+consume := func(ctx context.Context, response *weir.NativeResponse, data []byte) error {
     return consumeNativeBytes(ctx, response, data)
 }
-result, err := client.Native(ctx, options)
+result, err := client.Native(ctx, "search", request, weir.WithChunks(consume))
 ```
 
 `ParseHTTPNativeResponse(response)` optionally parses application/http metadata
 containing a complete status line and CRLF header block, with no body bytes or
 transfer framing. It returns HTTPNativeResponse with StatusCode and Headers;
-response body bytes continue through Native's chunk consumer. These helpers are
+response body bytes stay in `Body` or go to the `WithChunks` callback. These helpers are
 ordinary HTTP codecs, independent of any Store type or protobuf backend fields.
 
 ## Completion evidence

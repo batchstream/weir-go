@@ -17,16 +17,30 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 
 | Method | Use |
 | --- | --- |
-| `ReadOne` | Read one record. |
-| `Read` | Read many records. Results return in input order. |
-| `Create` | Write one record that must not exist. |
-| `Replace` | Write one record that must exist. |
-| `Put` | Create or replace one record. |
-| `Delete` | Delete one record. |
-| `Mutate` | Write many records in one call. Not a transaction. |
-| `AtomicTransform` | Change one record with a Lua function or a backend expression. |
-| `ReadStream`, `MutateStream` | Send and receive records incrementally. |
-| `Native` | Send a backend's own command. Use it for queries, scans and counts. |
+| `Read(ctx, store, options...)` | Read records. Results return in input order. |
+| `Mutate(ctx, store, options...)` | Write records. Not a transaction. |
+| `Native(ctx, store, request, options...)` | Send a backend's own command. Use it for queries, scans and counts. |
+
+### Options
+
+| Option | Applies to | Effect |
+| --- | --- | --- |
+| `WithDialOptions` | `New` | gRPC options for the connection, such as an interceptor or a custom dialer. |
+| `WithRequests` | `Read`, `Mutate` | The records to send. |
+| `WithNext` | `Read`, `Mutate` | A callback that produces more records, after those of `WithRequests`. |
+| `WithReadConsume`, `WithMutateConsume` | `Read`, `Mutate` | A callback that receives each result as it arrives, instead of the call returning them. |
+| `WithQueryVisible` | `Mutate` | Wait until normal queries can see the mutations. |
+| `WithChunks` | `Native` | A callback that receives the response body in chunks, instead of `Body` holding it. |
+
+### Mutation actions
+
+| Action | Use |
+| --- | --- |
+| `MutationCreate` | Write a record that must not exist. |
+| `MutationReplace` | Write a record that must exist. |
+| `MutationPut` | Create or replace a record. |
+| `MutationDelete` | Delete a record. |
+| `MutationAtomicTransform` | Change a record with a Lua function or a backend expression. |
 
 ### Backend formats
 
@@ -58,8 +72,8 @@ documents. Your code owns the document bytes.
 4. Never automatically resend a mutation that is `MutationApplied` or
    `MutationUnknown`, or that has no result. It has applied or may have applied.
    Reconcile it first.
-5. A write may not be visible to the next Search query. Set
-   `MutationQueryVisible` when it must be.
+5. A write may not be visible to the next Search query. Pass
+   `WithQueryVisible` when it must be.
 6. The application listener uses plaintext gRPC. Restrict its network access.
 
 ## Requirements
@@ -84,7 +98,7 @@ This writes one record to MongoDB through Weir and reads it back.
 mkdir hello
 cd hello
 go mod init example.com/hello
-go get github.com/batchstream/weir-go@v0.23.1 go.mongodb.org/mongo-driver/v2/bson
+go get github.com/batchstream/weir-go@v0.24.0 go.mongodb.org/mongo-driver/v2/bson
 ```
 
 **Step 3.** Save this as `main.go`.
@@ -122,24 +136,23 @@ func main() {
 		log.Fatal(err)
 	}
 	document := &weir.Document{ContentType: "application/bson", Data: data}
-	writeRequest := &weir.WriteRequest{Resource: resource, Document: document}
-	writeOptions := weir.WriteOptions{StoreName: storeName, Request: writeRequest}
-	written, err := client.Put(ctx, writeOptions)
+	write := &weir.MutateRequest{Resource: resource, Action: weir.MutationPut, Document: document}
+	written, err := client.Mutate(ctx, storeName, weir.WithRequests(write))
 	if err != nil {
 		log.Fatal(err)
 	}
-	if written.GetFailure() != nil {
-		log.Fatal(written.GetFailure())
+	if written[0].GetFailure() != nil {
+		log.Fatal(written[0].GetFailure())
 	}
-	fmt.Println("outcome:", written.GetOutcome())
+	fmt.Println("outcome:", written[0].GetOutcome())
 
 	// Read the record back.
-	readRequest := &weir.ReadRequest{Resource: resource}
-	readOptions := weir.ReadOneOptions{StoreName: storeName, Request: readRequest}
-	result, err := client.ReadOne(ctx, readOptions)
+	read := &weir.ReadRequest{Resource: resource}
+	results, err := client.Read(ctx, storeName, weir.WithRequests(read))
 	if err != nil {
 		log.Fatal(err)
 	}
+	result := results[0]
 	if result.Failure != nil {
 		log.Fatal(result.Failure)
 	}
@@ -176,18 +189,18 @@ message: hi
 
 | Guide | Contents |
 | --- | --- |
-| [Connections](docs/connections.md) | Addresses, Kubernetes DNS names, keepalive and closing |
+| [Connections](docs/connections.md) | Addresses, gRPC options, Kubernetes DNS names, keepalive and closing |
 | [Operations](docs/operations.md) | Reads, writes, visibility, results and outcomes |
 | [Lua](docs/lua.md) | Lua transforms |
 | [Native](docs/native.md) | Backend commands and HTTP helpers |
-| [Streaming](docs/streaming.md) | Streams, deadlines and resending refused records |
+| [Streaming](docs/streaming.md) | Callbacks, streams, deadlines and resending refused records |
 | [Development](docs/development.md) | Tests, real backend tests and releases |
 | [API reference](https://pkg.go.dev/github.com/batchstream/weir-go) | Every exported type and function |
 
 | Example | Shows |
 | --- | --- |
 | [read](examples/read/main.go) | A typed read |
-| [basic](examples/basic/main.go) | A mutation, then many reads in one stream |
+| [basic](examples/basic/main.go) | A mutation, then many reads in one call |
 | [native](examples/native/main.go) | A native command and its response |
 
 ## Development

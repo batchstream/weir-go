@@ -7,41 +7,38 @@ import (
 	"testing"
 
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
-	"google.golang.org/protobuf/proto"
 )
 
-func TestMutateStreamPreservesPerRecordVisibility(t *testing.T) {
+func TestQueryVisibleAppliesToEveryRecordOfACall(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 2)}
-	client := clientTestConnection(t, peer)
+	client := clientTestClient(t, peer)
 	expression := &Document{ContentType: "application/json", Data: []byte(`{"doc":{"n":1}}`)}
-	completion := &MutationOptions{Visibility: MutationQueryVisible}
-	first := &MutateRequest{Resource: "records/s:first", Action: MutationAtomicTransform, BackendExpression: expression, Options: completion}
-	second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete}
-	requests := []*MutateRequest{first, second}
-	produced, consumed := 0, uint64(0)
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(context.Context) (*MutateRequest, error) {
-		if produced == len(requests) {
+	first := &MutateRequest{Resource: "records/s:first", Action: MutationAtomicTransform, BackendExpression: expression}
+	second := deleteRequest("records/s:second")
+	produced := false
+	next := func(context.Context) (*MutateRequest, error) {
+		if produced {
 			return nil, io.EOF
 		}
-		request := requests[produced]
-		produced++
-		return request, nil
+		produced = true
+		return second, nil
 	}
-	options.Consume = func(_ context.Context, index uint64, result *MutationResult) error {
+	consumed := 0
+	consume := func(_ context.Context, _ int, result *MutationResult) error {
 		consumed++
-		if index != consumed || result.GetOutcome() != MutationApplied || result.Failure != nil {
-			return errors.New("mutation evidence was lost or reordered")
+		if result.GetOutcome() != MutationApplied || result.Failure != nil {
+			return errors.New("mutation evidence was lost")
 		}
 		return nil
 	}
-	if err := MutateStream(t.Context(), client, options); err != nil {
+	_, err := client.Mutate(t.Context(), "records", WithRequests(first), WithNext(next), WithMutateConsume(consume), WithQueryVisible())
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, request := range requests {
+	for range 2 {
 		mutation := <-peer.mutations
-		if mutation.Resource != request.Resource || !proto.Equal(mutation.Options, request.Options) {
-			t.Fatal("stream changed complete per-record options", mutation, request)
+		if mutation.GetOptions().GetVisibility() != pb.MutationVisibility_QUERY_VISIBLE {
+			t.Fatal("a record lost the call's visibility", mutation)
 		}
 	}
 	if peer.streams.Load() != 1 || peer.received.Load() != 2 || consumed != 2 {
@@ -49,58 +46,45 @@ func TestMutateStreamPreservesPerRecordVisibility(t *testing.T) {
 	}
 }
 
-func TestMutationOptionsRejectInvalidBatchBeforeRPC(t *testing.T) {
-	unknown := &MutationOptions{Visibility: MutationQueryVisible}
-	unknown.ProtoReflect().SetUnknown([]byte{0x10, 1})
-	negative := &MutationOptions{Visibility: MutationVisibility(-1)}
-	undeclared := &MutationOptions{Visibility: MutationVisibility(2)}
-	for _, completion := range []*MutationOptions{negative, undeclared, unknown} {
-		peer := &clientTestPeer{mode: "typed_mutation"}
-		client := clientTestConnection(t, peer)
-		first := &MutateRequest{Resource: "records/s:first", Action: MutationDelete}
-		second := &MutateRequest{Resource: "records/s:second", Action: MutationDelete, Options: completion}
-		options := MutateOptions{StoreName: "records", Requests: []*MutateRequest{first, second}}
-		results, err := Mutate(t.Context(), client, options)
-		if err == nil || results != nil || peer.streams.Load() != 0 || peer.received.Load() != 0 {
-			t.Fatal("invalid completion option sent part of a batch", completion, results, err, peer.streams.Load(), peer.received.Load())
-		}
+func TestMutationsWaitForApplicationByDefault(t *testing.T) {
+	peer := &clientTestPeer{mode: "typed_mutation", mutations: make(chan *pb.MutateRequest, 1)}
+	client := clientTestClient(t, peer)
+	if _, err := mutateOne(t.Context(), client, deleteRequest("records/s:key")); err != nil {
+		t.Fatal(err)
+	}
+	if mutation := <-peer.mutations; mutation.Options != nil {
+		t.Fatal("a mutation sent options nobody asked for", mutation)
 	}
 }
 
-func TestMutateStreamInvalidOptionsKeepConfirmedPrefix(t *testing.T) {
+func TestProducedInvalidMutationKeepsConfirmedPrefix(t *testing.T) {
 	peer := &clientTestPeer{mode: "typed_mutation"}
-	client := clientTestConnection(t, peer)
-	completion := &MutationOptions{Visibility: MutationVisibility(2)}
+	client := clientTestClient(t, peer)
 	confirmed := make(chan struct{})
-	produced, consumed := 0, uint64(0)
-	options := MutateStreamOptions{StoreName: "records"}
-	options.Next = func(ctx context.Context) (*MutateRequest, error) {
+	produced, consumed := 0, 0
+	next := func(ctx context.Context) (*MutateRequest, error) {
 		produced++
-		request := &MutateRequest{Resource: "records/s:key", Action: MutationDelete}
 		if produced == 1 {
-			return request, nil
-		}
-		if produced > 2 {
-			return nil, io.EOF
+			return deleteRequest("records/s:key"), nil
 		}
 		select {
 		case <-confirmed:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		request.Options = completion
-		return request, nil
+		invalid := &MutateRequest{Resource: "records/s:key", Action: MutationAction(99)}
+		return invalid, nil
 	}
-	options.Consume = func(_ context.Context, index uint64, result *MutationResult) error {
+	consume := func(_ context.Context, index int, result *MutationResult) error {
 		consumed++
-		if index != 1 || result.GetOutcome() != MutationApplied || result.Failure != nil {
+		if index != 0 || result.GetOutcome() != MutationApplied || result.Failure != nil {
 			return errors.New("confirmed mutation changed")
 		}
 		close(confirmed)
 		return nil
 	}
-	err := MutateStream(t.Context(), client, options)
+	_, err := client.Mutate(t.Context(), "records", WithNext(next), WithMutateConsume(consume))
 	if err == nil || consumed != 1 || peer.streams.Load() != 1 || peer.received.Load() != 1 {
-		t.Fatal("invalid later option lost evidence, reached the backend or caused replay", err, consumed, peer.streams.Load(), peer.received.Load())
+		t.Fatal("invalid later request lost evidence, reached the backend or caused replay", err, consumed, peer.streams.Load(), peer.received.Load())
 	}
 }

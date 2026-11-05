@@ -59,14 +59,13 @@ func run() error {
 	}
 	defer client.Close()
 	total := 0
-	opts := weir.NativeOptions{StoreName: *store, Request: request}
-	opts.Consume = func(_ context.Context, response *weir.NativeResponse, data []byte) error {
+	consume := func(_ context.Context, response *weir.NativeResponse, data []byte) error {
 		fmt.Printf("metadata=%v content-type=%s chunk=%d bytes\n", response.Metadata, response.BodyContentType, len(data))
 		total += len(data)
 		// Consume and discard each chunk instead of retaining the whole response.
 		return nil
 	}
-	result, err := client.Native(ctx, opts)
+	result, err := client.Native(ctx, *store, request, weir.WithChunks(consume))
 	if result != nil && result.Completion == weir.NativeNotStarted {
 		return fmt.Errorf("native request was not started: %v; RPC error=%v", result.Failure, err)
 	}

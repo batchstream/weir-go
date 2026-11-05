@@ -5,7 +5,6 @@ package weir_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,7 +64,7 @@ func testLifecycle(t *testing.T, backend string) {
 	defer client.Close()
 	id := fmt.Sprintf("sdk-%s-%d", backend, time.Now().UnixNano())
 	builder := mutationBuilder{t: t, backend: backend, resource: collection + "/s:" + id, id: id}
-	write := weir.WriteOptions{StoreName: store, Request: builder.write(1)}
+	remove := &weir.MutateRequest{Resource: builder.resource, Action: weir.MutationDelete}
 	deleted := false
 	t.Cleanup(func() {
 		if deleted {
@@ -79,38 +78,32 @@ func testLifecycle(t *testing.T, backend string) {
 			return
 		}
 		defer cleanupClient.Close()
-		request := &weir.DeleteRequest{Resource: builder.resource}
-		remove := weir.DeleteOptions{StoreName: store, Request: request}
-		result, err := cleanupClient.Delete(cleanup, remove)
+		result, err := mutateOne(cleanup, cleanupClient, store, remove)
 		if err != nil || result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
 			t.Error("owned record cleanup:", result, err)
 		}
 	})
-	result, err := client.Create(ctx, write)
+	create := builder.write(weir.MutationCreate, 1)
+	result, err := mutateOne(ctx, client, store, create)
 	applied(t, result, err)
-	duplicate, err := client.Create(ctx, write)
+	duplicate, err := mutateOne(ctx, client, store, create)
 	if err != nil || duplicate.GetOutcome() != weir.MutationNotApplied || duplicate.GetFailure().GetCode() != weir.FailurePreconditionFailed {
 		t.Fatalf("duplicate create: %v %v", duplicate, err)
 	}
-	write.Request = builder.write(4)
-	result, err = client.Replace(ctx, write)
+	result, err = mutateOne(ctx, client, store, builder.write(weir.MutationReplace, 4))
 	applied(t, result, err)
-	result, err = client.Put(ctx, write)
+	result, err = mutateOne(ctx, client, store, builder.write(weir.MutationPut, 4))
 	applied(t, result, err)
-	transform := weir.AtomicTransformOptions{StoreName: store, Request: builder.transform(4)}
-	result, err = client.AtomicTransform(ctx, transform)
+	result, err = mutateOne(ctx, client, store, builder.transform(4))
 	applied(t, result, err)
 	read := &weir.ReadRequest{Resource: builder.resource}
-	readOptions := weir.ReadOneOptions{StoreName: store, Request: read}
-	readResult, err := client.ReadOne(ctx, readOptions)
+	readResult, err := readOne(ctx, client, store, read)
 	if err != nil || readResult == nil || readResult.Document == nil || number(t, backend, readResult.Document.GetData()) != 4 {
 		t.Fatalf("persisted read: %v %v", readResult, err)
 	}
-	write.Request = builder.write(5)
-	result, err = client.Replace(ctx, write)
+	result, err = mutateOne(ctx, client, store, builder.write(weir.MutationReplace, 5))
 	applied(t, result, err)
-	reads := weir.ReadOptions{StoreName: store, Requests: []*weir.ReadRequest{read, read}}
-	batchResults, err := client.Read(ctx, reads)
+	batchResults, err := client.Read(ctx, store, weir.WithRequests(read, read))
 	if err != nil || len(batchResults) != 2 {
 		t.Fatal("batch read failed", batchResults, err)
 	}
@@ -120,21 +113,12 @@ func testLifecycle(t *testing.T, backend string) {
 		}
 	}
 	native := nativeRequest(t, backend, collection, id)
-	var body []byte
-	nativeOptions := weir.NativeOptions{StoreName: store, Request: native}
-	nativeOptions.Consume = func(_ context.Context, _ *weir.NativeResponse, data []byte) error {
-		if len(body)+len(data) > 1<<20 {
-			return errors.New("fixture response too large")
-		}
-		body = append(body, data...)
-		return nil
-	}
-	resultNative, err := client.Native(ctx, nativeOptions)
+	resultNative, err := client.Native(ctx, store, native)
 	if err != nil || resultNative == nil || resultNative.Completion != weir.NativeResponseComplete {
 		t.Fatalf("Native: %v %v", resultNative, err)
 	}
 	if backend == "mongo" {
-		raw := bson.Raw(body)
+		raw := bson.Raw(resultNative.Body)
 		if raw.Lookup("n").AsInt64() != 1 || raw.Lookup("ok").AsFloat64() != 1 {
 			t.Fatal("native count mismatch")
 		}
@@ -144,12 +128,10 @@ func testLifecycle(t *testing.T, backend string) {
 			t.Fatalf("native HTTP metadata: %v %v", metadata, err)
 		}
 	}
-	deleteRequest := &weir.DeleteRequest{Resource: builder.resource}
-	deleteOptions := weir.DeleteOptions{StoreName: store, Request: deleteRequest}
-	result, err = client.Delete(ctx, deleteOptions)
+	result, err = mutateOne(ctx, client, store, remove)
 	applied(t, result, err)
 	deleted = true
-	readResult, err = client.ReadOne(ctx, readOptions)
+	readResult, err = readOne(ctx, client, store, read)
 	if err != nil || readResult == nil || !readResult.Missing {
 		t.Fatalf("deleted read: %v %v", readResult, err)
 	}
@@ -184,42 +166,35 @@ func testStreaming(t *testing.T, backend string) {
 		}
 		defer cleanupClient.Close()
 		for _, builder := range builders {
-			request := &weir.DeleteRequest{Resource: builder.resource}
-			options := weir.DeleteOptions{StoreName: target.store, Request: request}
-			result, err := cleanupClient.Delete(cleanup, options)
+			remove := &weir.MutateRequest{Resource: builder.resource, Action: weir.MutationDelete}
+			result, err := mutateOne(cleanup, cleanupClient, target.store, remove)
 			if err != nil || result.GetOutcome() != weir.MutationApplied || result.GetFailure() != nil {
 				t.Error("owned record cleanup:", result, err)
 			}
 		}
 	})
-	first := builders[0].write(0)
-	updated := builders[0].write(10)
-	second := builders[1].write(1)
-	third := builders[2].write(2)
-	create := &weir.MutateRequest{Resource: first.Resource, Action: weir.MutationCreate, Document: first.Document}
-	put := &weir.MutateRequest{Resource: updated.Resource, Action: weir.MutationPut, Document: updated.Document}
-	createSecond := &weir.MutateRequest{Resource: second.Resource, Action: weir.MutationCreate, Document: second.Document}
-	createThird := &weir.MutateRequest{Resource: third.Resource, Action: weir.MutationCreate, Document: third.Document}
-	mutations := []*weir.MutateRequest{create, create, put, createSecond, createThird}
+	create := builders[0].write(weir.MutationCreate, 0)
+	// The rest follow from a producer, in order after the requests.
+	produced := []*weir.MutateRequest{builders[0].write(weir.MutationPut, 10), builders[1].write(weir.MutationCreate, 1), builders[2].write(weir.MutationCreate, 2)}
+	total := 2 + len(produced)
 	// Results arrive as records complete; each index appears once.
 	position, confirmed := 0, 0
-	seen := make(map[uint64]bool)
-	mutate := weir.MutateStreamOptions{StoreName: target.store}
-	mutate.Next = func(context.Context) (*weir.MutateRequest, error) {
-		if position == len(mutations) {
+	seen := make(map[int]bool)
+	nextMutation := func(context.Context) (*weir.MutateRequest, error) {
+		if position == len(produced) {
 			return nil, io.EOF
 		}
-		request := mutations[position]
+		request := produced[position]
 		position++
 		return request, nil
 	}
-	mutate.Consume = func(_ context.Context, index uint64, result *weir.MutationResult) error {
+	consumeMutation := func(_ context.Context, index int, result *weir.MutationResult) error {
 		confirmed++
-		if index == 0 || index > uint64(len(mutations)) || seen[index] {
-			return fmt.Errorf("unexpected mutation ordinal %d", index)
+		if index >= total || seen[index] {
+			return fmt.Errorf("unexpected mutation index %d", index)
 		}
 		seen[index] = true
-		if index == 2 {
+		if index == 1 {
 			if result.GetOutcome() != weir.MutationNotApplied || result.GetFailure().GetCode() != weir.FailurePreconditionFailed {
 				return fmt.Errorf("duplicate create evidence: %v", result)
 			}
@@ -230,23 +205,22 @@ func testStreaming(t *testing.T, backend string) {
 		}
 		return nil
 	}
-	if err := client.MutateStream(ctx, mutate); err != nil || confirmed != len(mutations) {
+	_, err = client.Mutate(ctx, target.store, weir.WithRequests(create, create), weir.WithNext(nextMutation), weir.WithMutateConsume(consumeMutation))
+	if err != nil || confirmed != total {
 		t.Fatalf("stream mutation acknowledgements=%d: %v", confirmed, err)
 	}
 	lua := &weir.LuaTransform{Source: []byte(`return function(current, incoming)
     current.n = current.n + 7
     return current
 end`)}
-	transform := &weir.AtomicTransformRequest{Resource: first.Resource, Lua: lua}
-	transformOptions := weir.AtomicTransformOptions{StoreName: target.store, Request: transform}
-	result, err := client.AtomicTransform(ctx, transformOptions)
+	transform := &weir.MutateRequest{Resource: create.Resource, Action: weir.MutationAtomicTransform, Lua: lua}
+	result, err := mutateOne(ctx, client, target.store, transform)
 	applied(t, result, err)
-	resources := []string{third.Resource, first.Resource, target.collection + "/s:" + idPrefix + "-missing", second.Resource, first.Resource}
+	resources := []string{builders[2].resource, create.Resource, target.collection + "/s:" + idPrefix + "-missing", builders[1].resource, create.Resource}
 	expected := []int64{2, 17, -1, 1, 17}
 	position, confirmed = 0, 0
 	clear(seen)
-	read := weir.ReadStreamOptions{StoreName: target.store}
-	read.Next = func(context.Context) (*weir.ReadRequest, error) {
+	nextRead := func(context.Context) (*weir.ReadRequest, error) {
 		if position == len(resources) {
 			return nil, io.EOF
 		}
@@ -254,25 +228,36 @@ end`)}
 		position++
 		return request, nil
 	}
-	read.Consume = func(_ context.Context, index uint64, result *weir.ReadResult) error {
+	consumeRead := func(_ context.Context, index int, result *weir.ReadResult) error {
 		confirmed++
-		if index == 0 || index > uint64(len(resources)) || seen[index] || result == nil || result.Failure != nil {
+		if index >= len(resources) || seen[index] || result == nil || result.Failure != nil {
 			return fmt.Errorf("read %d: %v", index, result)
 		}
 		seen[index] = true
-		if expected[index-1] == -1 {
+		if expected[index] == -1 {
 			if !result.Missing || result.Document != nil {
 				return fmt.Errorf("read %d did not confirm missing: %v", index, result)
 			}
-		} else if result.Missing || result.Document == nil || number(t, backend, result.Document.Data) != expected[index-1] {
+		} else if result.Missing || result.Document == nil || number(t, backend, result.Document.Data) != expected[index] {
 			return fmt.Errorf("read %d did not preserve same-key mutation order: %v", index, result)
 		}
 		return nil
 	}
-	if err := client.ReadStream(ctx, read); err != nil || confirmed != len(resources) {
+	_, err = client.Read(ctx, target.store, weir.WithNext(nextRead), weir.WithReadConsume(consumeRead))
+	if err != nil || confirmed != len(resources) {
 		t.Fatalf("stream read acknowledgements=%d: %v", confirmed, err)
 	}
 	t.Logf("%s: stream same-key order, duplicate-create continuation, Lua readback and repeated/missing streamed reads verified", backend)
+}
+
+func mutateOne(ctx context.Context, client *weir.Client, store string, request *weir.MutateRequest) (*weir.MutationResult, error) {
+	results, err := client.Mutate(ctx, store, weir.WithRequests(request))
+	return results[0], err
+}
+
+func readOne(ctx context.Context, client *weir.Client, store string, request *weir.ReadRequest) (*weir.ReadResult, error) {
+	results, err := client.Read(ctx, store, weir.WithRequests(request))
+	return results[0], err
 }
 
 func applied(t *testing.T, result *weir.MutationResult, err error) {
@@ -296,17 +281,17 @@ type mutationBuilder struct {
 	backend, resource, id string
 }
 
-func (b mutationBuilder) write(n int) *weir.WriteRequest {
+func (b mutationBuilder) write(action weir.MutationAction, n int) *weir.MutateRequest {
 	b.t.Helper()
 	document := &weir.Document{ContentType: "application/json", Data: []byte(fmt.Sprintf(`{"n":%d,"unprojected":true}`, n))}
 	if b.backend == "mongo" {
 		value := bson.D{{Key: "_id", Value: b.id}, {Key: "n", Value: n}, {Key: "unprojected", Value: true}}
 		document = bsonDocument(b.t, value)
 	}
-	request := &weir.WriteRequest{Resource: b.resource, Document: document}
+	request := &weir.MutateRequest{Resource: b.resource, Action: action, Document: document}
 	return request
 }
-func (b mutationBuilder) transform(n int) *weir.AtomicTransformRequest {
+func (b mutationBuilder) transform(n int) *weir.MutateRequest {
 	b.t.Helper()
 	expression := &weir.Document{ContentType: "application/vnd.weir.search-update.v1+json", Data: []byte(fmt.Sprintf(`{"doc":{"n":%d}}`, n))}
 	if b.backend == "mongo" {
@@ -315,7 +300,7 @@ func (b mutationBuilder) transform(n int) *weir.AtomicTransformRequest {
 		expression = bsonDocument(b.t, update)
 		expression.ContentType = "application/vnd.weir.mongodb-update.v1+bson"
 	}
-	request := &weir.AtomicTransformRequest{Resource: b.resource, BackendExpression: expression}
+	request := &weir.MutateRequest{Resource: b.resource, Action: weir.MutationAtomicTransform, BackendExpression: expression}
 	return request
 }
 func number(t *testing.T, backend string, data []byte) int64 {

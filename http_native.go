@@ -12,7 +12,8 @@ import (
 )
 
 // HTTPNativeResponse describes an application/http metadata document. Its body
-// belongs to the Native chunk consumer and is never retained by this helper.
+// stays in NativeResult.Body or goes to the WithChunks callback, and this helper
+// never retains it.
 type HTTPNativeResponse struct {
 	StatusCode int
 	Headers    http.Header

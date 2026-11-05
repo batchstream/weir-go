@@ -16,7 +16,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -207,13 +206,6 @@ type lane struct {
 	idle       *time.Timer
 }
 
-// execute sends one validated command on a shared stream when one has room and
-// otherwise reports false so the caller can use a stream of its own. Callers
-// validate first because an invalid request ends the stream for every record.
-func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command) (*pb.Event, bool, error) {
-	return p.finish(ctx, key, command, nil)
-}
-
 // queuedRecord is a record enqueue placed on a stream, or why it did not: an
 // error, or neither for a record that needs a stream of its own.
 type queuedRecord struct {
@@ -249,7 +241,10 @@ func (p *lanePool) enqueue(ctx context.Context, key laneKey, command *pb.Command
 }
 
 // finish waits for the outcome of a record enqueue placed, or sends it now when
-// queued is nil, and sends it again when its stream closed before sending it.
+// queued is nil, and sends it again when its stream closed before sending it. It
+// reports false when no stream has room, so the caller can use one of its own.
+// Callers validate first because an invalid request ends the stream for every
+// record.
 func (p *lanePool) finish(ctx context.Context, key laneKey, command *pb.Command, queued *queuedRecord) (*pb.Event, bool, error) {
 	for range laneAttempts {
 		if queued == nil {
@@ -391,9 +386,10 @@ type laneOpening struct {
 func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error) {
 	key, group := opening.key, opening.group
 	laneCtx, cancel := context.WithCancel(p.ctx)
-	streamCtx := laneCtx
+	picked := &atomic.Pointer[string]{}
+	streamCtx := context.WithValue(laneCtx, endpointPicked, picked)
 	if opening.target != "" {
-		streamCtx = context.WithValue(laneCtx, endpointPreference, opening.target)
+		streamCtx = context.WithValue(streamCtx, endpointPreference, opening.target)
 	}
 	// A group with one owner sends its caller's outgoing metadata.
 	if outgoing, ok := metadata.FromOutgoingContext(ctx); ok && key.owner != 0 {
@@ -411,8 +407,8 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 	if stopped && err == nil {
 		now := time.Now()
 		address := ""
-		if reached, ok := peer.FromContext(stream.Context()); ok && reached.Addr != nil {
-			address = reached.Addr.String()
+		if chosen := picked.Load(); chosen != nil {
+			address = *chosen
 		}
 		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), address: address, probing: opening.probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
 		opened.load.Store(1)
