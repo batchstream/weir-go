@@ -572,6 +572,134 @@ func TestLoneStreamMovesOffADrainingServerAtOnce(t *testing.T) {
 
 // A Client that knows its servers probes one that has not refused; behind one
 // address, a probe can still reach the draining server.
+// scriptedStreamsClient opens the streams it holds, one per Execute.
+type scriptedStreamsClient struct {
+	pb.StoreServiceClient
+	mu      sync.Mutex
+	streams []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
+	opened  int
+}
+
+func (c *scriptedStreamsClient) Execute(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses], error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stream := c.streams[c.opened]
+	c.opened++
+	return stream, nil
+}
+
+// rejectedStream is a stream a server has already rejected: Send reports that it
+// ended, and Recv returns the rejection once hold closes.
+type rejectedStream struct {
+	grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
+	ctx context.Context
+	// receiving closes when the client first asks for the stream's result.
+	receiving chan struct{}
+	hold      chan struct{}
+}
+
+func (s *rejectedStream) Context() context.Context { return s.ctx }
+
+func (s *rejectedStream) Send(*pb.ExecuteRequests) error { return io.EOF }
+
+func (s *rejectedStream) Recv() (*pb.ExecuteResponses, error) {
+	close(s.receiving)
+	<-s.hold
+	return nil, status.Error(codes.Unavailable, "draining")
+}
+
+// applyingStream answers every record as applied.
+type applyingStream struct {
+	grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
+	ctx     context.Context
+	replies chan *pb.ExecuteResponses
+}
+
+func (s *applyingStream) Context() context.Context { return s.ctx }
+
+func (s *applyingStream) Send(message *pb.ExecuteRequests) error {
+	for _, request := range message.Requests {
+		result := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
+		value := &pb.Event_MutationResult{MutationResult: result}
+		event := &pb.Event{Value: value}
+		response := &pb.ExecuteResponse{Index: request.Index, Event: event}
+		reply := &pb.ExecuteResponses{Responses: []*pb.ExecuteResponse{response}}
+		s.replies <- reply
+	}
+	return nil
+}
+
+func (s *applyingStream) Recv() (*pb.ExecuteResponses, error) {
+	select {
+	case reply := <-s.replies:
+		return reply, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+
+// A stream whose Send reported its end leaves its group at once. Until its receiver
+// runs nothing else says it ended, and a record sent back to it would run out of
+// attempts and use a stream of its own, which may reach a draining server.
+func TestStreamWhoseSendEndedTakesNoMoreRecords(t *testing.T) {
+	rejected := &rejectedStream{ctx: t.Context(), receiving: make(chan struct{}), hold: make(chan struct{})}
+	t.Cleanup(func() { close(rejected.hold) })
+	applying := &applyingStream{ctx: t.Context(), replies: make(chan *pb.ExecuteResponses, 1)}
+	client := &scriptedStreamsClient{streams: []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]{rejected, applying}}
+	pool := newLanePool(client, nil)
+	t.Cleanup(pool.close)
+	command, _, err := mutateCommand(putRequest("records/s:next", `{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := laneKey{store: "records"}
+	event, shared, err := pool.finish(t.Context(), key, command, nil)
+	if err != nil || !shared || event.GetMutationResult().GetOutcome() != MutationApplied {
+		t.Fatal("record did not move to the next shared stream", event, shared, err)
+	}
+	if client.opened != 2 {
+		t.Fatal("streams opened", client.opened)
+	}
+}
+
+// A stream that ends leaves its group. One a server rejects at once must not end
+// before the group holds it, or it stays there dead until it expires.
+func TestRejectedStreamDoesNotStayInItsGroup(t *testing.T) {
+	hold := make(chan struct{})
+	close(hold)
+	stream := &rejectedStream{ctx: t.Context(), receiving: make(chan struct{}), hold: hold}
+	client := &scriptedStreamsClient{streams: []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]{stream}}
+	pool := newLanePool(client, nil)
+	t.Cleanup(pool.close)
+	key := laneKey{store: "records"}
+	group := &laneGroup{opening: make(chan struct{})}
+	pool.groups[key] = group
+	opening := laneOpening{key: key, group: group}
+	opened := make(chan *lane, 1)
+	// Holding the pool's lock stops open before it can add the stream.
+	pool.mu.Lock()
+	go func() {
+		stream, err := pool.open(t.Context(), opening)
+		if err != nil {
+			t.Error(err)
+		}
+		opened <- stream
+	}()
+	select {
+	case <-stream.receiving:
+		t.Error("stream received before its group held it")
+	case <-time.After(50 * time.Millisecond):
+	}
+	pool.mu.Unlock()
+	// A stream's context ends after it has left its group.
+	<-(<-opened).ctx.Done()
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(group.lanes) != 0 {
+		t.Fatal("a rejected stream stayed in its group", len(group.lanes))
+	}
+}
+
 func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client := laneTestInTurn(t, first, second)
