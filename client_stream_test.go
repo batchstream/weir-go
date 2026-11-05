@@ -357,8 +357,8 @@ func TestClientStreamReportsItsCallbacksAndInputs(t *testing.T) {
 		{name: "no input", store: "records", options: nil, want: "requires a Store and requests"},
 		{name: "invalid store", store: "", options: []MutateOption{record}, want: "requires a Store and requests"},
 		{name: "empty input", store: "records", options: []MutateOption{WithNext(empty), WithMutateConsume(consume)}, want: "at least one record"},
-		{name: "producer error", store: "records", options: []MutateOption{WithNext(broken), WithMutateConsume(consume)}, want: "request 1: application failure"},
-		{name: "invalid request", store: "records", options: []MutateOption{WithNext(invalid), WithMutateConsume(consume)}, want: "request 1"},
+		{name: "producer error", store: "records", options: []MutateOption{WithNext(broken), WithMutateConsume(consume)}, want: "request 0: application failure"},
+		{name: "invalid request", store: "records", options: []MutateOption{WithNext(invalid), WithMutateConsume(consume)}, want: "request 0"},
 		{name: "consumer error", store: "records", options: []MutateOption{record, WithMutateConsume(failing)}, want: "application failure"},
 	}
 	for _, test := range tests {
@@ -876,12 +876,15 @@ func TestClientBatchBeyondItsWindowSendsTheRestAsResultsArrive(t *testing.T) {
 }
 
 func TestClientBatchOfOneResourceKeepsItsOrder(t *testing.T) {
-	peer := newLaneTestPeer()
-	client := laneTestClient(t, peer)
+	peer := newRefusingPeer()
+	client := refusingClient(t, peer)
 	const count = 8
 	var requests []*MutateRequest
-	for range count {
-		requests = append(requests, putRequest("records/s:same", `{}`))
+	var want []string
+	for index := range count {
+		data := fmt.Sprintf(`{"n":%d}`, index)
+		requests = append(requests, putRequest("records/s:same", data))
+		want = append(want, data)
 	}
 	results, err := client.Mutate(t.Context(), "records", WithRequests(requests...))
 	if err != nil {
@@ -891,6 +894,22 @@ func TestClientBatchOfOneResourceKeepsItsOrder(t *testing.T) {
 		if result.GetOutcome() != MutationApplied {
 			t.Fatal(index, result)
 		}
+	}
+	if applied := peer.drain(); !slices.Equal(applied, want) {
+		t.Fatal("a resource's records did not keep input order", applied)
+	}
+	// Each record waits for the previous one's result, so none shares a message.
+	counting := &countsMessages{}
+	countingClient, err := New(serveForTest(t, counting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer countingClient.Close()
+	if _, err := countingClient.Mutate(t.Context(), "records", WithRequests(requests...)); err != nil {
+		t.Fatal(err)
+	}
+	if messages := counting.take(); len(messages) != count || slices.Max(messages) != 1 {
+		t.Fatal("a record did not wait for the previous result of its resource", messages)
 	}
 }
 
@@ -903,8 +922,12 @@ func TestCanceledBatchEndsWithItsRecordsUnsent(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := mutateOne(ctx, client, putRequest("records/s:a", `{}`)); !errors.Is(err, context.Canceled) {
+	requests := WithRequests(putRequest("records/s:a", `{}`), putRequest("records/s:b", `{}`))
+	if _, err := client.Mutate(ctx, "records", requests); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+	if sent := peer.take(); len(sent) != 0 {
+		t.Fatal("a canceled call sent records", sent)
 	}
 }
 

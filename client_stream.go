@@ -112,12 +112,17 @@ func runClientStream[R comparable](ctx context.Context, c *Client, options clien
 // fail keeps the stream's first error and stops sending. A record that fails
 // cancels the ones behind it before they can start.
 func (s *clientStream[R]) fail(err error) {
+	s.keepFailure(err)
+	s.cancel()
+}
+
+// keepFailure keeps the stream's first error.
+func (s *clientStream[R]) keepFailure(err error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.failure == nil {
 		s.failure = err
 	}
-	s.mu.Unlock()
-	s.cancel()
 }
 
 // produce admits records until the input ends or fails, then closes outcomes
@@ -160,8 +165,10 @@ func (s *clientStream[R]) produce() {
 			}
 			return
 		}
+		// Input that fails ends the input only: the records before it finish, and
+		// their results are the caller's evidence of what they did.
 		if err != nil {
-			s.fail(fmt.Errorf("request %d: %w", count+1, err))
+			s.keepFailure(fmt.Errorf("request %d: %w", count, err))
 			return
 		}
 		size := proto.Size(command)

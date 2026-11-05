@@ -282,6 +282,15 @@ func TestReadRejectsMalformedStreamWithoutEvidence(t *testing.T) {
 			if err == nil || result != nil {
 				t.Fatal("unvalidated evidence exposed", result, err)
 			}
+			// A record that needs a stream of its own checks its events the same way.
+			command, _, err := readCommand(clientTestReadRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			alone, err := readKind.alone(ctx, client, "records", command)
+			if err == nil || alone != nil {
+				t.Fatal("unvalidated evidence exposed on a stream of its own", alone, err)
+			}
 		})
 	}
 }

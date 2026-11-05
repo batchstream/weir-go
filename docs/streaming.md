@@ -22,15 +22,16 @@ position for each record that has no result.
 
 Next starts once the requests of `WithRequests` have entered the window, without
 waiting for their results. Mutations of one resource keep input order across both.
-Next's requests are validated as they are produced; an invalid later item does not
-undo earlier requests. A call of a Client succeeds with one result per submitted
+Next's requests are validated as they are produced. An invalid item or another
+error from Next ends the input there: the records before it still finish, and the
+call then returns that error. A call of a Client succeeds with one result per submitted
 input. Results delivered before a later producer, consumer or transport error
 remain evidence, and a call goes on delivering results it already received after
 such an error, unless the consume callback itself failed. Next and the consume
 callback run concurrently; synchronize shared application state. Callbacks must
 honor their context and return promptly; the SDK cancels and joins its sender
 before returning. Keep yielded requests and document bytes immutable until the
-corresponding consume callback begins.
+call returns, or with a consume callback until the corresponding callback begins.
 
 ```go
 position := 0

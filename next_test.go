@@ -12,7 +12,11 @@ import (
 	"time"
 
 	"github.com/batchstream/weir-protocol/api/protocol"
+	pb "github.com/batchstream/weir-protocol/api/weir/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func TestNextLargeDuplexCallConsumesIncrementally(t *testing.T) {
@@ -160,7 +164,7 @@ func TestProducerFailureKeepsEarlierAcknowledgements(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	_, err := client.Read(ctx, "records", WithNext(next), WithReadConsume(consume))
-	if err == nil || !strings.Contains(err.Error(), "request 65") || consumed != 64 || peer.streams.Load() != 1 || peer.received.Load() != 64 {
+	if err == nil || !strings.Contains(err.Error(), "request 64") || consumed != 64 || peer.streams.Load() != 1 || peer.received.Load() != 64 {
 		t.Fatal("producer failure replayed requests or discarded earlier evidence", err, consumed, peer.streams.Load(), peer.received.Load())
 	}
 }
@@ -431,9 +435,35 @@ func TestNextWithoutConsumeCollectsEveryResult(t *testing.T) {
 	}
 }
 
+// answersOneOfTwo waits for two records on a stream, then answers only the first
+// and ends the stream.
+type answersOneOfTwo struct{}
+
+func (answersOneOfTwo) Execute(packed grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	stream := &recordPeer{BidiStreamingServer: packed}
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	applied := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
+	value := &pb.Event_MutationResult{MutationResult: applied}
+	event := &pb.Event{Value: value}
+	answer := &pb.ExecuteResponse{Index: first.Index, Event: event}
+	if err := stream.Send(answer); err != nil {
+		return err
+	}
+	return status.Error(codes.Unavailable, "the other response was lost")
+}
+
 func TestNextWithoutConsumeKeepsUnconfirmedPositions(t *testing.T) {
-	peer := &clientTestPeer{mode: "batch_partial"}
-	client := clientTestClient(t, peer)
+	client, err := New(serveForTest(t, answersOneOfTwo{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
 	produced := 0
 	next := func(context.Context) (*MutateRequest, error) {
 		if produced == 2 {
@@ -443,12 +473,61 @@ func TestNextWithoutConsumeKeepsUnconfirmedPositions(t *testing.T) {
 		return deleteRequest("records/s:" + strings.Repeat("k", produced)), nil
 	}
 	results, err := client.Mutate(t.Context(), "records", WithNext(next))
-	if err == nil || len(results) == 0 || results[0].GetOutcome() != MutationApplied {
-		t.Fatal(results, err)
+	if err == nil || len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1] != nil {
+		t.Fatal("a record without a result lost its position", results, err)
 	}
-	// Every produced record has a position, so one without a result stays visible.
-	if len(results) < 2 || results[len(results)-1] != nil {
-		t.Fatal("a record without a result lost its position", results)
+}
+
+func TestFailingNextLetsEarlierRecordsFinish(t *testing.T) {
+	invalid := func(context.Context) (*MutateRequest, error) {
+		request := &MutateRequest{}
+		return request, nil
+	}
+	broken := func(context.Context) (*MutateRequest, error) {
+		return nil, errors.New("no more input")
+	}
+	nexts := map[string]func(context.Context) (*MutateRequest, error){"invalid item": invalid, "error": broken}
+	for name, next := range nexts {
+		t.Run(name, func(t *testing.T) {
+			peer := newRefusingPeer()
+			client := refusingClient(t, peer)
+			first := putRequest("records/s:first", `{"n":1}`)
+			second := putRequest("records/s:second", `{"n":2}`)
+			results, err := client.Mutate(t.Context(), "records", WithRequests(first, second), WithNext(next))
+			if err == nil || !strings.Contains(err.Error(), "request 2") {
+				t.Fatal("the error does not name the failing input", err)
+			}
+			if len(results) != 2 || results[0].GetOutcome() != MutationApplied || results[1].GetOutcome() != MutationApplied {
+				t.Fatal("a failing Next canceled earlier records", results)
+			}
+			if applied := peer.drain(); len(applied) != 2 {
+				t.Fatal("a failing Next stopped earlier records", applied)
+			}
+		})
+	}
+}
+
+func TestRequestsLeaveWhileNextBlocks(t *testing.T) {
+	peer := &clientTestPeer{mode: "read_missing"}
+	client := clientTestClient(t, peer)
+	answered := make(chan struct{})
+	next := func(ctx context.Context) (*ReadRequest, error) {
+		select {
+		case <-answered:
+			return nil, io.EOF
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	consume := func(context.Context, int, *ReadResult) error {
+		close(answered)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err := client.Read(ctx, "records", WithRequests(clientTestReadRequest()), WithNext(next), WithReadConsume(consume))
+	if err != nil {
+		t.Fatal("a request waited for a blocked Next", err)
 	}
 }
 
@@ -494,6 +573,39 @@ func TestOptionsCombine(t *testing.T) {
 	}
 }
 
+func TestALaterConsumeCallbackReplacesAnEarlierOne(t *testing.T) {
+	peer := &clientTestPeer{mode: "read_missing"}
+	client := clientTestClient(t, peer)
+	replaced := func(context.Context, int, *ReadResult) error {
+		t.Error("a replaced read callback ran")
+		return nil
+	}
+	reads := 0
+	counts := func(context.Context, int, *ReadResult) error {
+		reads++
+		return nil
+	}
+	_, err := client.Read(t.Context(), "records", WithRequests(clientTestReadRequest()), WithReadConsume(replaced), WithReadConsume(counts))
+	if err != nil || reads != 1 {
+		t.Fatal(reads, err)
+	}
+	mutations := &clientTestPeer{mode: "typed_mutation"}
+	mutator := clientTestClient(t, mutations)
+	replacedMutation := func(context.Context, int, *MutationResult) error {
+		t.Error("a replaced mutation callback ran")
+		return nil
+	}
+	writes := 0
+	countsMutation := func(context.Context, int, *MutationResult) error {
+		writes++
+		return nil
+	}
+	_, err = mutator.Mutate(t.Context(), "records", WithRequests(deleteRequest("records/s:key")), WithMutateConsume(replacedMutation), WithMutateConsume(countsMutation))
+	if err != nil || writes != 1 {
+		t.Fatal(writes, err)
+	}
+}
+
 func TestSingleRecordSharesAStreamAndOtherCallsOwnOne(t *testing.T) {
 	peer := &countsMessages{}
 	address := serveForTest(t, peer)
@@ -531,7 +643,9 @@ func TestSingleRecordSharesAStreamAndOtherCallsOwnOne(t *testing.T) {
 		t.Fatal("single records did not share one stream", shared(), own())
 	}
 	// A call with a callback owns a stream, which it releases at its end.
+	called := false
 	consume := func(context.Context, int, *MutationResult) error {
+		called = true
 		if own() != 1 {
 			t.Error("a call with a callback does not own a stream")
 		}
@@ -539,8 +653,11 @@ func TestSingleRecordSharesAStreamAndOtherCallsOwnOne(t *testing.T) {
 	}
 	record := putRequest("records/s:b", `{}`)
 	_, err = client.Mutate(t.Context(), "records", WithRequests(record), WithMutateConsume(consume))
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || !called {
+		t.Fatal(called, err)
+	}
+	if own() != 0 {
+		t.Fatal("a finished call kept its stream", own())
 	}
 }
 

@@ -199,7 +199,7 @@ func (call recordCall[Q, R]) validate(ctx context.Context) (*pb.Command, error) 
 		var err error
 		command, _, err = call.command(request)
 		if err != nil {
-			return nil, fmt.Errorf("%s request %d: %w", call.kind.name, index+1, err)
+			return nil, fmt.Errorf("%s request %d: %w", call.kind.name, index, err)
 		}
 	}
 	return command, nil

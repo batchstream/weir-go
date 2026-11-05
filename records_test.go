@@ -10,6 +10,7 @@ import (
 
 	"github.com/batchstream/weir-protocol/api/protocol"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
+	"google.golang.org/grpc"
 )
 
 func TestReadPreservesMissingAndBackendFailure(t *testing.T) {
@@ -372,5 +373,36 @@ func TestReadAcceptsLargeRequestSequence(t *testing.T) {
 	results, err := client.Read(t.Context(), "records", WithRequests(requests...))
 	if err != nil || len(results) != 5000 || peer.streams.Load() != 1 || peer.received.Load() != 5000 {
 		t.Fatal("large batch was split or limited by count", len(results), err, peer.streams.Load(), peer.received.Load())
+	}
+}
+
+// streamRefuser turns every stream away before reading it.
+type streamRefuser struct{}
+
+func (streamRefuser) Execute(grpc.BidiStreamingServer[pb.ExecuteRequests, pb.ExecuteResponses]) error {
+	return refusedStreamError("draining")
+}
+
+func TestARefusedStreamOfItsOwnIsTheRecordsRefusal(t *testing.T) {
+	client, err := New(serveForTest(t, streamRefuser{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	readCommandToSend, _, err := readCommand(clientTestReadRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := readKind.alone(t.Context(), client, "records", readCommandToSend)
+	if err != nil || read.Failure.GetCode() != FailureUnavailable {
+		t.Fatal("a refused read lost its refusal", read, err)
+	}
+	mutateCommandToSend, _, err := mutateCommand(deleteRequest("records/s:key"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation, err := mutateKind.alone(t.Context(), client, "records", mutateCommandToSend)
+	if err != nil || mutation.GetOutcome() != MutationNotStarted || mutation.GetFailure().GetCode() != FailureUnavailable {
+		t.Fatal("a refused mutation lost its refusal", mutation, err)
 	}
 }

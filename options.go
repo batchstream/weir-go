@@ -49,10 +49,12 @@ func WithRequests[Q any](requests ...Q) Option[Q] {
 // WithNext produces requests one at a time, after those of WithRequests have
 // entered the window of 32 records and 8 MiB, without waiting for their results.
 // Next returns io.EOF after the last request. Each request is validated as it is
-// produced, so an invalid one ends the call without undoing earlier requests.
+// produced. An invalid request or another error from Next ends the input there:
+// the records before it still finish, and the call then returns that error.
 // Next runs concurrently with a consume callback, so synchronize what they share.
 // It must honor its context, and return promptly once that ends. Keep a produced
-// request and its document bytes unchanged until its result is consumed.
+// request and its document bytes unchanged until the call returns, or with a
+// consume callback until its result arrives there.
 //
 // Without a consume callback, results accumulate until the call returns, and
 // memory grows with the number of records.
@@ -65,7 +67,8 @@ func WithNext[Q any](next func(ctx context.Context) (Q, error)) Option[Q] {
 // of the call collecting them, and Read returns nil results. The index is the
 // record's position in the input, from 0. Results delivered before a later error
 // remain valid. Calls run one at a time and hold back the input when slow; an
-// error from consume ends the call.
+// error from consume ends the call. It must honor its context, as a call does not
+// return before it does.
 func WithReadConsume(consume func(ctx context.Context, index int, result *ReadResult) error) ReadOption {
 	option := func(options *callOptions[*ReadRequest]) { options.consumeRead = consume }
 	return option
@@ -76,7 +79,8 @@ func WithReadConsume(consume func(ctx context.Context, index int, result *ReadRe
 // is the record's position in the input, from 0. Each result is an individual
 // acknowledgement that a later error does not revoke; records without a result
 // may have applied. Calls run one at a time and hold back the input when slow; an
-// error from consume ends the call.
+// error from consume ends the call. It must honor its context, as a call does not
+// return before it does.
 func WithMutateConsume(consume func(ctx context.Context, index int, result *MutationResult) error) MutateOption {
 	option := func(options *callOptions[*MutateRequest]) { options.consumeMutate = consume }
 	return option
