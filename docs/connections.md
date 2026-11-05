@@ -12,8 +12,8 @@ deployments.
 first use and reconnects after failures. When a DNS name resolves to several
 Weir servers, streams are spread round-robin across them, so every server behind
 the address must host the Stores the client uses. A Read or Mutate of one
-request shares streams, and any other call uses a gRPC stream of its own, as
-described under [Streaming and deadlines](streaming.md). Use a name
+request usually shares streams, and any other call uses a gRPC stream of its own,
+as described under [Streaming and deadlines](streaming.md). Use a name
 that lists every server, such as a Kubernetes headless Service; a ClusterIP
 Service resolves to one virtual IP. The Client looks the name up again every 5
 seconds. A server that joins receives new calls once connected, and shared

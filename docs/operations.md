@@ -93,8 +93,8 @@ read or mutation and each response carries its indexed result. Backend protocols
 unacknowledged encoded input; a larger legal request uses the window alone.
 Credit returns after each Consume callback finishes. A size-dependent wait can
 hold one produced item that has not yet been sent. Sending and receiving run
-concurrently so HTTP/2 flow control advances in both directions. The SDK never
-waits for another input or EOF before sending the current item.
+concurrently so HTTP/2 flow control advances in both directions. A call with
+`WithNext` never waits for another input or EOF before sending the current item.
 Without a consume callback a call accumulates results for its caller; use `WithNext`
 and a consume callback to avoid retaining the full input and result sequence.
 
