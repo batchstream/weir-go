@@ -207,13 +207,6 @@ type lane struct {
 	idle       *time.Timer
 }
 
-// execute sends one validated command on a shared stream when one has room and
-// otherwise reports false so the caller can use a stream of its own. Callers
-// validate first because an invalid request ends the stream for every record.
-func (p *lanePool) execute(ctx context.Context, key laneKey, command *pb.Command) (*pb.Event, bool, error) {
-	return p.finish(ctx, key, command, nil)
-}
-
 // queuedRecord is a record enqueue placed on a stream, or why it did not: an
 // error, or neither for a record that needs a stream of its own.
 type queuedRecord struct {
@@ -249,7 +242,10 @@ func (p *lanePool) enqueue(ctx context.Context, key laneKey, command *pb.Command
 }
 
 // finish waits for the outcome of a record enqueue placed, or sends it now when
-// queued is nil, and sends it again when its stream closed before sending it.
+// queued is nil, and sends it again when its stream closed before sending it. It
+// reports false when no stream has room, so the caller can use one of its own.
+// Callers validate first because an invalid request ends the stream for every
+// record.
 func (p *lanePool) finish(ctx context.Context, key laneKey, command *pb.Command, queued *queuedRecord) (*pb.Event, bool, error) {
 	for range laneAttempts {
 		if queued == nil {
