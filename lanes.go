@@ -191,6 +191,8 @@ type lane struct {
 	answered bool
 	// wake asks the writer to send what is queued.
 	wake chan struct{}
+	// received closes once the receiver has ended the stream.
+	received chan struct{}
 
 	mu          sync.Mutex
 	queued      []*laneCall
@@ -410,7 +412,7 @@ func (p *lanePool) open(ctx context.Context, opening laneOpening) (*lane, error)
 		if chosen := picked.Load(); chosen != nil {
 			address = *chosen
 		}
-		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), address: address, probing: opening.probing, wake: make(chan struct{}, 1), outstanding: make(map[uint64]*laneCall)}
+		opened = &lane{pool: p, key: key, stream: stream, ctx: laneCtx, cancel: cancel, expires: now.Add(laneLifetime), address: address, probing: opening.probing, wake: make(chan struct{}, 1), received: make(chan struct{}), outstanding: make(map[uint64]*laneCall)}
 		opened.load.Store(1)
 		if key.owner != 0 {
 			group.writers.Add(1)
@@ -616,13 +618,14 @@ func (l *lane) writeNext() bool {
 }
 
 // sendFailed stops using a stream whose send failed. io.EOF means the stream has
-// ended and Recv holds its final status, so it leaves its group now: the records
-// handed back must not choose it again while the receiver has yet to run. Any other
-// error is a local failure, which may never surface through Recv.
+// ended and Recv holds its final status, so it waits for the receiver to read it:
+// only then has the stream left its group and any refusal counted, which the records
+// handed back need in order to choose another stream and server. Any other error is
+// a local failure, which may never surface through Recv.
 func (l *lane) sendFailed(err error) {
 	switch {
 	case errors.Is(err, io.EOF):
-		l.pool.remove(l)
+		<-l.received
 	case err != nil:
 		l.cancel()
 	}
@@ -691,6 +694,7 @@ func (l *lane) receive() {
 		l.pool.refusedBy(l.address)
 	}
 	l.fail(err)
+	close(l.received)
 }
 
 // ended is the outcome of a record outstanding when the stream ended. A record

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -570,54 +571,61 @@ func TestLoneStreamMovesOffADrainingServerAtOnce(t *testing.T) {
 	}
 }
 
-// A Client that knows its servers probes one that has not refused; behind one
-// address, a probe can still reach the draining server.
-// scriptedStreamsClient opens the streams it holds, one per Execute.
+// scriptedStreamsClient opens the streams it holds, one per Execute. Like the
+// picker, it reports the server a stream asked for as the one it chose.
 type scriptedStreamsClient struct {
 	pb.StoreServiceClient
 	mu      sync.Mutex
-	streams []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
-	opened  int
+	streams []*scriptedStream
+	asked   []string
 }
 
-func (c *scriptedStreamsClient) Execute(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses], error) {
+func (c *scriptedStreamsClient) Execute(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses], error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	stream := c.streams[c.opened]
-	c.opened++
+	target, _ := ctx.Value(endpointPreference).(string)
+	if picked, ok := ctx.Value(endpointPicked).(*atomic.Pointer[string]); ok {
+		picked.Store(&target)
+	}
+	stream := c.streams[len(c.asked)]
+	stream.ctx = ctx
+	c.asked = append(c.asked, target)
 	return stream, nil
 }
 
-// rejectedStream is a stream a server has already rejected: Send reports that it
-// ended, and Recv returns the rejection once hold closes.
-type rejectedStream struct {
+func (c *scriptedStreamsClient) servers() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.asked)
+}
+
+// scriptedStream answers every record as applied. With hold it is a stream a server
+// has already rejected: Send reports that it ended, and Recv returns the rejection
+// once hold closes.
+type scriptedStream struct {
 	grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
-	ctx context.Context
-	// receiving closes when the client first asks for the stream's result.
-	receiving chan struct{}
-	hold      chan struct{}
+	ctx  context.Context
+	hold chan struct{}
+	// sending and receiving close at the first Send and Recv.
+	sending, receiving chan struct{}
+	sendOnce, recvOnce sync.Once
+	replies            chan *pb.ExecuteResponses
 }
 
-func (s *rejectedStream) Context() context.Context { return s.ctx }
-
-func (s *rejectedStream) Send(*pb.ExecuteRequests) error { return io.EOF }
-
-func (s *rejectedStream) Recv() (*pb.ExecuteResponses, error) {
-	close(s.receiving)
-	<-s.hold
-	return nil, status.Error(codes.Unavailable, "draining")
+func newScriptedStream(hold chan struct{}) *scriptedStream {
+	stream := &scriptedStream{hold: hold, sending: make(chan struct{}), receiving: make(chan struct{}), replies: make(chan *pb.ExecuteResponses, 1)}
+	return stream
 }
 
-// applyingStream answers every record as applied.
-type applyingStream struct {
-	grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]
-	ctx     context.Context
-	replies chan *pb.ExecuteResponses
-}
+func (s *scriptedStream) Context() context.Context { return s.ctx }
 
-func (s *applyingStream) Context() context.Context { return s.ctx }
+func (s *scriptedStream) CloseSend() error { return nil }
 
-func (s *applyingStream) Send(message *pb.ExecuteRequests) error {
+func (s *scriptedStream) Send(message *pb.ExecuteRequests) error {
+	s.sendOnce.Do(func() { close(s.sending) })
+	if s.hold != nil {
+		return io.EOF
+	}
 	for _, request := range message.Requests {
 		result := protocol.Mutation(pb.MutationOutcome_APPLIED, nil)
 		value := &pb.Event_MutationResult{MutationResult: result}
@@ -629,8 +637,11 @@ func (s *applyingStream) Send(message *pb.ExecuteRequests) error {
 	return nil
 }
 
-func (s *applyingStream) Recv() (*pb.ExecuteResponses, error) {
+func (s *scriptedStream) Recv() (*pb.ExecuteResponses, error) {
+	s.recvOnce.Do(func() { close(s.receiving) })
 	select {
+	case <-s.hold:
+		return nil, status.Error(codes.Unavailable, "draining")
 	case reply := <-s.replies:
 		return reply, nil
 	case <-s.ctx.Done():
@@ -638,27 +649,83 @@ func (s *applyingStream) Recv() (*pb.ExecuteResponses, error) {
 	}
 }
 
-// A stream whose Send reported its end leaves its group at once. Until its receiver
-// runs nothing else says it ended, and a record sent back to it would run out of
-// attempts and use a stream of its own, which may reach a draining server.
-func TestStreamWhoseSendEndedTakesNoMoreRecords(t *testing.T) {
-	rejected := &rejectedStream{ctx: t.Context(), receiving: make(chan struct{}), hold: make(chan struct{})}
-	t.Cleanup(func() { close(rejected.hold) })
-	applying := &applyingStream{ctx: t.Context(), replies: make(chan *pb.ExecuteResponses, 1)}
-	client := &scriptedStreamsClient{streams: []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]{rejected, applying}}
+// A stream whose Send reported its end still holds the status that says whether its
+// server refused. A record it hands back waits for that. Sooner, the record would go
+// back to the same stream until it ran out of attempts, or ask for the same server
+// again as the one with the fewest streams.
+func TestEndedStreamHandsItsRecordBackOnceItsRefusalCounts(t *testing.T) {
+	const draining, healthy = "10.0.0.1:1", "10.0.0.2:1"
+	servers := &endpoints{resolved: []string{draining, healthy}, ready: []string{draining, healthy}}
+	hold := make(chan struct{})
+	rejected := newScriptedStream(hold)
+	client := &scriptedStreamsClient{streams: []*scriptedStream{rejected, newScriptedStream(nil)}}
+	pool := newLanePool(client, servers)
+	t.Cleanup(pool.close)
+	command, _, err := mutateCommand(putRequest("records/s:next", `{}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A busy stream on the healthy server makes the group want another stream, on
+	// the server with the fewest.
+	key := laneKey{store: "records"}
+	busy := &lane{address: healthy, expires: time.Now().Add(laneLifetime)}
+	busy.load.Store(int64(laneOpenAt))
+	group := &laneGroup{lanes: []*lane{busy}}
+	pool.groups[key] = group
+	type finished struct {
+		event  *pb.Event
+		shared bool
+		err    error
+	}
+	done := make(chan finished, 1)
+	go func() {
+		event, shared, err := pool.finish(t.Context(), key, command, nil)
+		result := finished{event: event, shared: shared, err: err}
+		done <- result
+	}()
+	<-rejected.sending
+	select {
+	case result := <-done:
+		t.Fatal("record left a stream whose receiver had not run", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(hold)
+	result := <-done
+	if result.err != nil || !result.shared || result.event.GetMutationResult().GetOutcome() != MutationApplied {
+		t.Fatal("record did not move to a shared stream", result)
+	}
+	if asked := client.servers(); !slices.Equal(asked, []string{draining, healthy}) {
+		t.Fatal("record asked for the server that refused it", asked)
+	}
+}
+
+// A record stream that failed joins its writers, one of which can be waiting for
+// the receiver of a stream that ended. Canceling the stream ends that wait.
+func TestFailedRecordStreamJoinsAWriterWaitingForItsReceiver(t *testing.T) {
+	rejected := newScriptedStream(make(chan struct{}))
+	client := &scriptedStreamsClient{streams: []*scriptedStream{rejected}}
 	pool := newLanePool(client, nil)
 	t.Cleanup(pool.close)
 	command, _, err := mutateCommand(putRequest("records/s:next", `{}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := laneKey{store: "records"}
-	event, shared, err := pool.finish(t.Context(), key, command, nil)
-	if err != nil || !shared || event.GetMutationResult().GetOutcome() != MutationApplied {
-		t.Fatal("record did not move to the next shared stream", event, shared, err)
+	key := pool.ownKey("records", false)
+	queued := pool.enqueue(t.Context(), key, command)
+	if queued.lane == nil {
+		t.Fatal("no stream took the record", queued.err)
 	}
-	if client.opened != 2 {
-		t.Fatal("streams opened", client.opened)
+	queued.lane.signal()
+	<-rejected.sending
+	forgotten := make(chan struct{})
+	go func() {
+		pool.forget(key, true)
+		close(forgotten)
+	}()
+	select {
+	case <-forgotten:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a failed record stream hung on a stream that ended")
 	}
 }
 
@@ -667,8 +734,8 @@ func TestStreamWhoseSendEndedTakesNoMoreRecords(t *testing.T) {
 func TestRejectedStreamDoesNotStayInItsGroup(t *testing.T) {
 	hold := make(chan struct{})
 	close(hold)
-	stream := &rejectedStream{ctx: t.Context(), receiving: make(chan struct{}), hold: hold}
-	client := &scriptedStreamsClient{streams: []grpc.BidiStreamingClient[pb.ExecuteRequests, pb.ExecuteResponses]{stream}}
+	stream := newScriptedStream(hold)
+	client := &scriptedStreamsClient{streams: []*scriptedStream{stream}}
 	pool := newLanePool(client, nil)
 	t.Cleanup(pool.close)
 	key := laneKey{store: "records"}
@@ -700,6 +767,8 @@ func TestRejectedStreamDoesNotStayInItsGroup(t *testing.T) {
 	}
 }
 
+// A Client that knows its servers probes one that has not refused; behind one
+// address, a probe can still reach the draining server.
 func TestRejectedProbeDoesNotHoldCallsOnADrainingServer(t *testing.T) {
 	first, second := newLaneTestPeer(), newLaneTestPeer()
 	client := laneTestInTurn(t, first, second)
