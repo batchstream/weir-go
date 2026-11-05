@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
 
@@ -58,14 +59,19 @@ const (
 // across them. The Client looks the name up every five seconds: a server
 // that joins takes its share of streams, and one that stops resolving gets
 // no new records while its streams finish the ones they carry.
-func New(address string) (*Client, error) {
+func New(address string, options ...ClientOption) (*Client, error) {
 	if err := validateAddress(address); err != nil {
 		return nil, err
 	}
+	config := clientOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
 	servers := &endpoints{}
 	builder := &endpointResolverBuilder{endpoints: servers, lookup: net.DefaultResolver.LookupHost, interval: resolveInterval, spacing: resolveSpacing}
-	options := append(connectionOptions(), grpc.WithResolvers(builder))
-	connection, err := grpc.NewClient(endpointScheme+":///"+address, options...)
+	connection, err := grpc.NewClient(endpointScheme+":///"+address, connectionOptions(config.dial, builder)...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,16 +105,20 @@ func validHostname(host string) bool {
 	return true
 }
 
-func connectionOptions() []grpc.DialOption {
+// connectionOptions orders a connection's options so that custom ones replace the
+// defaults but not what a Client relies on. gRPC takes the first resolver of a
+// scheme and the last value of the other options.
+func connectionOptions(custom []grpc.DialOption, servers resolver.Builder) []grpc.DialOption {
 	pings := keepalive.ClientParameters{Time: keepaliveTime, Timeout: keepaliveTimeout, PermitWithoutStream: true}
 	options := []grpc.DialOption{
+		grpc.WithResolvers(servers),
 		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
 		grpc.WithKeepaliveParams(pings),
-		grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(),
-		grpc.WithDefaultServiceConfig(endpointConfig),
 		grpc.WithMaxHeaderListSize(^uint32(0)),
 		grpc.WithDefaultCallOptions(grpc.MaxRetryRPCBufferSize(0), grpc.MaxCallSendMsgSize(protocol.MaxTransportMessageBytes), grpc.MaxCallRecvMsgSize(protocol.MaxTransportMessageBytes)),
 	}
+	options = append(options, custom...)
+	options = append(options, grpc.WithDisableRetry(), grpc.WithDisableServiceConfig(), grpc.WithDefaultServiceConfig(endpointConfig))
 	return options
 }
 

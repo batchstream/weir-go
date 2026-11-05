@@ -25,6 +25,7 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 
 | Option | Applies to | Effect |
 | --- | --- | --- |
+| `WithDialOptions` | `New` | gRPC options for the connection, such as an interceptor or a custom dialer. |
 | `WithRequests` | `Read`, `Mutate` | The records to send. |
 | `WithNext` | `Read`, `Mutate` | A callback that produces more records, after those of `WithRequests`. |
 | `WithReadConsume`, `WithMutateConsume` | `Read`, `Mutate` | A callback that receives each result as it arrives, instead of the call returning them. |
@@ -188,7 +189,7 @@ message: hi
 
 | Guide | Contents |
 | --- | --- |
-| [Connections](docs/connections.md) | Addresses, Kubernetes DNS names, keepalive and closing |
+| [Connections](docs/connections.md) | Addresses, gRPC options, Kubernetes DNS names, keepalive and closing |
 | [Operations](docs/operations.md) | Reads, writes, visibility, results and outcomes |
 | [Lua](docs/lua.md) | Lua transforms |
 | [Native](docs/native.md) | Backend commands and HTTP helpers |

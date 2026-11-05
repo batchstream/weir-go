@@ -3,7 +3,27 @@ package weir
 import (
 	"context"
 	"slices"
+
+	"google.golang.org/grpc"
 )
+
+// ClientOption configures a Client.
+type ClientOption func(*clientOptions)
+
+type clientOptions struct {
+	dial []grpc.DialOption
+}
+
+// WithDialOptions adds gRPC options to a Client's connection, such as a stats
+// handler, an interceptor or a custom dialer. They can replace its defaults for
+// transport credentials, keepalive and message sizes. They cannot change what a
+// Client relies on: gRPC never retries, service configs have no effect, and its
+// own resolver and balancer follow its servers. Several WithDialOptions add their
+// options in order.
+func WithDialOptions(options ...grpc.DialOption) ClientOption {
+	option := func(config *clientOptions) { config.dial = append(config.dial, options...) }
+	return option
+}
 
 // Option configures one Read or Mutate call whose requests have type Q.
 type Option[Q any] func(*callOptions[Q])

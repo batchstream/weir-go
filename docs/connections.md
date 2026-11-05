@@ -26,6 +26,29 @@ few seconds before it stops taking records, as the Weir chart's preStop delay
 arranges. A server that does not host the requested
 Store fails the call with NotFound.
 
+## gRPC options
+
+`WithDialOptions` adds gRPC options to a Client's connection, such as a stats
+handler or interceptor for tracing, or a custom dialer:
+
+```go
+client, err := weir.New("weir:7447", weir.WithDialOptions(grpc.WithStatsHandler(handler)))
+```
+
+They can replace the Client's defaults for transport credentials, keepalive and
+message sizes. They cannot change what the Client relies on: gRPC never retries,
+service configs, including `grpc.WithDefaultServiceConfig`, have no effect, and the
+Client's own resolver and balancer follow its servers.
+
+The address stays `host:port`, so `New` accepts no other gRPC target. A custom
+dialer can reach a Unix socket or an in-memory server, with an IP literal and any
+port as the address.
+
+The Weir application listener is plaintext, so TLS applies only to a proxy or
+sidecar in front of it. `grpc.WithTransportCredentials` then checks the certificate
+against the host name of the address. `grpc.WithCredentialsBundle` conflicts with
+the default credentials, so `New` returns an error for it.
+
 ## Reuse and close
 
 Reuse the client across goroutines and

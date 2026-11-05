@@ -210,7 +210,7 @@ func laneTestDial(t *testing.T, servers *laneTestServers, peers []*laneTestPeer)
 		servers.addresses = append(servers.addresses, laneTestListen(t, peer))
 	}
 	servers.resolver.InitialState(servers.state(servers.addresses...))
-	options := append(connectionOptions(), grpc.WithResolvers(servers.resolver))
+	options := connectionOptions(nil, servers.resolver)
 	connection, err := grpc.NewClient("weirlanes:///records", options...)
 	if err != nil {
 		t.Fatal(err)
