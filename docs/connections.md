@@ -81,10 +81,8 @@ A Client pings a server it has heard nothing from for 10 seconds and drops the
 connection if no answer comes within 5 seconds, so calls leave a server they
 can no longer reach, such as one behind a broken network path or a hung
 process, even while its name still resolves. Calls waiting on that connection
-end with an error, and a mutation sent on it has an unknown outcome. Servers
-must accept pings this often, as those of the Weir chart 0.15.0-rc.1 and later
-do; an older server ends such connections, after which the Client pings less
-often for the rest of its life. Upgrade servers before Clients.
+end with an error, and a mutation sent on it has an unknown outcome. Weir
+servers accept pings this often.
 
 ## Network access
 
