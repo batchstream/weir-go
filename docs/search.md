@@ -60,7 +60,9 @@ for what the program may return.
 `Search` sends a search request body to the index and returns its hits. Each
 `Hit` has the document's `ID`, `Score`, `Sort` values and the decoded `Document`.
 `Sort` keeps each value's exact JSON, so pass it back as `search_after` to read
-the next page. A status of 300 or more is a `*search.StatusError`.
+the next page. A status of 300 or more is a `*search.StatusError`. `Search`
+returns only the hits: for the total, aggregations or any other part of the
+response, send the request with `Do` and decode its `Body`.
 
 ```go
 query := map[string]any{
@@ -98,9 +100,10 @@ if response.StatusCode != http.StatusOK {
 For headers of your own or a response body read in chunks, use
 `weir.NewHTTPNativeRequest` and `Client.Native`; see [Native](native.md).
 
-Weir never sends a request again on its own. A request a lost connection or an
-unavailable backend cut short reports `weir.ErrInterrupted`, and may have run.
-Send it again only when that is safe, as it is for a search.
+A request is sent again only when a server refused it before it began. One a
+lost connection or an unavailable backend cut short reports
+`weir.ErrInterrupted`, and may have run. Send it again only when that is safe,
+as it is for a search.
 
 ## Errors
 
@@ -108,8 +111,13 @@ Send it again only when that is safe, as it is for a search.
 | --- | --- |
 | `weir.ErrNotFound` | `Get` found no document |
 | `*weir.Error` | A record failed. `weir.CodeOf(err)` gives its `FailureCode`, and `Outcome` tells whether a write applied. |
-| `weir.ErrInterrupted` | The request may have run. Never send a write again without checking. |
+| `weir.ErrInterrupted` | An outage cut the request short, so it may succeed later. It may have run: never send a write again without checking. |
 | `*search.StatusError` | `Search` got a status of 300 or more |
+
+A write certainly took no effect only when its `*weir.Error` has the `Outcome`
+`MutationNotStarted` or `MutationNotApplied`, or, for a request, the
+`Completion` `NativeNotStarted`. After any other error, a context error
+included, it may have applied.
 
 The Client already sent again every write a server refused before it began and
 every write that lost to concurrent writers of its record; see

@@ -154,10 +154,15 @@ if err := weir.MutationErr(results[0]); err != nil {
 ```
 
 `CodeOf(err)` returns the FailureCode of an `*Error` anywhere in the chain, or
-zero. `errors.Is(err, ErrInterrupted)` reports a request an outage cut short after
-it may have begun: a lost connection, a mutation UNKNOWN with UNAVAILABLE, or a
-Native request that began and ended with UNAVAILABLE or without its end. Send it
-again only when repeating it is safe. `ErrNotFound` is what the
+zero. `errors.Is(err, ErrInterrupted)` reports a request an outage cut short, so
+sending it again later may succeed: a lost connection, a mutation UNKNOWN with
+UNAVAILABLE, or a Native request that began and ended with UNAVAILABLE or without
+its end. It may have run, so send it again only when repeating it is safe.
+
+`ErrInterrupted` does not tell whether a write applied. A write certainly took no
+effect only when its `*Error` has the `Outcome` `MutationNotStarted` or
+`MutationNotApplied`, or the `Completion` `NativeNotStarted`. After any other
+error, a context error included, it may have applied. `ErrNotFound` is what the
 [mongodb](mongodb.md) and [search](search.md) packages return for a missing
 record.
 

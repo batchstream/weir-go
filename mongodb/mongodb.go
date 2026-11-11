@@ -73,8 +73,9 @@ func (e *CommandError) Error() string {
 
 // Command runs one command in the database and returns its reply. A reply
 // with ok: 0, writeErrors or a writeConcernError comes with a *CommandError.
-// Weir never sends a command again, so a command interrupted by a lost
-// connection reports weir.ErrInterrupted; send it again only when that is safe.
+// A command is sent again only when a server refused it before it began. One
+// a lost connection or an unavailable backend cut short reports
+// weir.ErrInterrupted and may have run; send it again only when that is safe.
 func (db DB) Command(ctx context.Context, command any) (bson.Raw, error) {
 	data, err := bson.Marshal(command)
 	if err != nil {
@@ -112,27 +113,26 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 			yield(nil, err)
 			return
 		}
-		// The namespace is database.collection, and database names hold no dot.
-		_, collection, _ := strings.Cut(page.Cursor.Namespace, ".")
+		space := parseNamespace(page.Cursor.Namespace)
 		batch, cursor := page.Cursor.FirstBatch, page.Cursor.ID
 		for {
 			for _, document := range batch {
 				if !yield(document, nil) {
-					db.killCursor(ctx, collection, cursor)
+					db.killCursor(ctx, space, cursor)
 					return
 				}
 			}
 			if cursor == 0 {
 				return
 			}
-			getMore := bson.D{{Key: "getMore", Value: cursor}, {Key: "collection", Value: collection}}
+			getMore := bson.D{{Key: "getMore", Value: cursor}, {Key: "collection", Value: space.collection}, {Key: "$db", Value: space.database}}
 			reply, err := db.Command(ctx, getMore)
 			var next cursorPage
 			if err == nil {
 				next, err = readPage(reply)
 			}
 			if err != nil {
-				db.killCursor(ctx, collection, cursor)
+				db.killCursor(ctx, space, cursor)
 				yield(nil, err)
 				return
 			}
@@ -140,6 +140,21 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 		}
 	}
 	return documents
+}
+
+// namespace names the collection of a cursor. Commands that follow the cursor
+// name its database, as the command that opened it may have named one with
+// $db.
+type namespace struct {
+	database   string
+	collection string
+}
+
+// parseNamespace splits database.collection; database names hold no dot.
+func parseNamespace(text string) namespace {
+	database, collection, _ := strings.Cut(text, ".")
+	space := namespace{database: database, collection: collection}
+	return space
 }
 
 // cursorPage is the cursor of a find, aggregate or getMore reply.
@@ -165,13 +180,13 @@ func readPage(reply bson.Raw) (cursorPage, error) {
 
 // killCursor releases a cursor a loop left open. The server also times idle
 // cursors out, so a failure here is ignored.
-func (db DB) killCursor(ctx context.Context, collection string, cursor int64) {
+func (db DB) killCursor(ctx context.Context, space namespace, cursor int64) {
 	if cursor == 0 {
 		return
 	}
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTimeout)
 	defer cancel()
-	command := bson.D{{Key: "killCursors", Value: collection}, {Key: "cursors", Value: bson.A{cursor}}}
+	command := bson.D{{Key: "killCursors", Value: space.collection}, {Key: "cursors", Value: bson.A{cursor}}, {Key: "$db", Value: space.database}}
 	_, _ = db.Command(cleanup, command)
 }
 

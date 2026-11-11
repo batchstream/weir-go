@@ -199,6 +199,23 @@ func TestClientResendsMutationsThatLostToConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestConflictsNeverSpendTheResendsOfRefusals(t *testing.T) {
+	peer := newRefusingPeer()
+	client := refusingClient(t, peer)
+	for client.resends.spend(resendConflict) {
+	}
+	peer.conflicts["records/s:hot"] = 1
+	result, err := refusingPut(t.Context(), client, "records/s:hot")
+	if err != nil || result.GetFailure().GetCode() != FailureConflict || peer.sent("records/s:hot") != 1 {
+		t.Fatal("conflict resent beyond its budget", result, err, peer.sent("records/s:hot"))
+	}
+	peer.refuse("records/s:cold", 1)
+	result, err = refusingPut(t.Context(), client, "records/s:cold")
+	if err != nil || result.GetOutcome() != MutationApplied || peer.sent("records/s:cold") != 2 {
+		t.Fatal("refusal not resent after conflicts used their budget", result, err, peer.sent("records/s:cold"))
+	}
+}
+
 func TestClientStopsResendingAfterFourSends(t *testing.T) {
 	peer := newRefusingPeer()
 	peer.refuse("records/s:write", 10)
@@ -304,7 +321,7 @@ func TestResendBudgetAllowsATenthOfFirstSendsPlusABurst(t *testing.T) {
 	spent := func(attempts int) int {
 		covered := 0
 		for range attempts {
-			if budget.spend() {
+			if budget.spend(resendRefusal) {
 				covered++
 			}
 		}
@@ -312,6 +329,9 @@ func TestResendBudgetAllowsATenthOfFirstSendsPlusABurst(t *testing.T) {
 	}
 	if covered := spent(resendBurst + 50); covered != resendBurst {
 		t.Fatal("burst not bounded", covered)
+	}
+	if !budget.spend(resendConflict) {
+		t.Fatal("refusals spent the conflict budget")
 	}
 	budget.earn(25)
 	if covered := spent(5); covered != 2 {
@@ -346,11 +366,11 @@ func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 		{"unknown mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_UNKNOWN, unavailable)), false},
 		{"missing mutation result", mutationRefused(nil), false},
 		{"conflicted mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)), false},
-		{"resendable draining mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, unavailable)), true},
-		{"resendable conflicted mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)), true},
-		{"unknown conflicted mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_UNKNOWN, conflict)), false},
-		{"not applied mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, invalid)), false},
-		{"missing resendable result", mutationResendable(nil), false},
+		{"draining mutation resent as a refusal", mutationResend(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, unavailable)) == resendRefusal, true},
+		{"conflicted mutation resent as a conflict", mutationResend(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)) == resendConflict, true},
+		{"unknown conflicted mutation", mutationResend(protocol.Mutation(pb.MutationOutcome_UNKNOWN, conflict)) != noResend, false},
+		{"not applied mutation", mutationResend(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, invalid)) != noResend, false},
+		{"missing mutation result resent", mutationResend(nil) != noResend, false},
 		{"refused read", readRefused(refusedRead), true},
 		{"exhausted read", readRefused(exhaustedRead), false},
 		{"invalid read", readRefused(invalidRead), false},

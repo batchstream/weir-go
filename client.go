@@ -1,6 +1,7 @@
 // Package weir sends typed business requests to the Stores hosted behind one
-// Weir application address. A Client sends a record again only when a server
-// refused it before it began; nothing that may have taken effect is resent.
+// Weir application address. A Client sends a record again only when it took
+// no effect: a server refused it before it began, or a mutation lost to
+// concurrent writers. Nothing that may have taken effect is resent.
 package weir
 
 import (

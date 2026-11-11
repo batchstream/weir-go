@@ -68,9 +68,10 @@ func (e *StatusError) Error() string {
 // Do sends one HTTP request to the cluster and returns its response, whatever
 // its status. The path starts at the cluster root, such as /_cluster/health,
 // and may carry a query string. A []byte or json.RawMessage body is sent as it
-// is, any other non-nil body as JSON. Weir never sends a request again, so a
-// request interrupted by a lost connection or an unavailable backend reports
-// weir.ErrInterrupted; send it again only when that is safe, as for a read.
+// is, any other non-nil body as JSON. A request is sent again only when a
+// server refused it before it began. One a lost connection or an unavailable
+// backend cut short reports weir.ErrInterrupted and may have run; send it
+// again only when that is safe, as for a read.
 func (c Cluster) Do(ctx context.Context, method, path string, body any) (*Response, error) {
 	request := httpRequest{method: method, path: path, body: body}
 	return c.send(ctx, request)

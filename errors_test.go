@@ -82,6 +82,13 @@ func TestReadAndNativeErrs(t *testing.T) {
 			t.Error(test.name, test.err)
 		}
 	}
+	var failed *Error
+	if !errors.As(lost.Err(), &failed) || failed.Completion != NativeResponseIncomplete {
+		t.Error("Native error lost its completion", lost.Err())
+	}
+	if text := lost.Err().Error(); text != "weir: native RESPONSE_INCOMPLETE: UNAVAILABLE: backend unavailable" {
+		t.Error(text)
+	}
 	if CodeOf(errors.New("other")) != 0 || CodeOf(nil) != 0 {
 		t.Error("code of an error without a Failure")
 	}

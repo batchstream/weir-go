@@ -214,7 +214,7 @@ func key[K ID](id K) (string, any) {
 
 // recordDocument encodes value as BSON whose first field is an _id equal to
 // id, as Weir requires. It moves an _id the value has to the front, keeping
-// its bytes, and adds one when it has none.
+// its bytes, and adds one when it has none or leaves it zero.
 func recordDocument(id any, value any) (*weir.Document, error) {
 	raw, err := bson.Marshal(value)
 	if err != nil {
@@ -226,7 +226,7 @@ func recordDocument(id any, value any) (*weir.Document, error) {
 	}
 	var first []byte
 	for i, element := range elements {
-		if element.Key() != "_id" {
+		if element.Key() != "_id" || zeroID(element.Value()) {
 			continue
 		}
 		if !sameID(element.Value(), id) {
@@ -257,6 +257,24 @@ func recordDocument(id any, value any) (*weir.Document, error) {
 	binary.LittleEndian.PutUint32(data, uint32(len(data)))
 	document := &weir.Document{ContentType: bsonContentType, Data: data}
 	return document, nil
+}
+
+// zeroID reports an _id a document left at its zero value or null, as a
+// struct field without omitempty does, which counts as no _id.
+func zeroID(value bson.RawValue) bool {
+	switch value.Type {
+	case bson.TypeNull:
+		return true
+	case bson.TypeString:
+		return value.StringValue() == ""
+	case bson.TypeInt32:
+		return value.Int32() == 0
+	case bson.TypeInt64:
+		return value.Int64() == 0
+	case bson.TypeObjectID:
+		return value.ObjectID().IsZero()
+	}
+	return false
 }
 
 // sameID reports whether a stored _id matches an id as Weir compares them: a

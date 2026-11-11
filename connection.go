@@ -28,8 +28,8 @@ var ErrClosed = errors.New("Weir client is closed")
 // Client sends business requests to the Weir servers behind one application
 // address. Every server behind the address must host the Stores the client
 // uses. Reuse a Client across goroutines and close it after callers finish.
-// It sends a record again only when a server refused it before it began, and
-// never one that may have taken effect.
+// It sends a record again only when it took no effect, as when a server
+// refused it before it began, and never one that may have taken effect.
 type Client struct {
 	connection *grpc.ClientConn
 	store      pb.StoreServiceClient

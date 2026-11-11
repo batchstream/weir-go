@@ -42,7 +42,7 @@ go vet ./...
 Default tests use owned loopback fixtures, without databases or production I/O.
 CI checks typed operation dispatch, acknowledgements with transport errors,
 malformed/empty native chunks, incremental consumption,
-completion/cancellation, refusal-only resends and deadline admission. It also checks that
+completion/cancellation, resends of only refused and conflicted records, and deadline admission. It also checks that
 the module graph does not contain the Weir server, that `go.mod` replaces no
 module and that the protocol is a released `vMAJOR.MINOR.PATCH` version.
 

@@ -41,8 +41,9 @@ MongoDB Go driver's `bson` package.
 | `Update(ctx, id, update)` | Applies `$set`, `$unset` and `$inc` to a document that must exist | `FailurePreconditionFailed` |
 | `Transform(ctx, id, program, input)` | Runs a Lua program atomically against the document | `FailurePreconditionFailed` for `weir.reject` |
 
-Writes take the `_id` separately. A document may leave out its `_id` field; one
-it has must equal the id. The package puts the `_id` first, as Weir requires.
+Writes take the `_id` separately. A document may leave out its `_id` field or
+leave it zero; one it sets must equal the id. The package puts the `_id` first,
+as Weir requires.
 
 ```go
 ada := &User{Name: "Ada"}
@@ -120,9 +121,10 @@ for document, err := range db.Cursor(ctx, aggregate) {
 }
 ```
 
-Weir never sends a command again on its own. A command a lost connection or an
-unavailable backend cut short reports `weir.ErrInterrupted`, and may have run.
-Send it again only when that is safe, as it is for a read.
+A command is sent again only when a server refused it before it began. One a
+lost connection or an unavailable backend cut short reports
+`weir.ErrInterrupted`, and may have run. Send it again only when that is safe,
+as it is for a read.
 
 ## Errors
 
@@ -130,8 +132,13 @@ Send it again only when that is safe, as it is for a read.
 | --- | --- |
 | `weir.ErrNotFound` | `Get` found no document |
 | `*weir.Error` | A record failed. `weir.CodeOf(err)` gives its `FailureCode`, and `Outcome` tells whether a write applied. |
-| `weir.ErrInterrupted` | The request may have run. Never send a write again without checking. |
+| `weir.ErrInterrupted` | An outage cut the request short, so it may succeed later. It may have run: never send a write again without checking. |
 | `*mongodb.CommandError` | MongoDB rejected a command or one of its writes |
+
+A write certainly took no effect only when its `*weir.Error` has the `Outcome`
+`MutationNotStarted` or `MutationNotApplied`, or, for a command, the
+`Completion` `NativeNotStarted`. After any other error, a context error
+included, it may have applied.
 
 The Client already sent again every write a server refused before it began and
 every write that lost to concurrent writers of its record; see

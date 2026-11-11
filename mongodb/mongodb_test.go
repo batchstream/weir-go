@@ -153,6 +153,17 @@ func TestRecordDocumentKeepsOrMovesAnEqualID(t *testing.T) {
 	if got := bson.Raw(added.Data).Lookup("_id").ObjectID(); got != object {
 		t.Fatal("ObjectID _id was not added", got)
 	}
+	unset := struct {
+		ID   string `bson:"_id"`
+		Name string `bson:"name"`
+	}{Name: "Ada"}
+	filled, err := recordDocument("ada", unset)
+	if err != nil {
+		t.Fatal("a zero _id was taken as a different one", err)
+	}
+	if got := bson.Raw(filled.Data).Lookup("_id").StringValue(); got != "ada" {
+		t.Fatal("a zero _id was not replaced", bson.Raw(filled.Data))
+	}
 }
 
 func TestGetDecodesAndReportsMissingRecords(t *testing.T) {
@@ -270,6 +281,28 @@ func TestCommandReportsFailedReplies(t *testing.T) {
 	}
 }
 
+func TestCommandKeepsACompleteReplyDespiteALaterLostConnection(t *testing.T) {
+	ok := bson.D{{Key: "ok", Value: 1.0}}
+	lost := false
+	r := &recorder{t: t}
+	r.answer = func(*pb.Command) []*pb.Event {
+		if lost {
+			return []*pb.Event{storetest.Lost}
+		}
+		return append(storetest.Native(nil, bsonDocument(t, ok).Data), storetest.Lost)
+	}
+	db := r.db()
+	ping := bson.D{{Key: "ping", Value: 1}}
+	reply, err := db.Command(t.Context(), ping)
+	if err != nil || reply.Lookup("ok").Double() != 1 {
+		t.Fatal("complete reply was discarded", reply, err)
+	}
+	lost = true
+	if _, err := db.Command(t.Context(), ping); !errors.Is(err, weir.ErrInterrupted) {
+		t.Fatal("lost connection not interrupted", err)
+	}
+}
+
 func TestCommandInterruptedByAnUnavailableBackend(t *testing.T) {
 	code := pb.FailureCode_UNAVAILABLE
 	r := &recorder{t: t, answer: func(*pb.Command) []*pb.Event { return storetest.NativeIncomplete(nil, []byte{1}, code) }}
@@ -347,7 +380,7 @@ func TestFindFollowsTheCursorAndKillsAnAbandonedOne(t *testing.T) {
 		t.Fatal("wrong find", find)
 	}
 	getMore := command(t, r.commands[1])
-	if getMore[1].Value != "users" {
+	if getMore[1].Value != "users" || getMore[2].Key != "$db" || getMore[2].Value != "app" {
 		t.Fatal("getMore named the wrong collection", getMore)
 	}
 
@@ -357,7 +390,7 @@ func TestFindFollowsTheCursorAndKillsAnAbandonedOne(t *testing.T) {
 		}
 		break
 	}
-	if len(cursors.killed) != 1 || cursors.killed[0][1].Value.(bson.A)[0] != int64(1) {
+	if len(cursors.killed) != 1 || cursors.killed[0][1].Value.(bson.A)[0] != int64(1) || cursors.killed[0][2].Value != "app" {
 		t.Fatal("abandoned cursor not killed", cursors.killed)
 	}
 }

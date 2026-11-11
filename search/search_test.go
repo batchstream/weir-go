@@ -158,6 +158,13 @@ func TestRecordsUseJSONAndStringIDs(t *testing.T) {
 	if update.GetOptions().GetVisibility() != pb.MutationVisibility_QUERY_VISIBLE {
 		t.Fatal("update did not wait for visibility")
 	}
+	if err := products.Update(t.Context(), "p/1", []byte(`{"price":26}`)); err != nil {
+		t.Fatal(err)
+	}
+	raw := r.commands[len(r.commands)-1].GetMutate().GetAtomicTransform().GetBackendExpression()
+	if string(raw.GetData()) != `{"doc":{"price":26}}` {
+		t.Fatal("JSON bytes were not sent as they are", string(raw.GetData()))
+	}
 	const program = "return function(current, incoming) return incoming end"
 	err = products.Transform(t.Context(), "p/1", program, lamp)
 	if err != nil {

@@ -19,7 +19,8 @@ type Target struct {
 var errNoClient = errors.New("weir: no Client")
 
 // Mutate sends one mutation and returns nil only for APPLIED without a
-// Failure. With visible, success also confirms that later queries see it.
+// Failure. With visible, success also confirms that later queries see it. A
+// confirmed result stands even when an RPC error came after it.
 func (t Target) Mutate(ctx context.Context, request *weir.MutateRequest, visible bool) error {
 	if t.Client == nil {
 		return errNoClient
@@ -29,7 +30,7 @@ func (t Target) Mutate(ctx context.Context, request *weir.MutateRequest, visible
 		options = append(options, weir.WithQueryVisible())
 	}
 	results, err := t.Client.Mutate(ctx, t.Store, options...)
-	if err != nil {
+	if err != nil && (len(results) != 1 || results[0] == nil) {
 		return err
 	}
 	if len(results) != 1 {
@@ -68,17 +69,18 @@ func (t Target) Read(ctx context.Context, resources []string) ([]*weir.Document,
 	return documents, nil
 }
 
-// Native sends one Native request and returns its complete result.
+// Native sends one Native request and returns its complete result. A complete
+// result stands even when an RPC error came after it.
 func (t Target) Native(ctx context.Context, request *weir.NativeRequest) (*weir.NativeResult, error) {
 	if t.Client == nil {
 		return nil, errNoClient
 	}
 	result, err := t.Client.Native(ctx, t.Store, request)
+	if result != nil && result.Err() == nil {
+		return result, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if err := result.Err(); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return nil, result.Err()
 }

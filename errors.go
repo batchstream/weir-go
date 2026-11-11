@@ -9,14 +9,19 @@ import (
 // ReadResult.Missing; the mongodb and search packages return ErrNotFound.
 var ErrNotFound = errors.New("weir: record not found")
 
-// ErrInterrupted marks a request cut short by an outage after it may have
-// begun: the connection to Weir broke, a mutation ended UNKNOWN with
-// UNAVAILABLE, or a Native request that began ended with UNAVAILABLE or
-// without its end. Whether the backend ran it is unknown, so
-// send it again only when repeating it is safe, as it is for a read. A request
-// a server refused before it began is not interrupted: it took no effect, and
-// the Client already sent it again. Neither is a request that failed for a
-// reason of its own, or whose context ended.
+// ErrInterrupted marks a request an outage cut short, so that sending it again
+// later may succeed: the connection to Weir broke, a mutation ended UNKNOWN
+// with UNAVAILABLE, or a Native request that began ended with UNAVAILABLE or
+// without its end. Whether the backend ran it is unknown, so send it again
+// only when repeating it is safe, as it is for a read. A request a server
+// refused before it began is not interrupted: it took no effect, and the
+// Client already sent it again. Neither is a request that failed for a reason
+// of its own, or whose context ended.
+//
+// ErrInterrupted does not tell whether a write applied. A write certainly took
+// no effect only when its *Error has the Outcome MutationNotStarted or
+// MutationNotApplied, or the Completion NativeNotStarted. After any other
+// error, a context error included, it may have applied.
 var ErrInterrupted = errors.New("weir: interrupted")
 
 // Error is a Failure Weir reported for one record or Native request.
@@ -24,6 +29,9 @@ type Error struct {
 	// Outcome is the outcome of a mutation, and zero for a read or Native
 	// request.
 	Outcome MutationOutcome
+	// Completion is how far a Native request got, and zero for a record or a
+	// Native response that stopped without its end.
+	Completion NativeCompletion
 	// Failure is nil when the request has no result or its Native response
 	// stopped early without one.
 	Failure *Failure
@@ -36,6 +44,9 @@ func (e *Error) Error() string {
 	text := "weir"
 	if e.Outcome != 0 {
 		text += ": mutation " + e.Outcome.String()
+	}
+	if e.Completion != 0 {
+		text += ": native " + e.Completion.String()
 	}
 	if e.Failure != nil {
 		text += fmt.Sprintf(": %s: %s", e.Failure.GetCode(), e.Failure.GetMessage())
@@ -105,13 +116,13 @@ func (r *NativeResult) Err() error {
 	}
 	if r.Failure != nil {
 		interrupted := r.Completion != NativeNotStarted && r.Failure.GetCode() == FailureUnavailable
-		failed := &Error{Failure: r.Failure, interrupted: interrupted}
+		failed := &Error{Completion: r.Completion, Failure: r.Failure, interrupted: interrupted}
 		return failed
 	}
 	// A terminal that is not complete carries a Failure, so this response
 	// stopped without one.
 	if r.Completion != NativeResponseComplete {
-		failed := &Error{reason: "native response without its end", interrupted: true}
+		failed := &Error{Completion: r.Completion, reason: "native response without its end", interrupted: true}
 		return failed
 	}
 	return nil

@@ -11,10 +11,16 @@ import (
 	weir "github.com/batchstream/weir-go"
 	pb "github.com/batchstream/weir-protocol/api/weir/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Handler answers one command sent to a Store with the events Weir would send.
 type Handler func(store string, command *pb.Command) []*pb.Event
+
+// Lost, in place of an event, ends the stream with UNAVAILABLE as a lost
+// connection does.
+var Lost = &pb.Event{}
 
 type server struct {
 	mu      sync.Mutex
@@ -43,6 +49,9 @@ func (s *server) Execute(stream grpc.BidiStreamingServer[pb.ExecuteRequests, pb.
 			events := s.handler(store, request.Command)
 			s.mu.Unlock()
 			for _, event := range events {
+				if event == Lost {
+					return status.Error(codes.Unavailable, "connection lost")
+				}
 				response := &pb.ExecuteResponse{Index: request.Index, Event: event}
 				responses := &pb.ExecuteResponses{Responses: []*pb.ExecuteResponse{response}}
 				if err := stream.Send(responses); err != nil {

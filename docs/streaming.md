@@ -123,10 +123,12 @@ A record is sent at most four times. The wait before each resend is jittered
 between half and all of 50 ms, 100 ms and then 200 ms. A resend is made only
 when the context deadline leaves that longest wait again for the send after it.
 A resend that still outlasts the deadline ends with the deadline error, and that
-record may have taken effect. Resends across a Client stay within one per ten
-first sends plus a burst of 100, so a server that refuses everything never
-receives several times its normal traffic, and a heavily contended record does
-not multiply its writers. A record still refused or conflicted at the end keeps
+record may have taken effect. Refusals and conflicts each have a budget: across
+a Client, the resends of each cause stay within one per ten first sends plus a
+burst of 100. A server that refuses everything never receives several times its
+normal traffic, a heavily contended record does not multiply its writers, and
+contention never uses up the resends of records a draining server refused. A
+record still refused or conflicted at the end keeps
 its evidence, and later mutations of its resource in the same call still run
 after it. The caller may send it again, unless such a mutation did not end
 NOT_STARTED or NOT_APPLIED; sending it then would apply it after that mutation.

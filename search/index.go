@@ -88,8 +88,13 @@ func (i Index[T]) Delete(ctx context.Context, id string) error {
 }
 
 // Update merges fields, a JSON object, into a document that must exist. A
-// missing document fails it with FailurePreconditionFailed.
+// []byte or json.RawMessage holds the object's JSON as it is; any other value
+// is encoded as JSON. A missing document fails it with
+// FailurePreconditionFailed.
 func (i Index[T]) Update(ctx context.Context, id string, fields any) error {
+	if raw, ok := fields.([]byte); ok {
+		fields = json.RawMessage(raw)
+	}
 	expression := struct {
 		Doc any `json:"doc"`
 	}{Doc: fields}
@@ -104,13 +109,14 @@ func (i Index[T]) Update(ctx context.Context, id string, fields any) error {
 
 // Transform runs a Lua program atomically against the document. The program
 // returns one function, called as function(current, incoming), where current
-// is the stored document or nil and incoming is input encoded as JSON, or nil
-// when input is nil. Its result replaces the document, and weir.reject(message)
+// is the stored document or nil and incoming is input, a []byte or
+// json.RawMessage holding JSON or another value encoded as JSON, or nil when
+// input is nil. Its result replaces the document, and weir.reject(message)
 // fails it with FailurePreconditionFailed. See the Lua guide for the rest.
 func (i Index[T]) Transform(ctx context.Context, id string, program string, input any) error {
 	lua := &weir.LuaTransform{Source: []byte(program)}
 	if input != nil {
-		data, err := json.Marshal(input)
+		data, err := encodeBody(input)
 		if err != nil {
 			return fmt.Errorf("search: encode transform input: %w", err)
 		}
