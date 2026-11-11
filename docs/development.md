@@ -2,6 +2,19 @@
 
 How to test the SDK and publish a version.
 
+## Packages
+
+| Package | Contents |
+| --- | --- |
+| `weir` | The client and its protocol types. It knows no backend. |
+| `mongodb` | MongoDB documents and commands, built on `weir`'s public API |
+| `search` | Elasticsearch and OpenSearch documents and HTTP requests, built on `weir`'s public API |
+| `internal/record` | Single-record calls the two packages share |
+| `internal/storetest` | A fake Weir for the two packages' tests |
+
+`weir` cannot depend on a backend package: both import it, and Go rejects import
+cycles.
+
 ## Module dependencies
 
 The SDK depends on the stable `github.com/batchstream/weir-protocol v0.17.0`
@@ -16,6 +29,8 @@ generate schemas.
 mutates a document then reads multiple resources in one call, and
 [native](../examples/native/main.go) consumes
 native responses. These examples use SDK request and result types.
+[mongodb](../examples/mongodb/main.go) and [search](../examples/search/main.go) use
+the `mongodb` and `search` packages.
 
 ## Tests
 
@@ -48,12 +63,14 @@ WEIR_MONGO_STORE=mongo \
 WEIR_MONGO_RESOURCE=weir_example/records \
 WEIR_SEARCH_STORE=search \
 WEIR_SEARCH_RESOURCE=weir_example \
-go test -race -tags integration -run 'Test(Mongo|Search)(Lifecycle|Streaming)' -v .
+go test -race -tags integration -v ./...
 ```
 
 Pre-create disposable collections/indexes. Each test creates and cleans up only
 its generated records. Lifecycle tests cover CRUD, backend expressions and
 Native; streaming tests verify same-resource ordering through an individual
-failure, Lua persistence, and repeated and missing reads. System integration tests,
-backend fault tests and throughput benchmarks belong to the independent
+failure, Lua persistence, and repeated and missing reads. The `mongodb` and
+`search` packages test every method, cursors and command failures against the
+same fixtures. System integration tests, backend fault tests and throughput
+benchmarks belong to the independent
 [weir-tests](https://github.com/batchstream/weir-tests) repository.
