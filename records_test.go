@@ -172,7 +172,7 @@ func TestMutateBatchSelectsOperationsAndPreservesOrder(t *testing.T) {
 			t.Fatal("wrong business operation", index, mutation)
 		}
 		if index == 1 {
-			if results[index].GetOutcome() != MutationNotApplied || results[index].GetFailure().GetCode() != FailureConflict {
+			if results[index].GetOutcome() != MutationNotApplied || results[index].GetFailure().GetCode() != FailurePreconditionFailed {
 				t.Fatal("individual mutation failure lost", results[index])
 			}
 		} else if results[index].GetOutcome() != MutationApplied {

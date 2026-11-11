@@ -165,7 +165,7 @@ func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream grpc.
 	}
 	result := protocol.Mutation(MutationApplied, nil)
 	if strings.HasPrefix(p.mode, "batch_") && request.Index == 2 {
-		result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailureConflict, "conflict"))
+		result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailurePreconditionFailed, "record exists"))
 	}
 	switch p.mode {
 	case "invalid_outcome":

@@ -103,16 +103,20 @@ rebalance clients behind one virtual IP, and idle streams close after 10
 seconds. Shared streams do not carry outgoing gRPC metadata from a call's
 context; a call with outgoing metadata uses a stream of its own and sends it.
 
-## Resending refused records
+## Resending records
 
-A Client sends a record again when a server refused it before it began: a
-`MutationNotStarted` mutation, a read Failure, or a `NativeNotStarted` without a
-Response, whose Failure code is `FailureUnavailable`. A replica draining for a
-rolling restart, a replica under memory pressure and an unavailable backend
-refuse this way. Such a record took no effect, so sending it again cannot apply
-it twice. `FailureResourceExhausted` reports that the request exceeded a budget
-of its own, such as a result over the message size limit, which a resend would
-exceed again. Every other result, including UNKNOWN, NOT_APPLIED, APPLIED with a
+A Client sends a record again when it took no effect and may succeed later:
+
+| Result | Cause |
+| --- | --- |
+| `MutationNotStarted`, read Failure or `NativeNotStarted` without a Response, with `FailureUnavailable` | A server refused it before it began: a replica draining for a rolling restart, a replica under memory pressure or an unavailable backend |
+| `MutationNotApplied` with `FailureConflict` | It lost every compare-and-swap or transaction attempt Weir made against concurrent writers of the same record |
+
+Such a record took no effect, so sending it again cannot apply it twice. A
+resent atomic transform runs again against the record as it then is.
+`FailureResourceExhausted` reports that the request exceeded a budget of its own,
+such as a result over the message size limit, which a resend would exceed again.
+Every other result, including UNKNOWN, other NOT_APPLIED failures, APPLIED with a
 Failure and nil positions, and every Go error reach the caller unchanged.
 
 A record is sent at most four times. The wait before each resend is jittered
@@ -121,8 +125,9 @@ when the context deadline leaves that longest wait again for the send after it.
 A resend that still outlasts the deadline ends with the deadline error, and that
 record may have taken effect. Resends across a Client stay within one per ten
 first sends plus a burst of 100, so a server that refuses everything never
-receives several times its normal traffic. A record still refused at the end
-keeps its NOT_STARTED evidence, and later mutations of its resource in the same
-call still run after it. The caller may send it again, unless such a mutation
-did not end NOT_STARTED; sending it then would apply it after that mutation. Use
-caller deadlines; they bound resends as well as calls.
+receives several times its normal traffic, and a heavily contended record does
+not multiply its writers. A record still refused or conflicted at the end keeps
+its evidence, and later mutations of its resource in the same call still run
+after it. The caller may send it again, unless such a mutation did not end
+NOT_STARTED or NOT_APPLIED; sending it then would apply it after that mutation.
+Use caller deadlines; they bound resends as well as calls.

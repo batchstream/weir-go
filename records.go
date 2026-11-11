@@ -75,13 +75,14 @@ type recordKind[R comparable] struct {
 	result func(*pb.Event) R
 	// refused returns the result of a record a server turned away.
 	refused func(*pb.Failure) R
-	// isRefused reports a result a server may accept later.
+	// isRefused reports a result the Client sends again: one a server may
+	// accept later, or a mutation that lost to concurrent writers.
 	isRefused func(R) bool
 }
 
 var readKind = recordKind[*ReadResult]{name: "Read", read: true, result: readEventResult, refused: readResultOfRefusal, isRefused: readRefused}
 
-var mutateKind = recordKind[*MutationResult]{name: "Mutate", result: mutationEventResult, refused: mutationResultOfRefusal, isRefused: mutationRefused}
+var mutateKind = recordKind[*MutationResult]{name: "Mutate", result: mutationEventResult, refused: mutationResultOfRefusal, isRefused: mutationResendable}
 
 func readEventResult(event *pb.Event) *ReadResult {
 	wire := event.GetReadResult()

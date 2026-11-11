@@ -15,19 +15,26 @@ import (
 )
 
 // refusingPeer refuses the first refusals[resource] sends of a resource as a
-// draining server does, then answers results[resource] or applies the
-// mutation and reports a read missing. It counts every send and records the
-// documents of applied mutations in order.
+// draining server does, then fails conflicts[resource] mutations as lost to
+// concurrent writers, then answers results[resource] or applies the mutation
+// and reports a read missing. It counts every send and records the documents
+// of applied mutations in order.
 type refusingPeer struct {
-	mu       sync.Mutex
-	refusals map[string]int
-	results  map[string]*pb.MutationResult
-	sends    map[string]int
-	applied  []string
+	mu        sync.Mutex
+	refusals  map[string]int
+	conflicts map[string]int
+	results   map[string]*pb.MutationResult
+	sends     map[string]int
+	applied   []string
 }
 
 func newRefusingPeer() *refusingPeer {
-	peer := &refusingPeer{refusals: make(map[string]int), results: make(map[string]*pb.MutationResult), sends: make(map[string]int)}
+	peer := &refusingPeer{
+		refusals:  make(map[string]int),
+		conflicts: make(map[string]int),
+		results:   make(map[string]*pb.MutationResult),
+		sends:     make(map[string]int),
+	}
 	return peer
 }
 
@@ -80,6 +87,10 @@ func (p *refusingPeer) answer(command *pb.Command) *pb.Event {
 	switch {
 	case refused:
 		result = protocol.Mutation(pb.MutationOutcome_NOT_STARTED, failure)
+	case p.conflicts[resource] > 0:
+		p.conflicts[resource]--
+		conflict := protocol.Fail(pb.FailureCode_CONFLICT, "record changed during every attempt")
+		result = protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)
 	case p.results[resource] != nil:
 		result = p.results[resource]
 	default:
@@ -154,6 +165,37 @@ func TestClientResendsRecordsAServerRefusedBeforeTheyBegan(t *testing.T) {
 	read, err := readOne(t.Context(), client, request)
 	if err != nil || !read.Missing || peer.sent("records/s:read") != 2 {
 		t.Fatal("refused read was not resent", read, err, peer.sent("records/s:read"))
+	}
+}
+
+func TestClientResendsMutationsThatLostToConcurrentWriters(t *testing.T) {
+	peer := newRefusingPeer()
+	peer.conflicts["records/s:hot"] = 2
+	peer.conflicts["records/s:hotter"] = 10
+	client := refusingClient(t, peer)
+	result, err := refusingPut(t.Context(), client, "records/s:hot")
+	if err != nil || result.GetOutcome() != MutationApplied || peer.sent("records/s:hot") != 3 {
+		t.Fatal("conflicted write was not resent until applied", result, err, peer.sent("records/s:hot"))
+	}
+	result, err = refusingPut(t.Context(), client, "records/s:hotter")
+	if err != nil || result.GetOutcome() != MutationNotApplied || result.GetFailure().GetCode() != FailureConflict {
+		t.Fatal("last conflict lost its evidence", result, err)
+	}
+	if peer.sent("records/s:hotter") != resendAttempts {
+		t.Fatal("unexpected sends", peer.sent("records/s:hotter"))
+	}
+	// A call of several records resends a conflicted one before the next
+	// mutation of its resource.
+	peer.conflicts["records/s:x"] = 1
+	first := putRequest("records/s:x", `{"n":1}`)
+	later := putRequest("records/s:x", `{"n":2}`)
+	peer.drain()
+	results, err := client.Mutate(t.Context(), "records", WithRequests(first, later))
+	if err != nil || results[0].GetOutcome() != MutationApplied || results[1].GetOutcome() != MutationApplied {
+		t.Fatal("conflicted write in a call was not resent", results, err)
+	}
+	if applied := peer.drain(); !slices.Equal(applied, []string{`{"n":1}`, `{"n":2}`}) {
+		t.Fatal("resent write applied out of order", applied)
 	}
 }
 
@@ -285,6 +327,7 @@ func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 	unavailable := protocol.Fail(pb.FailureCode_UNAVAILABLE, "store draining")
 	exhausted := protocol.Fail(pb.FailureCode_RESOURCE_EXHAUSTED, "result exceeds the message size limit")
 	invalid := protocol.Fail(pb.FailureCode_INVALID_ARGUMENT, "invalid record")
+	conflict := protocol.Fail(pb.FailureCode_CONFLICT, "record changed during every attempt")
 	refusedRead := &ReadResult{Failure: unavailable}
 	exhaustedRead := &ReadResult{Failure: exhausted}
 	invalidRead := &ReadResult{Failure: invalid}
@@ -302,6 +345,12 @@ func TestRefusalsAreThoseBeforeARecordBegan(t *testing.T) {
 		{"invalid mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, invalid)), false},
 		{"unknown mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_UNKNOWN, unavailable)), false},
 		{"missing mutation result", mutationRefused(nil), false},
+		{"conflicted mutation", mutationRefused(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)), false},
+		{"resendable draining mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_STARTED, unavailable)), true},
+		{"resendable conflicted mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, conflict)), true},
+		{"unknown conflicted mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_UNKNOWN, conflict)), false},
+		{"not applied mutation", mutationResendable(protocol.Mutation(pb.MutationOutcome_NOT_APPLIED, invalid)), false},
+		{"missing resendable result", mutationResendable(nil), false},
 		{"refused read", readRefused(refusedRead), true},
 		{"exhausted read", readRefused(exhaustedRead), false},
 		{"invalid read", readRefused(invalidRead), false},

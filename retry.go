@@ -12,9 +12,12 @@ import (
 // A Client sends a record again when a server refused it before it began, as
 // a draining or memory-pressured server or an unavailable backend does: a
 // mutation NOT_STARTED, a failed read or a Native NOT_STARTED whose Failure is
-// UNAVAILABLE. Such a record took no effect, so sending it again cannot apply
-// it twice. RESOURCE_EXHAUSTED reports a budget of the request itself, which a
-// resend would exceed again. Every other result reaches the caller as it came.
+// UNAVAILABLE. It also sends again a mutation NOT_APPLIED with CONFLICT, which
+// lost every compare-and-swap or transaction attempt Weir made against
+// concurrent writers of its record. Such a record took no effect, so sending
+// it again cannot apply it twice. RESOURCE_EXHAUSTED reports a budget of the
+// request itself, which a resend would exceed again. Every other result
+// reaches the caller as it came.
 const (
 	// resendAttempts bounds the sends of one record, the first included.
 	resendAttempts = 4
@@ -116,6 +119,16 @@ func refusal(failure *pb.Failure) bool {
 
 func mutationRefused(result *MutationResult) bool {
 	return result.GetOutcome() == pb.MutationOutcome_NOT_STARTED && refusal(result.GetFailure())
+}
+
+// mutationResendable reports a mutation that took no effect and may apply when
+// sent again: one a server refused, or one that lost to concurrent writers.
+// Only a refusal tells that a server turns work away.
+func mutationResendable(result *MutationResult) bool {
+	if mutationRefused(result) {
+		return true
+	}
+	return result.GetOutcome() == pb.MutationOutcome_NOT_APPLIED && result.GetFailure().GetCode() == pb.FailureCode_CONFLICT
 }
 
 func readRefused(result *ReadResult) bool {

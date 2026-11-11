@@ -132,7 +132,8 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 
 // callError reports a call that ended with its context as the context's error,
 // whether it used a shared stream or a stream of its own. The server enforces
-// the propagated deadline too, so its status can arrive before ctx expires.
+// the propagated deadline too, so its status can arrive before ctx expires. A
+// lost connection is marked ErrInterrupted and keeps its gRPC status.
 func callError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -142,6 +143,9 @@ func callError(ctx context.Context, err error) error {
 	}
 	if _, bounded := ctx.Deadline(); bounded && status.Code(err) == codes.DeadlineExceeded {
 		return context.DeadlineExceeded
+	}
+	if status.Code(err) == codes.Unavailable {
+		return fmt.Errorf("%w: %w", ErrInterrupted, err)
 	}
 	return err
 }
