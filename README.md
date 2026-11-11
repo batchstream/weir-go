@@ -80,7 +80,7 @@ documents. Your code owns the document bytes.
 
 | Item | Requirement |
 | --- | --- |
-| Go | 1.27.3 |
+| Go | 1.27.4 |
 | Weir server | Reachable at a `host:port` address. In Kubernetes, use a headless Service. |
 | Collections and indices | Must exist before typed reads and mutations. `Native` can create them. |
 | Docker | For the quick start only |
