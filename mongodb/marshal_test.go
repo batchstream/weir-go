@@ -28,6 +28,39 @@ func (d *dualBSONHooks) MarshalBSONValue() (byte, []byte, error) {
 	return byte(kind), data, err
 }
 
+type valueBSONHook struct{}
+
+func (valueBSONHook) MarshalBSON() ([]byte, error) {
+	document := bson.D{{Key: "source", Value: "value-receiver hook"}}
+	return bson.Marshal(document)
+}
+
+func TestWritesRejectNilInterfaceDocumentsBeforeInvokingHooks(t *testing.T) {
+	r := &recorder{t: t, answer: func(*pb.Command) []*pb.Event { return storetest.Applied() }}
+	db := r.db()
+	collection := Collection[string, any]{DB: db, Name: "records"}
+	documents := []any{nil, (*valueBSONHook)(nil), (*dualBSONHooks)(nil), (*user)(nil)}
+	for _, document := range documents {
+		if err := collection.Create(t.Context(), "one", &document); err == nil {
+			t.Error("create accepted a nil document")
+		}
+		if err := collection.Put(t.Context(), "one", &document); err == nil {
+			t.Error("put accepted a nil document")
+		}
+		if err := collection.Replace(t.Context(), "one", &document); err == nil {
+			t.Error("replace accepted a nil document")
+		}
+	}
+	var document bson.Marshaler = (*valueBSONHook)(nil)
+	abstract := Collection[string, bson.Marshaler]{DB: db, Name: "records"}
+	if err := abstract.Put(t.Context(), "one", &document); err == nil {
+		t.Error("non-empty interface accepted a typed nil")
+	}
+	if len(r.commands) != 0 {
+		t.Error("a nil document reached Weir", len(r.commands))
+	}
+}
+
 // A generic interface adds an artificial pointer around the concrete value.
 // That wrapper must not change bson.Marshal's document-hook precedence or
 // prevent encoding a non-empty interface.
