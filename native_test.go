@@ -14,6 +14,9 @@ import (
 )
 
 func (p *clientTestPeer) nativeExecute(stream grpc.BidiStreamingServer[pb.ExecuteRequest, pb.ExecuteResponse]) error {
+	if p.mode == "native_refused_stream" && p.received.Load() == 1 {
+		return refusedStreamError("draining")
+	}
 	metadata := &Document{ContentType: "application/vnd.example.response", Data: []byte{0xff, 0}}
 	head := &pb.NativeHead{Metadata: metadata, BodyContentType: "application/octet-stream"}
 	if p.mode == "native_invalid_metadata" {
@@ -155,6 +158,25 @@ func TestNativeConsumesBytesAndPreservesResponseEvidence(t *testing.T) {
 				t.Fatal("Native request replayed", peer.received.Load())
 			}
 		})
+	}
+}
+
+func TestNativeResendsARequestWhoseStreamAServerRefused(t *testing.T) {
+	peer := &clientTestPeer{mode: "native_refused_stream"}
+	client := clientTestClient(t, peer)
+	client.resends = newResendBudget()
+	result, err := client.Native(t.Context(), "records", clientTestNativeRequest())
+	if err != nil || result.Err() != nil || peer.received.Load() != 2 {
+		t.Fatal("refused Native stream was not resent", result, err, peer.received.Load())
+	}
+	client.resends = nil
+	peer.received.Store(0)
+	result, err = client.Native(t.Context(), "records", clientTestNativeRequest())
+	if err != nil || result.Completion != NativeNotStarted || result.Failure.GetCode() != FailureUnavailable {
+		t.Fatal("refused Native stream lost its refusal", result, err)
+	}
+	if errors.Is(result.Err(), ErrInterrupted) {
+		t.Fatal("refused Native request marked interrupted", result.Err())
 	}
 }
 

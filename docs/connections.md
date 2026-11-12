@@ -62,9 +62,11 @@ Reuse the client across goroutines and
 close it after callers finish.
 Calls started after `Close` return `ErrClosed`; calls still running end with a
 gRPC cancellation error. A call whose context ends returns the context's
-error, so test it with `errors.Is` rather than its gRPC status. A Client sends a record again only when a server refused it
-before it began, as described under
-[Resending refused records](streaming.md#resending-refused-records).
+error, so test it with `errors.Is` rather than its gRPC status. A call cut short by
+a lost connection returns an error that `errors.Is(err, weir.ErrInterrupted)`
+reports, with its gRPC status kept. A Client sends a record again only when it
+took no effect, as described under
+[Resending records](streaming.md#resending-records).
 
 ## Kubernetes DNS names
 

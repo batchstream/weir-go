@@ -25,7 +25,7 @@ func (c *Client) Native(ctx context.Context, store string, request *NativeReques
 	}
 	call := nativeCall{store: store, request: request, chunks: config.chunks}
 	send := func() (*NativeResult, error) { return call.send(ctx, client) }
-	result, err := resendRefused(ctx, c, nativeRefused, send)
+	result, err := withResends(ctx, c, onRefusal(nativeRefused), send)
 	return result, callError(ctx, err)
 }
 
@@ -68,6 +68,10 @@ func (n nativeCall) send(ctx context.Context, client pb.StoreServiceClient) (*Na
 		return false, nil
 	}
 	err := execute(ctx, client, request, consume)
+	if failure := refusedStream(err); failure != nil && result == nil {
+		refused := &NativeResult{Completion: NativeNotStarted, Failure: failure}
+		return refused, nil
+	}
 	return result, err
 }
 

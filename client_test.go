@@ -3,6 +3,7 @@ package weir
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -165,7 +166,7 @@ func (p *clientTestPeer) mutationRecord(request *pb.ExecuteRequest, stream grpc.
 	}
 	result := protocol.Mutation(MutationApplied, nil)
 	if strings.HasPrefix(p.mode, "batch_") && request.Index == 2 {
-		result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailureConflict, "conflict"))
+		result = protocol.Mutation(MutationNotApplied, protocol.Fail(FailurePreconditionFailed, "record exists"))
 	}
 	switch p.mode {
 	case "invalid_outcome":
@@ -360,6 +361,14 @@ func TestPutLostResponseHasNoAcknowledgementOrReplay(t *testing.T) {
 	result, err := mutateOne(t.Context(), client, request)
 	if status.Code(err) != codes.Unavailable || result != nil || peer.streams.Load() != 1 || peer.received.Load() != 1 {
 		t.Fatal("lost response confirmed or replayed mutation", result, err, peer.streams.Load(), peer.received.Load())
+	}
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatal("lost response not marked interrupted", err)
+	}
+	other := &MutateRequest{Resource: "records/s:other", Action: MutationPut, Document: document}
+	results, err := client.Mutate(t.Context(), "records", WithRequests(request, other))
+	if !errors.Is(err, ErrInterrupted) || status.Code(err) != codes.Unavailable || results[0] != nil {
+		t.Fatal("lost response in a call not marked interrupted", results, err)
 	}
 }
 

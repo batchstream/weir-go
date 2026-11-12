@@ -6,6 +6,14 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 
 ## Overview
 
+### Packages
+
+| Package | Use |
+| --- | --- |
+| `github.com/batchstream/weir-go` | The client: `Read`, `Mutate` and `Native` for any Store |
+| `github.com/batchstream/weir-go/mongodb` | Typed MongoDB collections, queries and commands |
+| `github.com/batchstream/weir-go/search` | Typed Elasticsearch and OpenSearch indexes, searches and HTTP requests |
+
 ### Terms
 
 | Term | Meaning |
@@ -50,8 +58,9 @@ Typed Go client for [Weir](https://github.com/batchstream/weir).
 | Elasticsearch, OpenSearch | `index/s:key` | `application/json` |
 
 MongoDB keys can also use `i:` for a 64-bit integer or `oid:` for an ObjectId in
-lowercase hex. `weir.EncodeSegment` encodes a path segment. The SDK does not encode
-documents. Your code owns the document bytes.
+lowercase hex. `weir.EncodeSegment` encodes a path segment. The `weir` package does
+not encode documents; your code owns the document bytes. The `mongodb` and `search`
+packages build resources and encode documents for you.
 
 ### Mutation outcomes
 
@@ -68,7 +77,8 @@ documents. Your code owns the document bytes.
    finish.
 2. Set a context deadline on every call.
 3. Check the Go error and every result. A record can fail while the Go error is
-   nil.
+   nil. `MutationErr`, `ReadResult.Err` and `NativeResult.Err` turn a result into
+   an error.
 4. Never automatically resend a mutation that is `MutationApplied` or
    `MutationUnknown`, or that has no result. It has applied or may have applied.
    Reconcile it first.
@@ -193,7 +203,9 @@ message: hi
 | [Operations](docs/operations.md) | Reads, writes, visibility, results and outcomes |
 | [Lua](docs/lua.md) | Lua transforms |
 | [Native](docs/native.md) | Backend commands and HTTP helpers |
-| [Streaming](docs/streaming.md) | Callbacks, streams, deadlines and resending refused records |
+| [MongoDB](docs/mongodb.md) | The `mongodb` package: collections, queries and commands |
+| [Search](docs/search.md) | The `search` package: indexes, searches and HTTP requests |
+| [Streaming](docs/streaming.md) | Callbacks, streams, deadlines and resending records |
 | [Development](docs/development.md) | Tests, real backend tests and releases |
 | [API reference](https://pkg.go.dev/github.com/batchstream/weir-go) | Every exported type and function |
 
@@ -202,6 +214,8 @@ message: hi
 | [read](examples/read/main.go) | A typed read |
 | [basic](examples/basic/main.go) | A mutation, then many reads in one call |
 | [native](examples/native/main.go) | A native command and its response |
+| [mongodb](examples/mongodb/main.go) | A typed MongoDB collection |
+| [search](examples/search/main.go) | A typed search index and a search |
 
 ## Development
 

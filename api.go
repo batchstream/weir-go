@@ -12,7 +12,7 @@ type Failure = pb.Failure
 
 // FailureCode identifies a declared operation failure. Only known nonzero codes
 // are accepted. A Client sends a record again only for FailureUnavailable on
-// a record that never began.
+// a record that never began, or FailureConflict on a mutation NOT_APPLIED.
 type FailureCode = pb.FailureCode
 type MutationResult = pb.MutationResult
 type MutationOutcome = pb.MutationOutcome

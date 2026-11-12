@@ -33,7 +33,7 @@ type clientStreamOptions[R comparable] struct {
 	// send returns the result of one command, sending it once unless it is
 	// already queued.
 	send    func(context.Context, *pb.Command, *queuedRecord) (R, error)
-	refused func(R) bool
+	resend  func(R) resendCause
 	consume func(context.Context, int, R) error
 }
 
@@ -229,7 +229,7 @@ func (s *clientStream[R]) run(record *streamRecord, queued *queuedRecord) {
 			queued = nil
 			return s.options.send(s.ctx, record.command, current)
 		}
-		result, err := resendRefused(s.ctx, s.client, s.options.refused, send)
+		result, err := withResends(s.ctx, s.client, s.options.resend, send)
 		if err != nil {
 			s.fail(err)
 		}

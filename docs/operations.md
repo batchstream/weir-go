@@ -132,12 +132,46 @@ cannot establish whether it applied. A later RPC failure does not revoke any
 confirmed item. Unconfirmed nil positions may have applied; reconcile them through
 application knowledge and never automatically replay writes.
 
+## Result errors
+
+These turn results into Go errors, so a caller can return them with `err`:
+
+| Function | Returns nil for | Otherwise |
+| --- | --- | --- |
+| `MutationErr(result)` | APPLIED without a Failure | `*Error` with Outcome and Failure |
+| `result.Err()` on a `ReadResult` | A document or a confirmed missing record | `*Error` with the Failure |
+| `result.Err()` on a `NativeResult` | A complete response, whatever its own status | `*Error` with the Failure, if any |
+
+```go
+results, err := client.Mutate(ctx, "search", weir.WithRequests(request))
+if err != nil { return err }
+if err := weir.MutationErr(results[0]); err != nil {
+    if weir.CodeOf(err) == weir.FailurePreconditionFailed {
+        // The record already exists.
+    }
+    return err
+}
+```
+
+`CodeOf(err)` returns the FailureCode of an `*Error` anywhere in the chain, or
+zero. `errors.Is(err, ErrInterrupted)` reports a request an outage cut short, so
+sending it again later may succeed: a lost connection, a mutation UNKNOWN with
+UNAVAILABLE, or a Native request that began and ended with UNAVAILABLE or without
+its end. It may have run, so send it again only when repeating it is safe.
+
+`ErrInterrupted` does not tell whether a write applied. A write certainly took no
+effect only when its `*Error` has the `Outcome` `MutationNotStarted` or
+`MutationNotApplied`, or the `Completion` `NativeNotStarted`. After any other
+error, a context error included, it may have applied. `ErrNotFound` is what the
+[mongodb](mongodb.md) and [search](search.md) packages return for a missing
+record.
+
 ## Response validation
 
 Requests and responses reject unknown protobuf fields recursively. FailureCode
 accepts only declared nonzero values. The SDK validates required result variants,
 completion evidence, document envelopes and indexes. A Failure leads to a
 resend only as described under
-[Resending refused records](streaming.md#resending-refused-records), and never changes
+[Resending records](streaming.md#resending-records), and never changes
 confirmed MutationApplied evidence.
 A malformed later response preserves previously confirmed results.

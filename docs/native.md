@@ -70,4 +70,7 @@ available. NativeResponseComplete means all response bytes arrived. Its status/b
 can report a backend error such as HTTP 404 with no Go error; interpret that data
 separately. A validated terminal is retained alongside a later RPC error. A
 Client sends a Native request again only after a refused NativeNotStarted without
-a Response.
+a Response. `NativeResult.Err` returns nil for a complete response and an
+`*Error` otherwise; one that began and ended with UNAVAILABLE or without its end
+is marked `ErrInterrupted`. A Native call cut short by a lost connection returns
+an error marked `ErrInterrupted` too.

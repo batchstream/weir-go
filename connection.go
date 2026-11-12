@@ -28,8 +28,8 @@ var ErrClosed = errors.New("Weir client is closed")
 // Client sends business requests to the Weir servers behind one application
 // address. Every server behind the address must host the Stores the client
 // uses. Reuse a Client across goroutines and close it after callers finish.
-// It sends a record again only when a server refused it before it began, and
-// never one that may have taken effect.
+// It sends a record again only when it took no effect, as when a server
+// refused it before it began, and never one that may have taken effect.
 type Client struct {
 	connection *grpc.ClientConn
 	store      pb.StoreServiceClient
@@ -132,7 +132,8 @@ func (c *Client) storeClient() (pb.StoreServiceClient, error) {
 
 // callError reports a call that ended with its context as the context's error,
 // whether it used a shared stream or a stream of its own. The server enforces
-// the propagated deadline too, so its status can arrive before ctx expires.
+// the propagated deadline too, so its status can arrive before ctx expires. A
+// lost connection is marked ErrInterrupted and keeps its gRPC status.
 func callError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -142,6 +143,9 @@ func callError(ctx context.Context, err error) error {
 	}
 	if _, bounded := ctx.Deadline(); bounded && status.Code(err) == codes.DeadlineExceeded {
 		return context.DeadlineExceeded
+	}
+	if status.Code(err) == codes.Unavailable {
+		return fmt.Errorf("%w: %w", ErrInterrupted, err)
 	}
 	return err
 }

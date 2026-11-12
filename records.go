@@ -45,8 +45,8 @@ func (c *Client) Read(ctx context.Context, store string, options ...ReadOption) 
 //
 // A single mutation without WithNext, WithMutateConsume or outgoing gRPC metadata
 // shares long-lived streams with concurrent calls. Any other Mutate uses a gRPC
-// stream of its own that follows the Client's servers. A mutation a server refused
-// is sent again; nothing else is.
+// stream of its own that follows the Client's servers. A mutation a server refused,
+// or one that lost to concurrent writers, is sent again; nothing else is.
 func (c *Client) Mutate(ctx context.Context, store string, options ...MutateOption) ([]*MutationResult, error) {
 	config := applyOptions(options)
 	var completion *pb.MutationOptions
@@ -75,13 +75,14 @@ type recordKind[R comparable] struct {
 	result func(*pb.Event) R
 	// refused returns the result of a record a server turned away.
 	refused func(*pb.Failure) R
-	// isRefused reports a result a server may accept later.
-	isRefused func(R) bool
+	// resend returns why the Client sends a result's record again: a server
+	// may accept it later, or a mutation lost to concurrent writers.
+	resend func(R) resendCause
 }
 
-var readKind = recordKind[*ReadResult]{name: "Read", read: true, result: readEventResult, refused: readResultOfRefusal, isRefused: readRefused}
+var readKind = recordKind[*ReadResult]{name: "Read", read: true, result: readEventResult, refused: readResultOfRefusal, resend: onRefusal(readRefused)}
 
-var mutateKind = recordKind[*MutationResult]{name: "Mutate", result: mutationEventResult, refused: mutationResultOfRefusal, isRefused: mutationRefused}
+var mutateKind = recordKind[*MutationResult]{name: "Mutate", result: mutationEventResult, refused: mutationResultOfRefusal, resend: mutationResend}
 
 func readEventResult(event *pb.Event) *ReadResult {
 	wire := event.GetReadResult()
@@ -132,7 +133,7 @@ func runRecords[Q any, R comparable](ctx context.Context, c *Client, call record
 		key := laneKey{store: call.store, read: call.kind.read}
 		send := call.sender(c, key)
 		once := func() (R, error) { return send(ctx, last, nil) }
-		results[0], err = resendRefused(ctx, c, call.kind.isRefused, once)
+		results[0], err = withResends(ctx, c, call.kind.resend, once)
 		return results, err
 	}
 	produced := 0
@@ -168,7 +169,7 @@ func runRecords[Q any, R comparable](ctx context.Context, c *Client, call record
 	}
 	key := c.lanes.ownKey(call.store, call.kind.read)
 	// Next may block, so only requests it cannot follow wait to share a message.
-	stream := clientStreamOptions[R]{key: key, known: call.next == nil, next: next, send: call.sender(c, key), refused: call.kind.isRefused, consume: consume}
+	stream := clientStreamOptions[R]{key: key, known: call.next == nil, next: next, send: call.sender(c, key), resend: call.kind.resend, consume: consume}
 	err = runClientStream(ctx, c, stream)
 	if call.consume == nil {
 		results = growResults(results, produced)
@@ -225,7 +226,7 @@ func (call recordCall[Q, R]) sender(c *Client, key laneKey) func(context.Context
 			return call.kind.alone(ctx, c, call.store, command)
 		}
 		if err != nil {
-			return none, err
+			return none, callError(ctx, err)
 		}
 		return call.kind.result(event), nil
 	}
