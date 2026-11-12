@@ -174,7 +174,18 @@ func (c Collection[K, T]) write(ctx context.Context, action weir.MutationAction,
 		return errors.New("mongodb: document is nil")
 	}
 	segment, stored := key(id)
-	encoded, err := recordDocument(stored, document)
+	value := any(document)
+	if reflect.TypeFor[T]().Kind() == reflect.Interface {
+		// The generic API adds this pointer, not the caller's document. An
+		// interface's concrete value must reach bson.Marshal directly so its
+		// top-level Marshaler hook keeps precedence over ValueMarshaler.
+		value = *document
+		concrete := reflect.ValueOf(value)
+		if !concrete.IsValid() || concrete.Kind() == reflect.Pointer && concrete.IsNil() {
+			return errors.New("mongodb: document is nil")
+		}
+	}
+	encoded, err := recordDocument(stored, value)
 	if err != nil {
 		return fmt.Errorf("mongodb: encode %s %v: %w", c.Name, id, err)
 	}
