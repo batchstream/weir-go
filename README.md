@@ -108,7 +108,7 @@ This writes one record to MongoDB through Weir and reads it back.
 mkdir hello
 cd hello
 go mod init example.com/hello
-go get github.com/batchstream/weir-go@v0.24.1 go.mongodb.org/mongo-driver/v2/bson
+go get github.com/batchstream/weir-go@v0.25.0 go.mongodb.org/mongo-driver/v2/bson
 ```
 
 **Step 3.** Save this as `main.go`.
