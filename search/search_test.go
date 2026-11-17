@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	weir "github.com/batchstream/weir-go"
@@ -188,6 +189,125 @@ func TestFailedWritesReportTheirCode(t *testing.T) {
 	}
 	if err := products.Replace(t.Context(), "p1", nil); err == nil {
 		t.Fatal("nil document accepted")
+	}
+}
+
+func TestSearchReportsPartialResponsesAndPreservesHits(t *testing.T) {
+	shardFailure := `{"shard":1,"index":"products","node":"node-1","reason":{"type":"query_shard_exception","reason":"query failed","caused_by":{"type":"illegal_argument_exception","reason":"bad field"}}}`
+	hit := `{"_id":"p1","_score":1.5,"sort":[9007199254740993,"lamp"],"_source":{"name":"lamp","price":30}}`
+	tests := []struct {
+		name          string
+		body          string
+		timedOut      bool
+		failedShards  int
+		shardFailures []string
+		// clusters holds the skipped, partial and failed cluster counts.
+		clusters [3]int
+		hitCount int
+	}{
+		{
+			name:     "timeout with empty hits",
+			body:     `{"timed_out":true,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"hits":[]}}`,
+			timedOut: true,
+		},
+		{
+			name:          "failed shards with partial hits",
+			body:          `{"timed_out":false,"_shards":{"total":2,"successful":1,"failed":1,"failures":[` + shardFailure + `]},"hits":{"hits":[` + hit + `]}}`,
+			failedShards:  1,
+			shardFailures: []string{shardFailure},
+			hitCount:      1,
+		},
+		{
+			name:          "timeout and failed shards",
+			body:          `{"timed_out":true,"_shards":{"total":2,"successful":1,"failed":1,"failures":[` + shardFailure + `]},"hits":{"hits":[` + hit + `]}}`,
+			timedOut:      true,
+			failedShards:  1,
+			shardFailures: []string{shardFailure},
+			hitCount:      1,
+		},
+		{
+			name:         "failed shards without failure details",
+			body:         `{"_shards":{"failed":2},"hits":{"hits":[]}}`,
+			failedShards: 2,
+		},
+		{
+			name:     "skipped remote cluster",
+			body:     `{"timed_out":false,"_shards":{"total":1,"successful":1,"failed":0},"_clusters":{"total":2,"successful":1,"skipped":1},"hits":{"hits":[` + hit + `]}}`,
+			clusters: [3]int{1, 0, 0},
+			hitCount: 1,
+		},
+		{
+			name:     "partial and failed clusters",
+			body:     `{"timed_out":false,"_shards":{"total":2,"successful":2,"failed":0},"_clusters":{"total":3,"successful":1,"skipped":0,"running":0,"partial":1,"failed":1},"hits":{"hits":[]}}`,
+			clusters: [3]int{0, 1, 1},
+		},
+		{
+			name:     "complete response",
+			body:     `{"timed_out":false,"_shards":{"total":3,"successful":3,"skipped":1,"failed":0},"hits":{"hits":[` + hit + `]}}`,
+			hitCount: 1,
+		},
+		{
+			name:     "complete cross-cluster response",
+			body:     `{"timed_out":false,"_shards":{"total":2,"successful":2,"failed":0},"_clusters":{"total":2,"successful":2,"skipped":0,"running":0,"partial":0,"failed":0},"hits":{"hits":[` + hit + `]}}`,
+			hitCount: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &recorder{t: t}
+			r.answer = func(*pb.Command) []*pb.Event { return httpResponse("200 OK", tt.body) }
+			products := r.products()
+			query := map[string]any{"query": map[string]any{"match_all": map[string]any{}}}
+			found, err := products.Search(t.Context(), query)
+			if tt.timedOut || tt.failedShards > 0 || tt.clusters != [3]int{} {
+				var partial *PartialResponseError
+				if !errors.As(err, &partial) {
+					t.Fatalf("expected *PartialResponseError, got %v", err)
+				}
+				if partial.TimedOut != tt.timedOut || partial.FailedShards != tt.failedShards {
+					t.Fatal("wrong incompleteness details", partial)
+				}
+				clusters := [3]int{partial.SkippedClusters, partial.PartialClusters, partial.FailedClusters}
+				if clusters != tt.clusters {
+					t.Fatal("wrong cluster details", partial)
+				}
+				if len(partial.ShardFailures) != len(tt.shardFailures) {
+					t.Fatal("wrong shard failures", partial.ShardFailures)
+				}
+				for n, failure := range partial.ShardFailures {
+					if string(failure) != tt.shardFailures[n] {
+						t.Fatal("shard failure details changed", string(failure))
+					}
+				}
+			} else if err != nil {
+				t.Fatal("complete response failed", err)
+			}
+			if len(found) != tt.hitCount {
+				t.Fatal("wrong hits", found)
+			}
+			if tt.hitCount > 0 {
+				if found[0].ID != "p1" || found[0].Score != 1.5 || found[0].Document == nil || found[0].Document.Name != "lamp" || found[0].Document.Price != 30 {
+					t.Fatal("hit changed", found[0])
+				}
+				if len(found[0].Sort) != 2 || string(found[0].Sort[0]) != "9007199254740993" || string(found[0].Sort[1]) != `"lamp"` {
+					t.Fatal("sort values changed", found[0].Sort)
+				}
+			}
+		})
+	}
+}
+
+func TestSearchRejectsResponsesWithoutHits(t *testing.T) {
+	bodies := []string{`null`, `{}`, `{"hits":null}`, `{"hits":{}}`, `{"hits":{"hits":null}}`, `{"timed_out":true}`}
+	for _, body := range bodies {
+		r := &recorder{t: t}
+		r.answer = func(*pb.Command) []*pb.Event { return httpResponse("200 OK", body) }
+		products := r.products()
+		query := map[string]any{"query": map[string]any{"match_all": map[string]any{}}}
+		found, err := products.Search(t.Context(), query)
+		if err == nil || found != nil || !strings.Contains(err.Error(), "no hits.hits array") {
+			t.Fatalf("accepted %s: %v, %v", body, found, err)
+		}
 	}
 }
 

@@ -20,7 +20,10 @@
 // Set a deadline on every context. A failed record is a *weir.Error: check it
 // with weir.CodeOf, and with errors.Is against weir.ErrNotFound and
 // weir.ErrInterrupted. The package keeps no state of its own; Cluster and
-// Index are plain values that are safe to copy and share.
+// Index are plain values that are safe to copy and share. Search returns
+// decoded hits alongside a *PartialResponseError when the backend times out,
+// reports failed shards or does not search every cluster of a cross-cluster
+// search, even with a successful HTTP status.
 package search
 
 import (
@@ -63,6 +66,34 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("search: status %d: %s", e.StatusCode, e.Body)
+}
+
+// PartialResponseError reports that Search received an incomplete response,
+// even though its HTTP status indicated success. Search returns any decoded
+// hits alongside this error; they are not a complete result set.
+// Inspect it with errors.As.
+type PartialResponseError struct {
+	TimedOut     bool
+	FailedShards int
+	// ShardFailures holds each _shards.failures entry as its original JSON,
+	// including any backend-specific reason details. It may be absent even
+	// when FailedShards is nonzero.
+	ShardFailures []json.RawMessage
+	// SkippedClusters, PartialClusters and FailedClusters count the clusters
+	// of a cross-cluster search that _clusters reports as skipped, such as an
+	// unavailable cluster with skip_unavailable, as returning partial results,
+	// or as failed. They are zero for a search of one cluster.
+	SkippedClusters int
+	PartialClusters int
+	FailedClusters  int
+}
+
+func (e *PartialResponseError) Error() string {
+	message := fmt.Sprintf("search: incomplete response: timed_out=%t, failed_shards=%d", e.TimedOut, e.FailedShards)
+	if e.SkippedClusters > 0 || e.PartialClusters > 0 || e.FailedClusters > 0 {
+		message += fmt.Sprintf(", skipped_clusters=%d, partial_clusters=%d, failed_clusters=%d", e.SkippedClusters, e.PartialClusters, e.FailedClusters)
+	}
+	return message
 }
 
 // Do sends one HTTP request to the cluster and returns its response, whatever

@@ -128,6 +128,11 @@ func (i Index[T]) Transform(ctx context.Context, id string, program string, inpu
 
 // Search sends a search request body, such as {"query": ..., "size": 10}, to
 // the index and returns its hits. A status of 300 or more is a *StatusError.
+// A timed-out response, failed shards, or a skipped, partial or failed cluster
+// of a cross-cluster search returns the decoded hits alongside a
+// *PartialResponseError, even with a successful HTTP status. These hits may be
+// incomplete, including an empty slice that does not establish no matches. A
+// response without a hits.hits array is a decoding error, not an empty result.
 // Sort holds a hit's sort values exactly, to pass back as search_after.
 func (i Index[T]) Search(ctx context.Context, body any) ([]Hit[T], error) {
 	response, err := i.Do(ctx, http.MethodPost, "/_search", body)
@@ -139,14 +144,42 @@ func (i Index[T]) Search(ctx context.Context, body any) ([]Hit[T], error) {
 		return nil, failed
 	}
 	var result struct {
+		TimedOut bool `json:"timed_out"`
+		Shards   struct {
+			Failed   int               `json:"failed"`
+			Failures []json.RawMessage `json:"failures"`
+		} `json:"_shards"`
+		// Clusters is present only for a cross-cluster search.
+		Clusters struct {
+			Skipped int `json:"skipped"`
+			Partial int `json:"partial"`
+			Failed  int `json:"failed"`
+		} `json:"_clusters"`
+		// Hits stays nil when the response has no hits.hits array or it is null.
 		Hits struct {
-			Hits []Hit[T] `json:"hits"`
+			Hits *[]Hit[T] `json:"hits"`
 		} `json:"hits"`
 	}
 	if err := json.Unmarshal(response.Body, &result); err != nil {
 		return nil, fmt.Errorf("search: decode %s hits: %w", i.Name, err)
 	}
-	return result.Hits.Hits, nil
+	if result.Hits.Hits == nil {
+		return nil, fmt.Errorf("search: decode %s hits: response has no hits.hits array", i.Name)
+	}
+	hits := *result.Hits.Hits
+	clusters := result.Clusters
+	if result.TimedOut || result.Shards.Failed > 0 || clusters.Skipped > 0 || clusters.Partial > 0 || clusters.Failed > 0 {
+		partial := &PartialResponseError{
+			TimedOut:        result.TimedOut,
+			FailedShards:    result.Shards.Failed,
+			ShardFailures:   result.Shards.Failures,
+			SkippedClusters: clusters.Skipped,
+			PartialClusters: clusters.Partial,
+			FailedClusters:  clusters.Failed,
+		}
+		return hits, partial
+	}
+	return hits, nil
 }
 
 // Do sends one HTTP request to the index and returns its response, whatever
