@@ -21,8 +21,9 @@
 // with weir.CodeOf, and with errors.Is against weir.ErrNotFound and
 // weir.ErrInterrupted. The package keeps no state of its own; Cluster and
 // Index are plain values that are safe to copy and share. Search returns
-// decoded hits alongside a *PartialResponseError when the backend times out
-// or reports failed shards, even with a successful HTTP status.
+// decoded hits alongside a *PartialResponseError when the backend times out,
+// reports failed shards or does not search every cluster of a cross-cluster
+// search, even with a successful HTTP status.
 package search
 
 import (
@@ -78,10 +79,21 @@ type PartialResponseError struct {
 	// including any backend-specific reason details. It may be absent even
 	// when FailedShards is nonzero.
 	ShardFailures []json.RawMessage
+	// SkippedClusters, PartialClusters and FailedClusters count the clusters
+	// of a cross-cluster search that _clusters reports as skipped, such as an
+	// unavailable cluster with skip_unavailable, as returning partial results,
+	// or as failed. They are zero for a search of one cluster.
+	SkippedClusters int
+	PartialClusters int
+	FailedClusters  int
 }
 
 func (e *PartialResponseError) Error() string {
-	return fmt.Sprintf("search: incomplete response: timed_out=%t, failed_shards=%d", e.TimedOut, e.FailedShards)
+	message := fmt.Sprintf("search: incomplete response: timed_out=%t, failed_shards=%d", e.TimedOut, e.FailedShards)
+	if e.SkippedClusters > 0 || e.PartialClusters > 0 || e.FailedClusters > 0 {
+		message += fmt.Sprintf(", skipped_clusters=%d, partial_clusters=%d, failed_clusters=%d", e.SkippedClusters, e.PartialClusters, e.FailedClusters)
+	}
+	return message
 }
 
 // Do sends one HTTP request to the cluster and returns its response, whatever
