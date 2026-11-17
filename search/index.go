@@ -128,6 +128,9 @@ func (i Index[T]) Transform(ctx context.Context, id string, program string, inpu
 
 // Search sends a search request body, such as {"query": ..., "size": 10}, to
 // the index and returns its hits. A status of 300 or more is a *StatusError.
+// A timed-out response or failed shards returns the decoded hits alongside a
+// *PartialResponseError, even with a successful HTTP status. These hits may be
+// incomplete, including an empty slice that does not establish no matches.
 // Sort holds a hit's sort values exactly, to pass back as search_after.
 func (i Index[T]) Search(ctx context.Context, body any) ([]Hit[T], error) {
 	response, err := i.Do(ctx, http.MethodPost, "/_search", body)
@@ -139,12 +142,25 @@ func (i Index[T]) Search(ctx context.Context, body any) ([]Hit[T], error) {
 		return nil, failed
 	}
 	var result struct {
+		TimedOut bool `json:"timed_out"`
+		Shards   struct {
+			Failed   int               `json:"failed"`
+			Failures []json.RawMessage `json:"failures"`
+		} `json:"_shards"`
 		Hits struct {
 			Hits []Hit[T] `json:"hits"`
 		} `json:"hits"`
 	}
 	if err := json.Unmarshal(response.Body, &result); err != nil {
 		return nil, fmt.Errorf("search: decode %s hits: %w", i.Name, err)
+	}
+	if result.TimedOut || result.Shards.Failed > 0 {
+		partial := &PartialResponseError{
+			TimedOut:      result.TimedOut,
+			FailedShards:  result.Shards.Failed,
+			ShardFailures: result.Shards.Failures,
+		}
+		return result.Hits.Hits, partial
 	}
 	return result.Hits.Hits, nil
 }

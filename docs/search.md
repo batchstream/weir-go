@@ -80,6 +80,30 @@ if len(hits) > 0 {
 }
 ```
 
+A successful HTTP status does not guarantee a complete search. If the backend
+reports `timed_out: true` or `_shards.failed > 0`, `Search` returns a
+`*search.PartialResponseError` **and any decoded hits**. An empty hit slice in
+this case does not mean there were no matches. A caller requiring complete
+results must reject these hits; a best-effort caller may explicitly choose to
+use them after inspecting the error with `errors.As`:
+
+```go
+hits, err := products.Search(ctx, query)
+if err != nil {
+    var partial *search.PartialResponseError
+    if !errors.As(err, &partial) { return err }
+    // This caller accepts incomplete results; hits may still be empty.
+    log.Printf("partial search: timed_out=%t failed_shards=%d", partial.TimedOut, partial.FailedShards)
+}
+```
+
+`TimedOut` and `FailedShards` report the backend's completion metadata.
+`ShardFailures` holds each `_shards.failures` entry as `json.RawMessage`,
+preserving its shard, index and backend-specific reason details. The backend
+may omit these entries even when `FailedShards` is nonzero. This error does not
+trigger an automatic retry. Complete responses still return hits and a nil
+error; HTTP status and JSON decoding errors retain their existing behavior.
+
 ## HTTP requests
 
 `Index.Do` sends any HTTP request with a path relative to the index, such as
@@ -113,6 +137,7 @@ as it is for a search.
 | `*weir.Error` | A record failed. `weir.CodeOf(err)` gives its `FailureCode`, and `Outcome` tells whether a write applied. |
 | `weir.ErrInterrupted` | An outage cut the request short, so it may succeed later. It may have run: never send a write again without checking. |
 | `*search.StatusError` | `Search` got a status of 300 or more |
+| `*search.PartialResponseError` | `Search` timed out or had failed shards despite a successful HTTP status. Any returned hits may be incomplete. |
 
 A write certainly took no effect only when its `*weir.Error` has the `Outcome`
 `MutationNotStarted` or `MutationNotApplied`, or, for a request, the

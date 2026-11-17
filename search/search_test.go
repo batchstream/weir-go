@@ -191,6 +191,89 @@ func TestFailedWritesReportTheirCode(t *testing.T) {
 	}
 }
 
+func TestSearchReportsPartialResponsesAndPreservesHits(t *testing.T) {
+	shardFailure := `{"shard":1,"index":"products","node":"node-1","reason":{"type":"query_shard_exception","reason":"query failed","caused_by":{"type":"illegal_argument_exception","reason":"bad field"}}}`
+	hit := `{"_id":"p1","_score":1.5,"sort":[9007199254740993,"lamp"],"_source":{"name":"lamp","price":30}}`
+	tests := []struct {
+		name          string
+		body          string
+		timedOut      bool
+		failedShards  int
+		shardFailures []string
+		hitCount      int
+	}{
+		{
+			name:     "timeout with empty hits",
+			body:     `{"timed_out":true,"_shards":{"total":1,"successful":1,"failed":0},"hits":{"hits":[]}}`,
+			timedOut: true,
+		},
+		{
+			name:          "failed shards with partial hits",
+			body:          `{"timed_out":false,"_shards":{"total":2,"successful":1,"failed":1,"failures":[` + shardFailure + `]},"hits":{"hits":[` + hit + `]}}`,
+			failedShards:  1,
+			shardFailures: []string{shardFailure},
+			hitCount:      1,
+		},
+		{
+			name:          "timeout and failed shards",
+			body:          `{"timed_out":true,"_shards":{"total":2,"successful":1,"failed":1,"failures":[` + shardFailure + `]},"hits":{"hits":[` + hit + `]}}`,
+			timedOut:      true,
+			failedShards:  1,
+			shardFailures: []string{shardFailure},
+			hitCount:      1,
+		},
+		{
+			name:         "failed shards without failure details",
+			body:         `{"_shards":{"failed":2},"hits":{"hits":[]}}`,
+			failedShards: 2,
+		},
+		{
+			name:     "complete response",
+			body:     `{"timed_out":false,"_shards":{"total":3,"successful":3,"skipped":1,"failed":0},"hits":{"hits":[` + hit + `]}}`,
+			hitCount: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &recorder{t: t}
+			r.answer = func(*pb.Command) []*pb.Event { return httpResponse("200 OK", tt.body) }
+			products := r.products()
+			query := map[string]any{"query": map[string]any{"match_all": map[string]any{}}}
+			found, err := products.Search(t.Context(), query)
+			if tt.timedOut || tt.failedShards > 0 {
+				var partial *PartialResponseError
+				if !errors.As(err, &partial) {
+					t.Fatalf("expected *PartialResponseError, got %v", err)
+				}
+				if partial.TimedOut != tt.timedOut || partial.FailedShards != tt.failedShards {
+					t.Fatal("wrong incompleteness details", partial)
+				}
+				if len(partial.ShardFailures) != len(tt.shardFailures) {
+					t.Fatal("wrong shard failures", partial.ShardFailures)
+				}
+				for n, failure := range partial.ShardFailures {
+					if string(failure) != tt.shardFailures[n] {
+						t.Fatal("shard failure details changed", string(failure))
+					}
+				}
+			} else if err != nil {
+				t.Fatal("complete response failed", err)
+			}
+			if len(found) != tt.hitCount {
+				t.Fatal("wrong hits", found)
+			}
+			if tt.hitCount > 0 {
+				if found[0].ID != "p1" || found[0].Score != 1.5 || found[0].Document == nil || found[0].Document.Name != "lamp" || found[0].Document.Price != 30 {
+					t.Fatal("hit changed", found[0])
+				}
+				if len(found[0].Sort) != 2 || string(found[0].Sort[0]) != "9007199254740993" || string(found[0].Sort[1]) != `"lamp"` {
+					t.Fatal("sort values changed", found[0].Sort)
+				}
+			}
+		})
+	}
+}
+
 func TestSearchDecodesHitsAndKeepsSortValuesExact(t *testing.T) {
 	hits := `{"hits":{"total":{"value":2},"hits":[
 		{"_id":"p1","_score":null,"sort":[9007199254740993,"lamp"],"_source":{"name":"lamp","price":30}},

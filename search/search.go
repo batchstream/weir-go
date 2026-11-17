@@ -20,7 +20,9 @@
 // Set a deadline on every context. A failed record is a *weir.Error: check it
 // with weir.CodeOf, and with errors.Is against weir.ErrNotFound and
 // weir.ErrInterrupted. The package keeps no state of its own; Cluster and
-// Index are plain values that are safe to copy and share.
+// Index are plain values that are safe to copy and share. Search returns
+// decoded hits alongside a *PartialResponseError when the backend times out
+// or reports failed shards, even with a successful HTTP status.
 package search
 
 import (
@@ -63,6 +65,23 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("search: status %d: %s", e.StatusCode, e.Body)
+}
+
+// PartialResponseError reports that Search received an incomplete response,
+// even though its HTTP status indicated success. Search returns any decoded
+// hits alongside this error; they are not a complete result set.
+// Inspect it with errors.As.
+type PartialResponseError struct {
+	TimedOut     bool
+	FailedShards int
+	// ShardFailures holds each _shards.failures entry as its original JSON,
+	// including any backend-specific reason details. It may be absent even
+	// when FailedShards is nonzero.
+	ShardFailures []json.RawMessage
+}
+
+func (e *PartialResponseError) Error() string {
+	return fmt.Sprintf("search: incomplete response: timed_out=%t, failed_shards=%d", e.TimedOut, e.FailedShards)
 }
 
 // Do sends one HTTP request to the cluster and returns its response, whatever
