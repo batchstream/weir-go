@@ -3,6 +3,7 @@ package mongodb
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -146,8 +147,16 @@ func TestCursorPreservesExplicitSessionAndTransaction(t *testing.T) {
 			id := bson.Binary{Subtype: 4, Data: []byte("0123456789abcdef")}
 			session := bson.D{{Key: "id", Value: id}}
 			concern := bson.D{{Key: "level", Value: "majority"}}
-			find := bson.D{{Key: "find", Value: "users"}, {Key: "lsid", Value: session}, {Key: "batchSize", Value: 1}, {Key: "readConcern", Value: concern}}
-			keys := []string{"lsid"}
+			find := bson.D{
+				{Key: "find", Value: "users"},
+				{Key: "lsid", Value: session},
+				{Key: "batchSize", Value: 1},
+				{Key: "readConcern", Value: concern},
+				{Key: "apiVersion", Value: "1"},
+				{Key: "apiStrict", Value: true},
+				{Key: "apiDeprecationErrors", Value: true},
+			}
+			keys := []string{"lsid", "apiVersion", "apiStrict", "apiDeprecationErrors"}
 			if test.transaction {
 				transaction := bson.D{{Key: "txnNumber", Value: int64(7)}, {Key: "autocommit", Value: false}, {Key: "startTransaction", Value: true}}
 				find = append(find, transaction...)
@@ -186,10 +195,23 @@ func TestCursorPreservesExplicitSessionAndTransaction(t *testing.T) {
 						t.Fatalf("lost %s in continuation: %v", key, raw)
 					}
 				}
-				for _, key := range []string{"startTransaction", "readConcern", "batchSize"} {
+				for _, key := range []string{"startTransaction", "readConcern"} {
 					if raw.Lookup(key).Type != 0 {
 						t.Fatalf("copied initial-only %s into continuation: %v", key, raw)
 					}
+				}
+				want, got := original.Lookup("batchSize"), raw.Lookup("batchSize")
+				switch name := command(t, sent)[0].Key; name {
+				case "getMore":
+					if got.Type != want.Type || !bytes.Equal(got.Value, want.Value) {
+						t.Fatalf("getMore lost batchSize: %v", raw)
+					}
+				case "killCursors":
+					if got.Type != 0 {
+						t.Fatalf("copied batchSize into cleanup: %v", raw)
+					}
+				default:
+					t.Fatal("unexpected continuation", name)
 				}
 			}
 			if got := cursors.killed[0][1].Value.(bson.A)[0]; got != int64(2) {
@@ -199,6 +221,75 @@ func TestCursorPreservesExplicitSessionAndTransaction(t *testing.T) {
 				t.Fatal("encoded the original command more than once", custom.calls)
 			}
 		})
+	}
+}
+
+func TestGetMoreRepeatsAPositiveBatchSize(t *testing.T) {
+	pipeline := bson.E{Key: "pipeline", Value: bson.A{}}
+	tests := []struct {
+		name    string
+		command bson.D
+		want    any
+	}{
+		{
+			name:    "find",
+			command: bson.D{{Key: "find", Value: "users"}, {Key: "batchSize", Value: int64(2)}},
+			want:    int64(2),
+		},
+		{
+			name:    "aggregate",
+			command: bson.D{{Key: "aggregate", Value: "users"}, pipeline, {Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(3)}}}},
+			want:    int32(3),
+		},
+		{
+			name:    "server default",
+			command: bson.D{{Key: "aggregate", Value: "users"}, pipeline, {Key: "cursor", Value: bson.D{}}},
+		},
+		{
+			name:    "empty first batch",
+			command: bson.D{{Key: "find", Value: "users"}, {Key: "batchSize", Value: int32(0)}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cursors := &cursorServer{t: t, batches: [][]string{{"a"}, {"b"}, {"c"}}, failAt: -1}
+			r := &recorder{t: t, answer: cursors.answer}
+			for _, err := range r.db().Cursor(t.Context(), test.command) {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(r.commands) != 3 {
+				t.Fatal("expected the opening command and two getMores", r.commands)
+			}
+			for _, sent := range r.commands[1:] {
+				var size any
+				for _, field := range command(t, sent) {
+					if field.Key == "batchSize" {
+						size = field.Value
+					}
+				}
+				if size != test.want {
+					t.Fatalf("getMore batchSize = %#v, want %#v", size, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestCursorFieldsDoNotRetainTheEncodedCommand(t *testing.T) {
+	session := bson.D{{Key: "id", Value: "session"}}
+	find := bson.D{{Key: "find", Value: "users"}, {Key: "lsid", Value: session}, {Key: "apiVersion", Value: "1"}, {Key: "batchSize", Value: int32(5)}}
+	data := bson.Raw(bsonDocument(t, find).Data)
+	fields := readCursorFields(data)
+	kept := slices.Concat(fields.shared, fields.batchSize)
+	if len(kept) != 3 {
+		t.Fatal("wrong cursor fields", kept)
+	}
+	want := bsonDocument(t, kept).Data
+	clear(data)
+	if got := bsonDocument(t, kept).Data; !bytes.Equal(got, want) {
+		t.Fatal("cursor fields share memory with the encoded command")
 	}
 }
 

@@ -112,9 +112,13 @@ A reply with `ok: 0`, `writeErrors` or a `writeConcernError` comes back together
 with a `*CommandError` holding its code, code name and message. `DB.Cursor` takes
 an ordered command that opens a cursor, such as `aggregate` or `listIndexes`,
 and yields its documents the way `Find` does. Its `getMore` and cleanup commands
-retain an explicit `lsid`, `txnNumber` and `autocommit` from the opening command,
-but do not repeat `startTransaction`. The cursor is cleaned up if the loop exits
-early, returns an error or panics, even after the caller's context is canceled.
+repeat an explicit `lsid`, `txnNumber`, `autocommit`, `apiVersion`, `apiStrict`
+and `apiDeprecationErrors` from the opening command, but do not repeat
+`startTransaction`. Each `getMore` also repeats a positive batch size, from
+`batchSize` for `find` or `cursor.batchSize` for `aggregate` and the list
+commands, so later batches stay as small as the first. The cursor is cleaned up
+if the loop exits early, returns an error or panics, even after the caller's
+context is canceled.
 
 ```go
 create := bson.D{{Key: "create", Value: "users"}}

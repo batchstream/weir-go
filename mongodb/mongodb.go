@@ -26,6 +26,7 @@
 package mongodb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -125,10 +126,11 @@ func (db DB) command(ctx context.Context, data bson.Raw) (bson.Raw, error) {
 }
 
 // Cursor runs an ordered command that opens a cursor, such as find, aggregate
-// or listIndexes, and yields its documents. It preserves explicit session and
-// transaction fields on getMore and cleanup commands. It sends getMore until
-// the cursor ends, and kills the cursor when the loop stops early, fails or
-// panics. An error ends the sequence.
+// or listIndexes, and yields its documents. Its getMore and cleanup commands
+// repeat the explicit session, transaction and Stable API fields of the
+// command, and each getMore repeats a positive batch size. It sends getMore
+// until the cursor ends, and kills the cursor when the loop stops early, fails
+// or panics. An error ends the sequence.
 func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error] {
 	documents := func(yield func(bson.Raw, error) bool) {
 		data, err := marshalCommand(command)
@@ -136,7 +138,7 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 			yield(nil, err)
 			return
 		}
-		session := cursorSession(data)
+		fields := readCursorFields(data)
 		reply, err := db.command(ctx, data)
 		if err != nil {
 			yield(nil, err)
@@ -149,7 +151,7 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 		}
 		space := parseNamespace(page.Cursor.Namespace)
 		batch, cursor := page.Cursor.FirstBatch, page.Cursor.ID
-		defer func() { db.killCursor(ctx, space, cursor, session) }()
+		defer func() { db.killCursor(ctx, space, cursor, fields.shared) }()
 		for {
 			for _, document := range batch {
 				if !yield(document, nil) {
@@ -160,14 +162,15 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 				return
 			}
 			getMore := bson.D{{Key: "getMore", Value: cursor}, {Key: "collection", Value: space.collection}, {Key: "$db", Value: space.database}}
-			getMore = append(getMore, session...)
+			getMore = append(getMore, fields.batchSize...)
+			getMore = append(getMore, fields.shared...)
 			reply, err := db.Command(ctx, getMore)
 			var next cursorPage
 			if err == nil {
 				next, err = readPage(reply)
 			}
 			if err != nil {
-				db.killCursor(ctx, space, cursor, session)
+				db.killCursor(ctx, space, cursor, fields.shared)
 				cursor = 0
 				yield(nil, err)
 				return
@@ -178,18 +181,50 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 	return documents
 }
 
-// cursorSession retains only fields needed to continue the original session
-// or transaction. In particular, startTransaction belongs to the first command.
-func cursorSession(command bson.Raw) bson.D {
-	var session bson.D
-	for _, key := range []string{"lsid", "txnNumber", "autocommit"} {
+// sharedCursorKeys name the fields of a cursor's opening command that its
+// getMore and killCursors commands repeat: the explicit session, transaction
+// and Stable API fields, which MongoDB requires to stay the same. The
+// startTransaction field belongs to the first command only.
+var sharedCursorKeys = []string{"lsid", "txnNumber", "autocommit", "apiVersion", "apiStrict", "apiDeprecationErrors"}
+
+// cursorFields are the fields of a cursor's opening command that the commands
+// following it repeat.
+type cursorFields struct {
+	// shared go on every getMore and killCursors.
+	shared bson.D
+	// batchSize goes on every getMore, as MongoDB applies a batch size only to
+	// the reply of the command that names it.
+	batchSize bson.D
+}
+
+func readCursorFields(command bson.Raw) cursorFields {
+	var fields cursorFields
+	for _, key := range sharedCursorKeys {
 		value := command.Lookup(key)
 		if value.Type != 0 {
-			field := bson.E{Key: key, Value: value}
-			session = append(session, field)
+			field := bson.E{Key: key, Value: detach(value)}
+			fields.shared = append(fields.shared, field)
 		}
 	}
-	return session
+	// find names its batch size at the top level; aggregate and the list
+	// commands name it in their cursor option. A size of 0 asks only for an
+	// empty first batch, so it is not repeated.
+	size := command.Lookup("batchSize")
+	if size.Type == 0 {
+		size = command.Lookup("cursor", "batchSize")
+	}
+	if n, ok := size.AsInt64OK(); ok && n > 0 {
+		field := bson.E{Key: "batchSize", Value: detach(size)}
+		fields.batchSize = bson.D{field}
+	}
+	return fields
+}
+
+// detach copies a value out of the command it was read from, so a cursor does
+// not keep the whole encoded command alive while it runs.
+func detach(value bson.RawValue) bson.RawValue {
+	copied := bson.RawValue{Type: value.Type, Value: bytes.Clone(value.Value)}
+	return copied
 }
 
 // namespace names the collection of a cursor. Commands that follow the cursor
@@ -230,14 +265,14 @@ func readPage(reply bson.Raw) (cursorPage, error) {
 
 // killCursor releases a cursor a loop left open. The server also times idle
 // cursors out, so a failure here is ignored.
-func (db DB) killCursor(ctx context.Context, space namespace, cursor int64, session bson.D) {
+func (db DB) killCursor(ctx context.Context, space namespace, cursor int64, shared bson.D) {
 	if cursor == 0 {
 		return
 	}
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTimeout)
 	defer cancel()
 	command := bson.D{{Key: "killCursors", Value: space.collection}, {Key: "cursors", Value: bson.A{cursor}}, {Key: "$db", Value: space.database}}
-	command = append(command, session...)
+	command = append(command, shared...)
 	_, _ = db.Command(cleanup, command)
 }
 
