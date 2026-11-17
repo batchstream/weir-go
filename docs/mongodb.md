@@ -112,13 +112,15 @@ A reply with `ok: 0`, `writeErrors` or a `writeConcernError` comes back together
 with a `*CommandError` holding its code, code name and message. `DB.Cursor` takes
 an ordered command that opens a cursor, such as `aggregate` or `listIndexes`,
 and yields its documents the way `Find` does. Its `getMore` and cleanup commands
-repeat an explicit `lsid`, `txnNumber`, `autocommit`, `apiVersion`, `apiStrict`
-and `apiDeprecationErrors` from the opening command, but do not repeat
-`startTransaction`. Each `getMore` also repeats a positive batch size, from
-`batchSize` for `find` or `cursor.batchSize` for `aggregate` and the list
-commands, so later batches stay as small as the first. The cursor is cleaned up
-if the loop exits early, returns an error or panics, even after the caller's
-context is canceled.
+repeat an explicit `lsid`, `apiVersion`, `apiStrict` and `apiDeprecationErrors`
+from the opening command. Within a multi-document transaction, marked by
+`autocommit: false`, they also repeat `txnNumber` and `autocommit`, but not
+`startTransaction`. The `txnNumber` of a retryable write, such as `bulkWrite`,
+is not repeated, as MongoDB accepts it only on the write itself. Each `getMore`
+also repeats a positive batch size, from `batchSize` for `find` or
+`cursor.batchSize` for `aggregate` and the list commands, so later batches stay
+as small as the first. The cursor is cleaned up if the loop exits early,
+returns an error or panics, even after the caller's context is canceled.
 
 ```go
 create := bson.D{{Key: "create", Value: "users"}}

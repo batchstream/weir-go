@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"iter"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -127,10 +128,11 @@ func (db DB) command(ctx context.Context, data bson.Raw) (bson.Raw, error) {
 
 // Cursor runs an ordered command that opens a cursor, such as find, aggregate
 // or listIndexes, and yields its documents. Its getMore and cleanup commands
-// repeat the explicit session, transaction and Stable API fields of the
-// command, and each getMore repeats a positive batch size. It sends getMore
-// until the cursor ends, and kills the cursor when the loop stops early, fails
-// or panics. An error ends the sequence.
+// repeat the explicit session and Stable API fields of the command, and its
+// transaction fields within a multi-document transaction. Each getMore also
+// repeats a positive batch size. It sends getMore until the cursor ends, and
+// kills the cursor when the loop stops early, fails or panics. An error ends
+// the sequence.
 func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error] {
 	documents := func(yield func(bson.Raw, error) bool) {
 		data, err := marshalCommand(command)
@@ -182,10 +184,16 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 }
 
 // sharedCursorKeys name the fields of a cursor's opening command that its
-// getMore and killCursors commands repeat: the explicit session, transaction
-// and Stable API fields, which MongoDB requires to stay the same. The
+// getMore and killCursors commands repeat: the explicit session and Stable API
+// fields, which MongoDB requires to stay the same.
+var sharedCursorKeys = []string{"lsid", "apiVersion", "apiStrict", "apiDeprecationErrors"}
+
+// transactionCursorKeys name the fields that getMore and killCursors also
+// repeat inside a multi-document transaction, which autocommit: false marks.
+// A retryable write such as bulkWrite names a txnNumber too, but MongoDB
+// rejects one on getMore and killCursors outside a transaction. The
 // startTransaction field belongs to the first command only.
-var sharedCursorKeys = []string{"lsid", "txnNumber", "autocommit", "apiVersion", "apiStrict", "apiDeprecationErrors"}
+var transactionCursorKeys = []string{"txnNumber", "autocommit"}
 
 // cursorFields are the fields of a cursor's opening command that the commands
 // following it repeat.
@@ -199,7 +207,11 @@ type cursorFields struct {
 
 func readCursorFields(command bson.Raw) cursorFields {
 	var fields cursorFields
-	for _, key := range sharedCursorKeys {
+	keys := sharedCursorKeys
+	if autocommit, found := command.Lookup("autocommit").BooleanOK(); found && !autocommit {
+		keys = slices.Concat(sharedCursorKeys, transactionCursorKeys)
+	}
+	for _, key := range keys {
 		value := command.Lookup(key)
 		if value.Type != 0 {
 			field := bson.E{Key: key, Value: detach(value)}

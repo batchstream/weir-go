@@ -224,6 +224,49 @@ func TestCursorPreservesExplicitSessionAndTransaction(t *testing.T) {
 	}
 }
 
+func TestCursorDoesNotRepeatARetryableWriteTxnNumber(t *testing.T) {
+	id := bson.Binary{Subtype: 4, Data: []byte("0123456789abcdef")}
+	session := bson.D{{Key: "id", Value: id}}
+	insert := bson.D{{Key: "insert", Value: 0}, {Key: "document", Value: bson.D{{Key: "name", Value: "a"}}}}
+	namespace := bson.D{{Key: "ns", Value: "app.users"}}
+	bulkWrite := bson.D{
+		{Key: "bulkWrite", Value: 1},
+		{Key: "ops", Value: bson.A{insert, insert}},
+		{Key: "nsInfo", Value: bson.A{namespace}},
+		{Key: "cursor", Value: bson.D{{Key: "batchSize", Value: int32(1)}}},
+		{Key: "lsid", Value: session},
+		{Key: "txnNumber", Value: int64(1)},
+	}
+	cursors := &cursorServer{t: t, batches: [][]string{{"a"}, {"b"}, {"c"}}, failAt: -1}
+	r := &recorder{t: t, answer: cursors.answer}
+	seen := 0
+	for _, err := range r.db().Cursor(t.Context(), bulkWrite) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen++
+		if seen == 2 {
+			break
+		}
+	}
+	if len(r.commands) != 3 || len(cursors.killed) != 1 {
+		t.Fatal("expected bulkWrite, getMore and one cleanup", r.commands)
+	}
+	original := bson.Raw(r.commands[0].GetNative().GetRequest().GetData())
+	for _, sent := range r.commands[1:] {
+		raw := bson.Raw(sent.GetNative().GetRequest().GetData())
+		want, got := original.Lookup("lsid"), raw.Lookup("lsid")
+		if got.Type != want.Type || !bytes.Equal(got.Value, want.Value) {
+			t.Fatalf("lost lsid in continuation: %v", raw)
+		}
+		for _, key := range []string{"txnNumber", "autocommit"} {
+			if raw.Lookup(key).Type != 0 {
+				t.Fatalf("repeated a retryable write's %s: %v", key, raw)
+			}
+		}
+	}
+}
+
 func TestGetMoreRepeatsAPositiveBatchSize(t *testing.T) {
 	pipeline := bson.E{Key: "pipeline", Value: bson.A{}}
 	tests := []struct {
