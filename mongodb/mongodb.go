@@ -74,8 +74,9 @@ func (e *CommandError) Error() string {
 }
 
 // Command runs one command in the database and returns its reply. Commands
-// must preserve field order, with the command name first; multi-key maps are
-// rejected before sending. Use bson.D or another ordered BSON representation.
+// must preserve field order, with the command name first; multi-key maps without
+// custom BSON encoders are rejected before sending. Use bson.D or another
+// ordered BSON representation. Custom BSON encoders own their field order.
 // A reply with ok: 0, writeErrors or a writeConcernError comes with a *CommandError.
 // A command is sent again only when a server refused it before it began. One
 // a lost connection or an unavailable backend cut short reports
@@ -89,12 +90,15 @@ func (db DB) Command(ctx context.Context, command any) (bson.Raw, error) {
 }
 
 func marshalCommand(command any) (bson.Raw, error) {
-	value := reflect.ValueOf(command)
-	for value.IsValid() && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) {
-		value = value.Elem()
-	}
-	if value.IsValid() && value.Kind() == reflect.Map && value.Len() > 1 {
-		return nil, errors.New("mongodb: command must be ordered; use bson.D instead of a multi-key map")
+	// bson.Marshal gives an explicit document encoder control over field order.
+	if _, custom := command.(bson.Marshaler); !custom {
+		value := reflect.ValueOf(command)
+		for value.IsValid() && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) {
+			value = value.Elem()
+		}
+		if value.IsValid() && value.Kind() == reflect.Map && value.Len() > 1 {
+			return nil, errors.New("mongodb: command must be ordered; use bson.D instead of a multi-key map")
+		}
 	}
 	data, err := bson.Marshal(command)
 	if err != nil {
@@ -163,6 +167,8 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 				next, err = readPage(reply)
 			}
 			if err != nil {
+				db.killCursor(ctx, space, cursor, session)
+				cursor = 0
 				yield(nil, err)
 				return
 			}

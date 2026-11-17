@@ -101,10 +101,12 @@ estimate of a whole collection, run the `count` command with `DB.Command`.
 
 `DB.Command` runs any command in the database and returns its reply. Put the
 command name first in an ordered document such as `bson.D` or `bson.Raw`.
-Multi-key maps, including `bson.M`, are rejected before sending because MongoDB
-uses the first key to identify the command. Maps nested in a command's filter
-or other arguments are unaffected; single-key commands such as `bson.M{"ping": 1}`
-are also accepted.
+Multi-key maps without a custom BSON encoder, including ordinary `bson.M`, are
+rejected before sending because MongoDB uses the first key to identify the
+command. Custom `bson.Marshaler` implementations remain supported and are
+responsible for emitting an ordered command. Maps nested in a command's filter
+or other arguments are unaffected; single-key commands such as
+`bson.M{"ping": 1}` are also accepted.
 
 A reply with `ok: 0`, `writeErrors` or a `writeConcernError` comes back together
 with a `*CommandError` holding its code, code name and message. `DB.Cursor` takes

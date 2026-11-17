@@ -11,6 +11,54 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
+type orderedMapCommand map[string]any
+
+func (command orderedMapCommand) MarshalBSON() ([]byte, error) {
+	ordered := bson.D{{Key: "find", Value: command["find"]}, {Key: "filter", Value: command["filter"]}}
+	return bson.Marshal(ordered)
+}
+
+type pointerMapCommand map[string]any
+
+func (command *pointerMapCommand) MarshalBSON() ([]byte, error) {
+	return orderedMapCommand(*command).MarshalBSON()
+}
+
+func TestCommandsHonorOrderedMapMarshalers(t *testing.T) {
+	ordered := orderedMapCommand{"find": "users", "filter": bson.M{"active": true}}
+	pointer := pointerMapCommand(ordered)
+	inputs := []any{ordered, &ordered, &pointer}
+	for _, input := range inputs {
+		if _, err := bson.Marshal(input); err != nil {
+			t.Fatalf("fixture %T is not a supported BSON document: %v", input, err)
+		}
+		cursors := &cursorServer{t: t, batches: [][]string{{"a"}}, failAt: -1}
+		r := &recorder{t: t, answer: cursors.answer}
+		db := r.db()
+		if _, err := db.Command(t.Context(), input); err != nil {
+			t.Fatalf("Command rejected ordered %T: %v", input, err)
+		}
+		var seen int
+		for document, err := range db.Cursor(t.Context(), input) {
+			if err != nil {
+				t.Fatalf("Cursor rejected ordered %T: %v", input, err)
+			}
+			if document.Lookup("name").StringValue() != "a" {
+				t.Fatal("wrong cursor document", document)
+			}
+			seen++
+		}
+		if seen != 1 || len(r.commands) != 2 {
+			t.Fatal("wrong custom command dispatch", seen, r.commands)
+		}
+		for _, sent := range r.commands {
+			if got := command(t, sent)[0].Key; got != "find" {
+				t.Fatal("custom command order changed", got)
+			}
+		}
+	}
+}
+
 func TestCommandsRejectUnorderedMultiKeyMapsBeforeSending(t *testing.T) {
 	type namedMap map[string]any
 	unordered := bson.M{"find": "users", "filter": bson.M{"active": true}}
@@ -197,5 +245,33 @@ func TestCanceledCursorStillCleansUp(t *testing.T) {
 	}
 	if len(cursors.killed) != 1 {
 		t.Fatal("caller cancellation prevented cursor cleanup", cursors.killed)
+	}
+}
+
+func TestGetMoreFailureCleansUpBeforeYieldingError(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		cursors := &cursorServer{t: t, batches: [][]string{{"a"}, {"b"}}, failAt: 1}
+		r := &recorder{t: t}
+		r.answer = func(sent *pb.Command) []*pb.Event {
+			if interrupted && command(t, sent)[0].Key == "getMore" {
+				return storetest.NativeIncomplete(nil, nil, pb.FailureCode_UNAVAILABLE)
+			}
+			return cursors.answer(sent)
+		}
+		db := r.db()
+		find := bson.D{{Key: "find", Value: "users"}}
+		var failures int
+		for _, err := range db.Cursor(t.Context(), find) {
+			if err == nil {
+				continue
+			}
+			failures++
+			if len(cursors.killed) != 1 {
+				t.Errorf("getMore error yielded before cleanup: interrupted=%t kills=%d", interrupted, len(cursors.killed))
+			}
+		}
+		if failures != 1 || len(cursors.killed) != 1 {
+			t.Fatal("expected one failure and exactly one cleanup", failures, cursors.killed)
+		}
 	}
 }
