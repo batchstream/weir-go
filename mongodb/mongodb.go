@@ -27,8 +27,10 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
+	"reflect"
 	"strings"
 	"time"
 
@@ -71,16 +73,37 @@ func (e *CommandError) Error() string {
 	return fmt.Sprintf("mongodb: command failed: %s (%d): %s", e.Name, e.Code, e.Message)
 }
 
-// Command runs one command in the database and returns its reply. A reply
-// with ok: 0, writeErrors or a writeConcernError comes with a *CommandError.
+// Command runs one command in the database and returns its reply. Commands
+// must preserve field order, with the command name first; multi-key maps are
+// rejected before sending. Use bson.D or another ordered BSON representation.
+// A reply with ok: 0, writeErrors or a writeConcernError comes with a *CommandError.
 // A command is sent again only when a server refused it before it began. One
 // a lost connection or an unavailable backend cut short reports
 // weir.ErrInterrupted and may have run; send it again only when that is safe.
 func (db DB) Command(ctx context.Context, command any) (bson.Raw, error) {
+	data, err := marshalCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	return db.command(ctx, data)
+}
+
+func marshalCommand(command any) (bson.Raw, error) {
+	value := reflect.ValueOf(command)
+	for value.IsValid() && (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) {
+		value = value.Elem()
+	}
+	if value.IsValid() && value.Kind() == reflect.Map && value.Len() > 1 {
+		return nil, errors.New("mongodb: command must be ordered; use bson.D instead of a multi-key map")
+	}
 	data, err := bson.Marshal(command)
 	if err != nil {
 		return nil, fmt.Errorf("mongodb: encode command: %w", err)
 	}
+	return bson.Raw(data), nil
+}
+
+func (db DB) command(ctx context.Context, data bson.Raw) (bson.Raw, error) {
 	document := &weir.Document{ContentType: bsonContentType, Data: data}
 	request := &weir.NativeRequest{Resource: db.resource(), Request: document}
 	result, err := db.target().Native(ctx, request)
@@ -97,13 +120,20 @@ func (db DB) Command(ctx context.Context, command any) (bson.Raw, error) {
 	return reply, nil
 }
 
-// Cursor runs a command that opens a cursor, such as find, aggregate or
-// listIndexes, and yields its documents. It sends getMore until the cursor
-// ends, and kills the cursor when the loop stops early or fails. An error
-// ends the sequence.
+// Cursor runs an ordered command that opens a cursor, such as find, aggregate
+// or listIndexes, and yields its documents. It preserves explicit session and
+// transaction fields on getMore and cleanup commands. It sends getMore until
+// the cursor ends, and kills the cursor when the loop stops early, fails or
+// panics. An error ends the sequence.
 func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error] {
 	documents := func(yield func(bson.Raw, error) bool) {
-		reply, err := db.Command(ctx, command)
+		data, err := marshalCommand(command)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		session := cursorSession(data)
+		reply, err := db.command(ctx, data)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -115,10 +145,10 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 		}
 		space := parseNamespace(page.Cursor.Namespace)
 		batch, cursor := page.Cursor.FirstBatch, page.Cursor.ID
+		defer func() { db.killCursor(ctx, space, cursor, session) }()
 		for {
 			for _, document := range batch {
 				if !yield(document, nil) {
-					db.killCursor(ctx, space, cursor)
 					return
 				}
 			}
@@ -126,13 +156,13 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 				return
 			}
 			getMore := bson.D{{Key: "getMore", Value: cursor}, {Key: "collection", Value: space.collection}, {Key: "$db", Value: space.database}}
+			getMore = append(getMore, session...)
 			reply, err := db.Command(ctx, getMore)
 			var next cursorPage
 			if err == nil {
 				next, err = readPage(reply)
 			}
 			if err != nil {
-				db.killCursor(ctx, space, cursor)
 				yield(nil, err)
 				return
 			}
@@ -140,6 +170,20 @@ func (db DB) Cursor(ctx context.Context, command any) iter.Seq2[bson.Raw, error]
 		}
 	}
 	return documents
+}
+
+// cursorSession retains only fields needed to continue the original session
+// or transaction. In particular, startTransaction belongs to the first command.
+func cursorSession(command bson.Raw) bson.D {
+	var session bson.D
+	for _, key := range []string{"lsid", "txnNumber", "autocommit"} {
+		value := command.Lookup(key)
+		if value.Type != 0 {
+			field := bson.E{Key: key, Value: value}
+			session = append(session, field)
+		}
+	}
+	return session
 }
 
 // namespace names the collection of a cursor. Commands that follow the cursor
@@ -180,13 +224,14 @@ func readPage(reply bson.Raw) (cursorPage, error) {
 
 // killCursor releases a cursor a loop left open. The server also times idle
 // cursors out, so a failure here is ignored.
-func (db DB) killCursor(ctx context.Context, space namespace, cursor int64) {
+func (db DB) killCursor(ctx context.Context, space namespace, cursor int64, session bson.D) {
 	if cursor == 0 {
 		return
 	}
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTimeout)
 	defer cancel()
 	command := bson.D{{Key: "killCursors", Value: space.collection}, {Key: "cursors", Value: bson.A{cursor}}, {Key: "$db", Value: space.database}}
+	command = append(command, session...)
 	_, _ = db.Command(cleanup, command)
 }
 
